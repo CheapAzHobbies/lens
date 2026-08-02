@@ -301,9 +301,9 @@ class LensWindow(Adw.ApplicationWindow):
         /* --- deck-of-cards thumbnail --- */
         .thumb-placeholder { color: rgba(255,255,255,0.6); }
         .deck-card {
-            border-radius: 10px;
-            border: 2px solid white;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.5);
+            border-radius: 22px;                 /* much rounder corners */
+            border: 3px solid white;
+            box-shadow: 0 3px 8px rgba(0,0,0,0.55);
             transition: transform 320ms cubic-bezier(.2,.9,.3,1.2),
                         opacity   250ms ease-out;
         }
@@ -650,6 +650,9 @@ class ThumbnailDeck(Gtk.Overlay):
             img.set_pixel_size(self.THUMB_PX)
             img.add_css_class("deck-card")
             img.add_css_class(f"deck-idx-{i}")   # for stacking transforms
+            # Clip the paintable to the widget's rounded corners so the image
+            # doesn't bleed past the border.
+            img.set_overflow(Gtk.Overflow.HIDDEN)
 
             # Anchor each card to the LEFT and vertically centered — this
             # keeps the thumbnail well inside the action area (avoids the
