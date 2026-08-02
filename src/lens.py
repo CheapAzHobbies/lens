@@ -126,14 +126,17 @@ class LensWindow(Adw.ApplicationWindow):
         bg.add_css_class("bg-black")
         overlay.set_child(bg)
 
+        # Wrap the Picture in an AspectFrame so the visible viewport can be
+        # constrained to the chosen aspect ratio (4:3 / 16:9 / 1:1).
         self.picture = Gtk.Picture()
         self.picture.set_can_shrink(True)
-        self.picture.set_content_fit(Gtk.ContentFit.CONTAIN)  # centers image within widget
-        self.picture.set_hexpand(True)
-        self.picture.set_vexpand(True)
-        # halign/valign default FILL so the Picture fills the window; CONTAIN
-        # then centers the video inside it → equal bars on the shorter axis.
-        bg.append(self.picture)
+        self.picture.set_content_fit(Gtk.ContentFit.COVER)  # fill + crop
+        self.picture.set_hexpand(True); self.picture.set_vexpand(True)
+
+        self.aspect_frame = Gtk.AspectFrame.new(0.5, 0.5, 4/3, False)
+        self.aspect_frame.set_child(self.picture)
+        self.aspect_frame.set_hexpand(True); self.aspect_frame.set_vexpand(True)
+        bg.append(self.aspect_frame)
 
         # ---- Top control row ----
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -391,7 +394,8 @@ class LensWindow(Adw.ApplicationWindow):
     def _toggle_aspect(self):
         self.aspect_idx = (self.aspect_idx + 1) % len(self.aspects)
         self.btn_aspect.set_label(self.aspects[self.aspect_idx])
-        # (Aspect ratio applied at capture; viewfinder is CONTAIN)
+        ratio = {"4:3": 4/3, "16:9": 16/9, "1:1": 1.0}[self.aspects[self.aspect_idx]]
+        self.aspect_frame.set_ratio(ratio)
 
     def _toggle_timer(self):
         seq = [0, 3, 10]
@@ -480,6 +484,23 @@ class LensWindow(Adw.ApplicationWindow):
         ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         path = PICTURES / f"Lens-{ts}.jpg"
         path.write_bytes(data)
+        # Center-crop to the current aspect ratio so the saved image matches
+        # what the viewfinder showed.
+        try:
+            target_ratio = {"4:3": 4/3, "16:9": 16/9, "1:1": 1.0}[self.aspects[self.aspect_idx]]
+            pb = GdkPixbuf.Pixbuf.new_from_file(str(path))
+            src_w, src_h = pb.get_width(), pb.get_height()
+            src_ratio = src_w / src_h
+            if abs(src_ratio - target_ratio) > 0.01:
+                if src_ratio > target_ratio:   # too wide → crop sides
+                    new_w = int(src_h * target_ratio); new_h = src_h
+                    x = (src_w - new_w) // 2;   y = 0
+                else:                          # too tall → crop top/bottom
+                    new_w = src_w; new_h = int(src_w / target_ratio)
+                    x = 0;   y = (src_h - new_h) // 2
+                pb.new_subpixbuf(x, y, new_w, new_h).savev(str(path), "jpeg", ["quality"], ["92"])
+        except Exception as e:
+            print("crop failed, keeping original:", e)
         print(f"Lens: saved {path} ({path.stat().st_size // 1024} KB)")
         self.last_photo = str(path)
         # Flash animation + thumbnail update
