@@ -150,6 +150,14 @@ class LensWindow(Adw.ApplicationWindow):
         self.btn_fullscreen.set_margin_end(12)
         overlay.add_overlay(self.btn_fullscreen)
 
+        # Exit — top-left corner
+        self.btn_exit = self._pill_button("✕", lambda: self.close(), width=42, tint=False)
+        self.btn_exit.set_halign(Gtk.Align.START)
+        self.btn_exit.set_valign(Gtk.Align.START)
+        self.btn_exit.set_margin_top(12)
+        self.btn_exit.set_margin_start(12)
+        overlay.add_overlay(self.btn_exit)
+
         # ---- Bottom control area ----
         bottom = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         bottom.set_valign(Gtk.Align.END)
