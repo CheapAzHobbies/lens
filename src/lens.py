@@ -307,16 +307,15 @@ class LensWindow(Adw.ApplicationWindow):
             transition: transform 320ms cubic-bezier(.2,.9,.3,1.2),
                         opacity   250ms ease-out;
         }
-        /* Collapsed: peek-fanned deck.
-           Cards drawn in add-order → idx-0 is at the BACK of the stack,
-           idx-4 is at the FRONT (top / most recent). Older cards peek out
-           to the right & up from behind the top card so nothing spills
-           left of the deck widget. */
-        .state-idle.deck-idx-4 { transform: translate(  0px,  0px) rotate( 0deg); }
-        .state-idle.deck-idx-3 { transform: translate( 10px, -6px) rotate(  6deg); }
-        .state-idle.deck-idx-2 { transform: translate( 22px,-10px) rotate( 12deg); }
-        .state-idle.deck-idx-1 { transform: translate( 36px,-12px) rotate( 18deg); }
-        .state-idle.deck-idx-0 { transform: translate( 52px,-12px) rotate( 24deg); }
+        /* Hand-of-cards fan — all rotate around a common bottom pivot.
+           Draw order: idx-0 is deepest (leftmost), idx-4 is on top (rightmost),
+           matching a hand of playing cards held together at the bottom. */
+        .deck-card { transform-origin: 50% 100%; }   /* pivot at bottom-center */
+        .state-idle.deck-idx-0 { transform: translate(80px, 8px) rotate(-30deg); }
+        .state-idle.deck-idx-1 { transform: translate(80px, 8px) rotate(-15deg); }
+        .state-idle.deck-idx-2 { transform: translate(80px, 8px) rotate(  0deg); }
+        .state-idle.deck-idx-3 { transform: translate(80px, 8px) rotate( 15deg); }
+        .state-idle.deck-idx-4 { transform: translate(80px, 8px) rotate( 30deg); }
         /* Expanded: fan them out — anchored middle-left, spread across the deck */
         .state-expanded.deck-idx-0 { transform: translate( 20px, -10px) rotate(-14deg) scale(1.05); }
         .state-expanded.deck-idx-1 { transform: translate( 65px, -35px) rotate( -7deg) scale(1.08); }
