@@ -183,40 +183,40 @@ class LensWindow(Adw.ApplicationWindow):
         mode_row.append(self.btn_photo); mode_row.append(self.btn_video)
         bottom.append(mode_row)
 
-        # Row: thumb | shutter | flip
-        act_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        act_row.set_margin_start(32); act_row.set_margin_end(32); act_row.set_margin_top(20)
-        act_row.set_hexpand(True)
-        bottom.append(act_row)
+        # Action area — Gtk.Overlay so each button is positioned independently.
+        # Shutter stays dead-center regardless of deck/flip sizes.
+        act_area = Gtk.Overlay()
+        act_area.set_size_request(-1, 160)   # tall enough for the enlarged deck
+        act_area.set_margin_top(12); act_area.set_hexpand(True)
+        act_base = Gtk.Box(); act_base.set_hexpand(True); act_base.set_vexpand(True)
+        act_area.set_child(act_base)
+        bottom.append(act_area)
 
-        # Stacked deck-of-cards thumbnail — hover to fan out + auto-cycle,
-        # click a card to see it full-screen
+        # SHUTTER — always centered in the action area
+        self.shutter = Gtk.Button()
+        self.shutter.set_size_request(80, 80); self.shutter.add_css_class("shutter")
+        self.shutter.set_halign(Gtk.Align.CENTER); self.shutter.set_valign(Gtk.Align.CENTER)
+        self.shutter.set_hexpand(False); self.shutter.set_vexpand(False)
+        self.shutter.connect("clicked", lambda *_: self._on_shutter())
+        act_area.add_overlay(self.shutter)
+
+        # Deck thumbnail — anchored LEFT, does not affect shutter position
         self.thumb = ThumbnailDeck(
             on_click=self._open_gallery,
             on_card_click=self._open_photo_viewer,
         )
-        act_row.append(self.thumb)
-        # Load any pre-existing photos into the deck
+        act_area.add_overlay(self.thumb)
         self._refresh_deck()
 
-        spacer1 = Gtk.Box(); spacer1.set_hexpand(True); act_row.append(spacer1)
-
-        self.shutter = Gtk.Button()
-        self.shutter.set_size_request(80, 80); self.shutter.add_css_class("shutter")
-        self.shutter.set_hexpand(False); self.shutter.set_vexpand(False)
-        self.shutter.set_valign(Gtk.Align.CENTER)
-        self.shutter.connect("clicked", lambda *_: self._on_shutter())
-        act_row.append(self.shutter)
-
-        spacer2 = Gtk.Box(); spacer2.set_hexpand(True); act_row.append(spacer2)
-
+        # Flip camera — anchored RIGHT
         self.btn_flip = Gtk.Button(label="⟳")
         self.btn_flip.set_size_request(56, 56); self.btn_flip.add_css_class("flip")
+        self.btn_flip.set_halign(Gtk.Align.END); self.btn_flip.set_valign(Gtk.Align.CENTER)
         self.btn_flip.set_hexpand(False); self.btn_flip.set_vexpand(False)
-        self.btn_flip.set_valign(Gtk.Align.CENTER)
+        self.btn_flip.set_margin_end(28)
         self.btn_flip.set_sensitive(len(self.cameras) > 1)
         self.btn_flip.connect("clicked", lambda *_: self._flip_camera())
-        act_row.append(self.btn_flip)
+        act_area.add_overlay(self.btn_flip)
 
         # Countdown overlay
         self.countdown_label = Gtk.Label(label="")
@@ -312,16 +312,16 @@ class LensWindow(Adw.ApplicationWindow):
         .state-idle.deck-idx-3 { transform: translate(-1px,  0px) rotate(-0.5deg); }
         .state-idle.deck-idx-4 { transform: translate( 0px,  0px) rotate( 0deg); }
         /* Expanded: fan them out — anchored bottom-left, spread across the deck */
-        .state-expanded.deck-idx-0 { transform: translate( 20px, -50px) rotate(-14deg) scale(1.1); }
-        .state-expanded.deck-idx-1 { transform: translate( 55px, -70px) rotate( -7deg) scale(1.12); }
-        .state-expanded.deck-idx-2 { transform: translate( 90px, -78px) rotate(  0deg) scale(1.15); }
-        .state-expanded.deck-idx-3 { transform: translate(120px, -70px) rotate(  7deg) scale(1.12); }
-        .state-expanded.deck-idx-4 { transform: translate(150px, -50px) rotate( 14deg) scale(1.1); }
+        .state-expanded.deck-idx-0 { transform: translate( 20px, -70px) rotate(-14deg) scale(1.05); }
+        .state-expanded.deck-idx-1 { transform: translate( 65px, -95px) rotate( -7deg) scale(1.08); }
+        .state-expanded.deck-idx-2 { transform: translate(110px,-105px) rotate(  0deg) scale(1.10); }
+        .state-expanded.deck-idx-3 { transform: translate(150px, -95px) rotate(  7deg) scale(1.08); }
+        .state-expanded.deck-idx-4 { transform: translate(190px, -70px) rotate( 14deg) scale(1.05); }
         /* "Pulled" — one card lifted farther and up */
         .pulled { transform: translate(0px, -80px) rotate(0deg) scale(1.4);
                   box-shadow: 0 8px 20px rgba(0,0,0,0.6); }
         /* Focused card (mouse over a specific card while deck is fanned) */
-        .card-focused { transform: translate(0px, -90px) rotate(0deg) scale(1.9) !important;
+        .card-focused { transform: translate(100px, -170px) rotate(0deg) scale(1.7) !important;
                         box-shadow: 0 12px 30px rgba(0,0,0,0.7);
                         border: 2px solid white; }
         /* Full-screen photo viewer */
@@ -568,18 +568,19 @@ class ThumbnailDeck(Gtk.Overlay):
       under the deck. Cycle continues until mouse leaves.
     """
     DECK_SIZE = 5     # up to N cards visible
-    THUMB_PX  = 56    # collapsed edge
-    HOVER_PX  = 84    # expanded edge
+    THUMB_PX  = 112   # collapsed edge (was 56 — user asked for 2x)
     # Bigger widget than the visible card so the fan-out region is inside
     # the hit area (GTK4 hit boxes don't follow CSS transforms).
-    HIT_W     = 220
-    HIT_H     = 140
+    HIT_W     = 320
+    HIT_H     = 200
 
     def __init__(self, on_click=None, on_card_click=None):
         super().__init__()
         self.set_size_request(self.HIT_W, self.HIT_H)
         self.set_hexpand(False); self.set_vexpand(False)
-        self.set_valign(Gtk.Align.END); self.set_halign(Gtk.Align.START)
+        # Centered vertically in the row, with breathing room from the left edge.
+        self.set_valign(Gtk.Align.CENTER); self.set_halign(Gtk.Align.START)
+        self.set_margin_start(28)
         self.on_click = on_click
         self.on_card_click = on_card_click
         self.card_paths = []
