@@ -305,12 +305,12 @@ class LensWindow(Adw.ApplicationWindow):
             transition: transform 320ms cubic-bezier(.2,.9,.3,1.2),
                         opacity   250ms ease-out;
         }
-        /* Collapsed: cards stack near-flush, top one visible */
-        .state-idle.deck-idx-0 { transform: translate( 3px,  3px) rotate( 2deg); }
-        .state-idle.deck-idx-1 { transform: translate(-2px,  2px) rotate(-1deg); }
-        .state-idle.deck-idx-2 { transform: translate( 1px, -1px) rotate( 1deg); }
-        .state-idle.deck-idx-3 { transform: translate(-1px,  0px) rotate(-0.5deg); }
-        .state-idle.deck-idx-4 { transform: translate( 0px,  0px) rotate( 0deg); }
+        /* Collapsed: subtle fan so it's clearly a stack of cards */
+        .state-idle.deck-idx-0 { transform: translate( 24px, 12px) rotate(-8deg); }
+        .state-idle.deck-idx-1 { transform: translate( 12px,  6px) rotate(-4deg); }
+        .state-idle.deck-idx-2 { transform: translate(  0px,  0px) rotate( 0deg); }
+        .state-idle.deck-idx-3 { transform: translate(-12px, -6px) rotate( 4deg); }
+        .state-idle.deck-idx-4 { transform: translate(-24px,-12px) rotate( 8deg); }
         /* Expanded: fan them out — anchored middle-left, spread across the deck */
         .state-expanded.deck-idx-0 { transform: translate( 20px, -10px) rotate(-14deg) scale(1.05); }
         .state-expanded.deck-idx-1 { transform: translate( 65px, -35px) rotate( -7deg) scale(1.08); }
