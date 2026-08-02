@@ -21,42 +21,51 @@ VIDEOS.mkdir(parents=True, exist_ok=True)
 
 
 def list_v4l2_cameras():
-    """Return [(path, human_name)] for real video capture devices, skipping metadata nodes."""
+    """Return [(path, human_name)] for real video capture devices.
+
+    A single physical camera often exposes multiple /dev/videoN nodes
+    (capture, metadata, subdev). We keep only nodes that report
+    "Video Capture" in their capabilities.
+    """
+    import subprocess
     devs = []
+    seen_cards = set()
     for d in sorted(pathlib.Path("/dev").glob("video*")):
         try:
-            import subprocess
-            info = subprocess.run(
-                ["v4l2-ctl", "-d", str(d), "--list-formats"],
-                capture_output=True, text=True, timeout=1).stdout
-            if "Pixel Format" not in info:
-                continue
-            name = subprocess.run(
-                ["v4l2-ctl", "-d", str(d), "--info"],
-                capture_output=True, text=True, timeout=1).stdout
-            title = "Camera"
-            for line in name.splitlines():
-                if "Card type" in line:
-                    title = line.split(":", 1)[1].strip(); break
-            devs.append((str(d), title))
+            info = subprocess.run(["v4l2-ctl", "-d", str(d), "--info"],
+                                  capture_output=True, text=True, timeout=1).stdout
         except Exception:
             continue
-    # De-duplicate by title, keep first
-    seen = set(); out = []
-    for path, title in devs:
-        if title in seen: continue
-        seen.add(title); out.append((path, title))
-    return out
+        # Must be an actual capture device (not metadata/subdev)
+        # Look at Device Caps line — should include "Video Capture"
+        capture = False
+        card = "Camera"
+        for line in info.splitlines():
+            line = line.strip()
+            if line.startswith("Card type"):
+                card = line.split(":", 1)[1].strip()
+            if "Video Capture" in line and "Metadata" not in line:
+                capture = True
+        if not capture:
+            continue
+        if card in seen_cards:  # one node per physical camera
+            continue
+        seen_cards.add(card)
+        devs.append((str(d), card))
+    return devs
 
 
 class LensWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Lens")
-        self.set_default_size(420, 780)
+        # Landscape default — works well on laptops. Resizable to portrait for tablets.
+        self.set_default_size(960, 640)
         self.pipeline = None
         self.paintable = None
         self.cameras = list_v4l2_cameras() or [("/dev/video0", "Camera")]
         self.cam_idx = 0
+        print(f"Lens: detected {len(self.cameras)} camera(s):")
+        for c in self.cameras: print(f"   {c}")
         self.video_mode = False
         self.recording = False
         self.grid_visible = False
@@ -73,6 +82,11 @@ class LensWindow(Adw.ApplicationWindow):
     def _start_pipeline(self):
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
+            # Wait for pipeline to actually reach NULL — otherwise the v4l2 device
+            # can still be held when we open it below and the flip fails silently.
+            self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
+            self.pipeline = None
+            self.paintable = None
 
         dev = self.cameras[self.cam_idx][0]
         # gtk4paintablesink -> capture into a GdkPaintable widget
@@ -270,6 +284,9 @@ class LensWindow(Adw.ApplicationWindow):
     def _flip_camera(self):
         if len(self.cameras) < 2: return
         self.cam_idx = (self.cam_idx + 1) % len(self.cameras)
+        print(f"Lens: switching to camera {self.cam_idx}: {self.cameras[self.cam_idx]}")
+        # Detach paintable before tearing down pipeline
+        self.picture.set_paintable(None)
         self._start_pipeline()
 
     def _on_shutter(self):
