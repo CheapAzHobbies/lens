@@ -301,7 +301,9 @@ class LensWindow(Adw.ApplicationWindow):
         /* --- deck-of-cards thumbnail --- */
         .thumb-placeholder { color: rgba(255,255,255,0.6); }
         .deck-card {
-            border-radius: 8px;
+            border-radius: 10px;
+            border: 2px solid white;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.5);
             transition: transform 320ms cubic-bezier(.2,.9,.3,1.2),
                         opacity   250ms ease-out;
         }
