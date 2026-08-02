@@ -92,9 +92,10 @@ class LensWindow(Adw.ApplicationWindow):
         # Preview branch + photo-capture branch, both fed by the same v4l2src via tee.
         # The photo branch produces encoded JPEG buffers on the appsink,
         # and we pull the latest one when the shutter is pressed.
+        # Let the camera pick its native resolution — forcing 1280x720 stretched
+        # 4:3 sensors (like the Z13 rear camera at 2592x1944) into 16:9.
         pipe_str = (
-            f"v4l2src device={dev} ! videoconvert ! videoscale ! "
-            f"video/x-raw,width=1280,height=720 ! tee name=t "
+            f"v4l2src device={dev} ! videoconvert ! tee name=t "
             f"t. ! queue max-size-buffers=2 leaky=downstream ! gtk4paintablesink name=sink "
             f"t. ! queue max-size-buffers=2 leaky=downstream ! jpegenc quality=92 ! "
             f"appsink name=photosink emit-signals=false max-buffers=1 drop=true sync=false"
@@ -268,6 +269,8 @@ class LensWindow(Adw.ApplicationWindow):
                    transition: transform 80ms ease-out, background 100ms; }
         .shutter:active { background: #ddd; transform: scale(0.88); }
         .shutter:hover  { background: #f5f5f5; }
+        .thumb          { min-width: 56px; min-height: 56px; padding: 0; }
+        .thumb picture  { min-width: 56px; min-height: 56px; }
         .thumb:active   { transform: scale(0.9); }
         .flip:active    { transform: scale(0.9); }
         .pill:active    { transform: scale(0.9); }
@@ -420,6 +423,8 @@ class LensWindow(Adw.ApplicationWindow):
         try:
             thumb_img = Gtk.Picture.new_for_filename(str(path))
             thumb_img.set_content_fit(Gtk.ContentFit.COVER)
+            thumb_img.set_size_request(56, 56)   # lock size — don't let it grow
+            thumb_img.set_can_shrink(True)
             self.thumb.set_child(thumb_img)
         except Exception as e:
             print("thumb update:", e)
