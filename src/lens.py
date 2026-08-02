@@ -124,11 +124,11 @@ class LensWindow(Adw.ApplicationWindow):
 
         self.picture = Gtk.Picture()
         self.picture.set_can_shrink(True)
-        self.picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+        self.picture.set_content_fit(Gtk.ContentFit.CONTAIN)  # centers image within widget
         self.picture.set_hexpand(True)
         self.picture.set_vexpand(True)
-        self.picture.set_halign(Gtk.Align.CENTER)   # center horizontally
-        self.picture.set_valign(Gtk.Align.CENTER)   # center vertically
+        # halign/valign default FILL so the Picture fills the window; CONTAIN
+        # then centers the video inside it → equal bars on the shorter axis.
         bg.append(self.picture)
 
         # ---- Top control row ----
