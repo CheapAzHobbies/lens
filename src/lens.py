@@ -600,6 +600,7 @@ class ThumbnailDeck(Gtk.Overlay):
         # open it. Short click opens the most recent. Double click opens the
         # gallery folder in the file manager.
         self._hold_timer = None
+        self._click_timer = None
         self._press_is_hold = False
 
         press = Gtk.GestureClick.new()
