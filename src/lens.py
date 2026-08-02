@@ -189,17 +189,11 @@ class LensWindow(Adw.ApplicationWindow):
         act_row.set_hexpand(True)
         bottom.append(act_row)
 
-        # All buttons are centered vertically so they keep their fixed size
-        # rather than stretching to the row height.
-        self.thumb = Gtk.Button()
-        self.thumb.set_size_request(56, 56); self.thumb.add_css_class("thumb")
-        self.thumb.set_hexpand(False); self.thumb.set_vexpand(False)
-        self.thumb.set_valign(Gtk.Align.CENTER)
-        self.thumb_img = Gtk.Image.new_from_icon_name("image-x-generic-symbolic")
-        self.thumb_img.set_pixel_size(28)
-        self.thumb.set_child(self.thumb_img)
-        self.thumb.connect("clicked", self._open_gallery)
+        # Stacked deck-of-cards thumbnail — hover to fan out + auto-cycle
+        self.thumb = ThumbnailDeck(on_click=self._open_gallery)
         act_row.append(self.thumb)
+        # Load any pre-existing photos into the deck
+        self._refresh_deck()
 
         spacer1 = Gtk.Box(); spacer1.set_hexpand(True); act_row.append(spacer1)
 
@@ -273,6 +267,30 @@ class LensWindow(Adw.ApplicationWindow):
         .thumb          { min-width: 56px; min-height: 56px; padding: 0; }
         .thumb picture  { min-width: 56px; min-height: 56px; }
         .thumb:active   { transform: scale(0.9); }
+        /* --- deck-of-cards thumbnail --- */
+        .thumb-placeholder { color: rgba(255,255,255,0.6); }
+        .deck-card {
+            border-radius: 8px;
+            border: 1px solid rgba(255,255,255,0.6);
+            background: rgba(255,255,255,0.1);
+            transition: transform 320ms cubic-bezier(.2,.9,.3,1.2),
+                        opacity   250ms ease-out;
+        }
+        /* Collapsed: cards stack near-flush, top one visible */
+        .state-idle.deck-idx-0 { transform: translate( 3px,  3px) rotate( 2deg); }
+        .state-idle.deck-idx-1 { transform: translate(-2px,  2px) rotate(-1deg); }
+        .state-idle.deck-idx-2 { transform: translate( 1px, -1px) rotate( 1deg); }
+        .state-idle.deck-idx-3 { transform: translate(-1px,  0px) rotate(-0.5deg); }
+        .state-idle.deck-idx-4 { transform: translate( 0px,  0px) rotate( 0deg); }
+        /* Expanded: fan them out */
+        .state-expanded.deck-idx-0 { transform: translate(-42px, -18px) rotate(-14deg) scale(1.1); }
+        .state-expanded.deck-idx-1 { transform: translate(-22px, -28px) rotate( -7deg) scale(1.12); }
+        .state-expanded.deck-idx-2 { transform: translate(  0px, -32px) rotate(  0deg) scale(1.15); }
+        .state-expanded.deck-idx-3 { transform: translate( 22px, -28px) rotate(  7deg) scale(1.12); }
+        .state-expanded.deck-idx-4 { transform: translate( 42px, -18px) rotate( 14deg) scale(1.1); }
+        /* "Pulled" — one card lifted farther and up */
+        .pulled { transform: translate(0px, -80px) rotate(0deg) scale(1.4);
+                  box-shadow: 0 8px 20px rgba(0,0,0,0.6); }
         .flip:active    { transform: scale(0.9); }
         .pill:active    { transform: scale(0.9); }
         .rec-shutter { background: red; border-radius: 8px;
@@ -421,20 +439,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.last_photo = str(path)
         # Flash animation + thumbnail update
         self._flash()
-        try:
-            # Load, center-crop to square, scale to 56×56 — locks the button size.
-            full = GdkPixbuf.Pixbuf.new_from_file(str(path))
-            side = min(full.get_width(), full.get_height())
-            x = (full.get_width()  - side) // 2
-            y = (full.get_height() - side) // 2
-            square = full.new_subpixbuf(x, y, side, side)
-            thumb_pb = square.scale_simple(112, 112, GdkPixbuf.InterpType.BILINEAR)
-            texture = Gdk.Texture.new_for_pixbuf(thumb_pb)
-            img = Gtk.Image.new_from_paintable(texture)
-            img.set_pixel_size(56)   # forces the image widget to 56×56
-            self.thumb.set_child(img)
-        except Exception as e:
-            print("thumb update:", e)
+        self._refresh_deck()
 
     def _flash(self):
         """Full-screen white flash overlay ~150ms — visual capture feedback."""
@@ -497,6 +502,127 @@ class LensWindow(Adw.ApplicationWindow):
 
     def _open_gallery(self, *_):
         Gio.AppInfo.launch_default_for_uri("file://" + str(PICTURES), None)
+
+    def _refresh_deck(self):
+        """Feed the last N photos on disk into the thumbnail deck."""
+        jpgs = sorted(PICTURES.glob("*.jpg"), key=lambda p: p.stat().st_mtime)
+        self.thumb.update_photos(jpgs)
+
+
+class ThumbnailDeck(Gtk.Overlay):
+    """A stacked "deck of cards" thumbnail preview.
+
+    Idle: shows just the top card (last photo).
+    Hover: after 500ms delay, fans the deck out and starts a card-pull cycle
+      where the bottom card animates up-and-out, holds briefly, then returns
+      under the deck. Cycle continues until mouse leaves.
+    """
+    DECK_SIZE = 5     # up to N cards visible
+    THUMB_PX  = 56    # collapsed edge
+    HOVER_PX  = 84    # expanded edge
+
+    def __init__(self, on_click=None):
+        super().__init__()
+        self.set_size_request(self.THUMB_PX, self.THUMB_PX)
+        self.set_hexpand(False); self.set_vexpand(False)
+        self.set_valign(Gtk.Align.CENTER); self.set_halign(Gtk.Align.START)
+        self.on_click = on_click
+        self.cards = []        # bottom-to-top order
+        self.hover_delay_id = None
+        self.cycle_id = None
+        self.expanded = False
+        self.current_pull = 0
+
+        # Placeholder icon when no photos yet
+        self.placeholder = Gtk.Image.new_from_icon_name("image-x-generic-symbolic")
+        self.placeholder.set_pixel_size(28)
+        self.placeholder.add_css_class("thumb-placeholder")
+        self.set_child(self.placeholder)
+
+        # Hover
+        motion = Gtk.EventControllerMotion()
+        motion.connect("enter", lambda *_: self._on_enter())
+        motion.connect("leave", lambda *_: self._on_leave())
+        self.add_controller(motion)
+        # Click
+        click = Gtk.GestureClick()
+        click.connect("released", lambda *_: on_click() if on_click else None)
+        self.add_controller(click)
+
+    def _load_thumb(self, path, size=112):
+        try:
+            full = GdkPixbuf.Pixbuf.new_from_file(str(path))
+        except Exception:
+            return None
+        side = min(full.get_width(), full.get_height())
+        x = (full.get_width()  - side) // 2
+        y = (full.get_height() - side) // 2
+        sq = full.new_subpixbuf(x, y, side, side)
+        scaled = sq.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR)
+        return Gdk.Texture.new_for_pixbuf(scaled)
+
+    def update_photos(self, paths):
+        """Rebuild the deck from these paths (oldest → newest at top)."""
+        # Clear existing
+        while self.cards:
+            self.remove_overlay(self.cards.pop())
+        self.set_child(None)
+        latest = list(paths)[-self.DECK_SIZE:]
+        if not latest:
+            self.set_child(self.placeholder); return
+        for i, p in enumerate(latest):
+            tex = self._load_thumb(p, self.THUMB_PX * 2)
+            if not tex: continue
+            img = Gtk.Image.new_from_paintable(tex)
+            img.set_pixel_size(self.THUMB_PX)
+            img.add_css_class("deck-card")
+            img.add_css_class(f"deck-idx-{i}")   # for stacking transforms
+            self.cards.append(img)
+            self.add_overlay(img)
+        self._refresh_transforms()
+
+    def _refresh_transforms(self):
+        """Apply CSS classes based on state so cards fan when expanded."""
+        state = "expanded" if self.expanded else "idle"
+        for i, c in enumerate(self.cards):
+            for cls in ("state-idle", "state-expanded", "pulled"):
+                if c.has_css_class(cls): c.remove_css_class(cls)
+            c.add_css_class(f"state-{state}")
+
+    def _on_enter(self):
+        if self.hover_delay_id: return
+        self.hover_delay_id = GLib.timeout_add(500, self._expand)
+
+    def _on_leave(self):
+        if self.hover_delay_id:
+            GLib.source_remove(self.hover_delay_id); self.hover_delay_id = None
+        if self.cycle_id:
+            GLib.source_remove(self.cycle_id); self.cycle_id = None
+        self.expanded = False
+        for c in self.cards:
+            if c.has_css_class("pulled"): c.remove_css_class("pulled")
+        self._refresh_transforms()
+
+    def _expand(self):
+        self.hover_delay_id = None
+        if not self.cards: return False
+        self.expanded = True
+        self._refresh_transforms()
+        self.current_pull = 0
+        self.cycle_id = GLib.timeout_add(1200, self._cycle_pull)
+        return False
+
+    def _cycle_pull(self):
+        if not self.expanded or not self.cards: return False
+        # Un-pull previous card
+        for c in self.cards:
+            if c.has_css_class("pulled"): c.remove_css_class("pulled")
+        # Pull next card (skip the top-most, i == len-1, since it's already visible)
+        if len(self.cards) > 1:
+            idx = self.current_pull % (len(self.cards) - 1)
+            self.cards[idx].add_css_class("pulled")
+            self.current_pull += 1
+        return True
 
 
 class _GridOverlay(Gtk.DrawingArea):
