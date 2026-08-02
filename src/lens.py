@@ -256,8 +256,13 @@ class LensWindow(Adw.ApplicationWindow):
         .mode-active { background: rgba(0,0,0,0.5); color: #ffcc00; }
         .shutter { background: white; border-radius: 40px;
                    border: 4px solid white; min-width: 76px; min-height: 76px;
-                   box-shadow: 0 0 0 4px rgba(0,0,0,0.4); }
-        .shutter:active { background: #eee; }
+                   box-shadow: 0 0 0 4px rgba(0,0,0,0.4);
+                   transition: transform 80ms ease-out, background 100ms; }
+        .shutter:active { background: #ddd; transform: scale(0.88); }
+        .shutter:hover  { background: #f5f5f5; }
+        .thumb:active   { transform: scale(0.9); }
+        .flip:active    { transform: scale(0.9); }
+        .pill:active    { transform: scale(0.9); }
         .rec-shutter { background: red; border-radius: 8px;
                        min-width: 40px; min-height: 40px; border: 4px solid white; }
         .thumb { background: rgba(255,255,255,0.2); border-radius: 8px;
