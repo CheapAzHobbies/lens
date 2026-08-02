@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Lens
+Comment=Fast mobile-first camera for Linux
+Exec=/home/bao/Documents/lens/src/lens.py
+Icon=camera-photo-symbolic
+Terminal=false
+Type=Application
+Categories=AudioVideo;Video;
+Keywords=camera;photo;video;webcam;
