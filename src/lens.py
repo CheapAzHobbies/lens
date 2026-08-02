@@ -302,11 +302,6 @@ class LensWindow(Adw.ApplicationWindow):
         .thumb-placeholder { color: rgba(255,255,255,0.6); }
         .deck-card {
             border-radius: 8px;
-            border: 1px solid rgba(255,255,255,0.6);
-            background: rgba(255,255,255,0.1);
-            /* GTK4 doesn't move the hit-area with CSS transforms, so add
-               invisible padding to enlarge the hover region a bit. */
-            padding: 10px;
             transition: transform 320ms cubic-bezier(.2,.9,.3,1.2),
                         opacity   250ms ease-out;
         }
@@ -316,12 +311,12 @@ class LensWindow(Adw.ApplicationWindow):
         .state-idle.deck-idx-2 { transform: translate( 1px, -1px) rotate( 1deg); }
         .state-idle.deck-idx-3 { transform: translate(-1px,  0px) rotate(-0.5deg); }
         .state-idle.deck-idx-4 { transform: translate( 0px,  0px) rotate( 0deg); }
-        /* Expanded: fan them out */
-        .state-expanded.deck-idx-0 { transform: translate(-42px, -18px) rotate(-14deg) scale(1.1); }
-        .state-expanded.deck-idx-1 { transform: translate(-22px, -28px) rotate( -7deg) scale(1.12); }
-        .state-expanded.deck-idx-2 { transform: translate(  0px, -32px) rotate(  0deg) scale(1.15); }
-        .state-expanded.deck-idx-3 { transform: translate( 22px, -28px) rotate(  7deg) scale(1.12); }
-        .state-expanded.deck-idx-4 { transform: translate( 42px, -18px) rotate( 14deg) scale(1.1); }
+        /* Expanded: fan them out — anchored bottom-left, spread across the deck */
+        .state-expanded.deck-idx-0 { transform: translate( 20px, -50px) rotate(-14deg) scale(1.1); }
+        .state-expanded.deck-idx-1 { transform: translate( 55px, -70px) rotate( -7deg) scale(1.12); }
+        .state-expanded.deck-idx-2 { transform: translate( 90px, -78px) rotate(  0deg) scale(1.15); }
+        .state-expanded.deck-idx-3 { transform: translate(120px, -70px) rotate(  7deg) scale(1.12); }
+        .state-expanded.deck-idx-4 { transform: translate(150px, -50px) rotate( 14deg) scale(1.1); }
         /* "Pulled" — one card lifted farther and up */
         .pulled { transform: translate(0px, -80px) rotate(0deg) scale(1.4);
                   box-shadow: 0 8px 20px rgba(0,0,0,0.6); }
@@ -575,12 +570,16 @@ class ThumbnailDeck(Gtk.Overlay):
     DECK_SIZE = 5     # up to N cards visible
     THUMB_PX  = 56    # collapsed edge
     HOVER_PX  = 84    # expanded edge
+    # Bigger widget than the visible card so the fan-out region is inside
+    # the hit area (GTK4 hit boxes don't follow CSS transforms).
+    HIT_W     = 220
+    HIT_H     = 140
 
     def __init__(self, on_click=None, on_card_click=None):
         super().__init__()
-        self.set_size_request(self.THUMB_PX, self.THUMB_PX)
+        self.set_size_request(self.HIT_W, self.HIT_H)
         self.set_hexpand(False); self.set_vexpand(False)
-        self.set_valign(Gtk.Align.CENTER); self.set_halign(Gtk.Align.START)
+        self.set_valign(Gtk.Align.END); self.set_halign(Gtk.Align.START)
         self.on_click = on_click
         self.on_card_click = on_card_click
         self.card_paths = []
@@ -596,11 +595,18 @@ class ThumbnailDeck(Gtk.Overlay):
         self.placeholder.add_css_class("thumb-placeholder")
         self.set_child(self.placeholder)
 
-        # Hover (deck-level)
+        # Hover (deck-level, single controller — tracks cursor over the whole
+        # widget, then computes which card is focused by cursor x-position.
+        # Avoids per-card enter/leave ping-pong when moving across cards.)
         motion = Gtk.EventControllerMotion()
         motion.connect("enter", lambda *_: self._on_enter())
         motion.connect("leave", lambda *_: self._on_leave())
+        motion.connect("motion", lambda _c, x, y: self._on_motion(x, y))
         self.add_controller(motion)
+        # Deck-level click (falls through to the focused card, if any)
+        click = Gtk.GestureClick()
+        click.connect("released", self._handle_click)
+        self.add_controller(click)
 
     def _load_thumb(self, path, size=112):
         try:
@@ -632,30 +638,10 @@ class ThumbnailDeck(Gtk.Overlay):
             img.add_css_class("deck-card")
             img.add_css_class(f"deck-idx-{i}")   # for stacking transforms
 
-            # Per-card hover: on enter add 'card-focused' (larger, centered);
-            # on leave remove it. Also pause the auto-cycle while focused.
-            card_motion = Gtk.EventControllerMotion()
-            def _card_enter(*_, card=img):
-                if not self.expanded: return
-                self._focused_card = card
-                card.add_css_class("card-focused")
-            def _card_leave(*_, card=img):
-                if card.has_css_class("card-focused"):
-                    card.remove_css_class("card-focused")
-                if self._focused_card is card:
-                    self._focused_card = None
-            card_motion.connect("enter", _card_enter)
-            card_motion.connect("leave", _card_leave)
-            img.add_controller(card_motion)
-
-            # Per-card click: open full-screen preview of THIS card's photo.
-            click = Gtk.GestureClick()
-            def _card_click(gesture, n_press, x, y, path=str(p)):
-                if self.on_card_click: self.on_card_click(path)
-                elif self.on_click: self.on_click()
-            click.connect("released", _card_click)
-            img.add_controller(click)
-
+            # Anchor each card to the bottom-left of the deck widget so it
+            # sits where a single 56×56 thumbnail used to, even though the
+            # deck widget itself is now 220×140.
+            img.set_halign(Gtk.Align.START); img.set_valign(Gtk.Align.END)
             self.cards.append(img)
             self.add_overlay(img)
         self._focused_card = None
@@ -668,6 +654,31 @@ class ThumbnailDeck(Gtk.Overlay):
             for cls in ("state-idle", "state-expanded", "pulled"):
                 if c.has_css_class(cls): c.remove_css_class(cls)
             c.add_css_class(f"state-{state}")
+
+    def _on_motion(self, x, y):
+        """Cursor moved inside the deck widget — pick focused card by x zone."""
+        if not self.expanded or len(self.cards) < 2:
+            return
+        # Divide the widget width into N zones, one per card
+        w = self.get_width() or self.HIT_W
+        idx = int((x / max(w, 1)) * len(self.cards))
+        idx = max(0, min(len(self.cards) - 1, idx))
+        target = self.cards[idx]
+        if self._focused_card is target:
+            return
+        for c in self.cards:
+            if c.has_css_class("card-focused"):
+                c.remove_css_class("card-focused")
+        target.add_css_class("card-focused")
+        self._focused_card = target
+
+    def _handle_click(self, gesture, n_press, x, y):
+        """Click on the deck — if a card is focused, view it; else open gallery."""
+        if self._focused_card and self._focused_card in self.cards:
+            idx = self.cards.index(self._focused_card)
+            if idx < len(self.card_paths) and self.on_card_click:
+                self.on_card_click(self.card_paths[idx]); return
+        if self.on_click: self.on_click()
 
     def _on_enter(self):
         if self.hover_delay_id: return
