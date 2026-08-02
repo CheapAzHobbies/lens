@@ -187,8 +187,12 @@ class LensWindow(Adw.ApplicationWindow):
         act_row.set_hexpand(True)
         bottom.append(act_row)
 
+        # All buttons are centered vertically so they keep their fixed size
+        # rather than stretching to the row height.
         self.thumb = Gtk.Button()
         self.thumb.set_size_request(56, 56); self.thumb.add_css_class("thumb")
+        self.thumb.set_hexpand(False); self.thumb.set_vexpand(False)
+        self.thumb.set_valign(Gtk.Align.CENTER)
         self.thumb_img = Gtk.Image.new_from_icon_name("image-x-generic-symbolic")
         self.thumb_img.set_pixel_size(28)
         self.thumb.set_child(self.thumb_img)
@@ -199,6 +203,8 @@ class LensWindow(Adw.ApplicationWindow):
 
         self.shutter = Gtk.Button()
         self.shutter.set_size_request(80, 80); self.shutter.add_css_class("shutter")
+        self.shutter.set_hexpand(False); self.shutter.set_vexpand(False)
+        self.shutter.set_valign(Gtk.Align.CENTER)
         self.shutter.connect("clicked", lambda *_: self._on_shutter())
         act_row.append(self.shutter)
 
@@ -206,6 +212,8 @@ class LensWindow(Adw.ApplicationWindow):
 
         self.btn_flip = Gtk.Button(label="⟳")
         self.btn_flip.set_size_request(56, 56); self.btn_flip.add_css_class("flip")
+        self.btn_flip.set_hexpand(False); self.btn_flip.set_vexpand(False)
+        self.btn_flip.set_valign(Gtk.Align.CENTER)
         self.btn_flip.set_sensitive(len(self.cameras) > 1)
         self.btn_flip.connect("clicked", lambda *_: self._flip_camera())
         act_row.append(self.btn_flip)
@@ -374,22 +382,36 @@ class LensWindow(Adw.ApplicationWindow):
         return True
 
     def _take_photo(self):
-        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        path = PICTURES / f"Lens-{ts}.jpg"
         appsink = self.pipeline.get_by_name("photosink")
         if not appsink:
             print("Lens: no photosink in pipeline"); return
-        sample = appsink.try_pull_sample(int(0.5 * Gst.SECOND))
-        if not sample:
-            print("Lens: no frame available for capture"); return
-        buf = sample.get_buffer()
-        ok, mapinfo = buf.map(Gst.MapFlags.READ)
-        if not ok: return
-        try:
-            with open(path, "wb") as f:
-                f.write(mapinfo.data)
-        finally:
-            buf.unmap(mapinfo)
+
+        # Try up to 3 times over ~1 sec — first buffer can be tiny warmup data.
+        data = None
+        for attempt in range(6):
+            sample = appsink.try_pull_sample(int(0.25 * Gst.SECOND))
+            if not sample:
+                print(f"Lens: attempt {attempt+1}: no sample"); continue
+            buf = sample.get_buffer()
+            size = buf.get_size()
+            ok, mapinfo = buf.map(Gst.MapFlags.READ)
+            if not ok: continue
+            try:
+                blob = bytes(mapinfo.data)  # copy out before unmap
+            finally:
+                buf.unmap(mapinfo)
+            # A valid JPEG is at least a few KB and starts with 0xFF 0xD8
+            if len(blob) > 1000 and blob[:2] == b"\xff\xd8":
+                data = blob; break
+            print(f"Lens: attempt {attempt+1}: got {size} bytes (not valid JPEG yet)")
+
+        if not data:
+            print("Lens: capture failed — no valid JPEG from pipeline")
+            return
+
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = PICTURES / f"Lens-{ts}.jpg"
+        path.write_bytes(data)
         print(f"Lens: saved {path} ({path.stat().st_size // 1024} KB)")
         self.last_photo = str(path)
         # Flash animation + thumbnail update
