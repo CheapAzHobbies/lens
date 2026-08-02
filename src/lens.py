@@ -264,12 +264,13 @@ class LensWindow(Adw.ApplicationWindow):
         self.viewer_picture.set_content_fit(Gtk.ContentFit.CONTAIN)
         self.viewer_picture.set_hexpand(True); self.viewer_picture.set_vexpand(True)
         viewer_bg.append(self.viewer_picture)
-        # Close button
-        viewer_close = Gtk.Button(label="✕")
+        # Back button — top-LEFT so it's clearly "back to camera" not "close app"
+        # (the ✕ in the corner already means close-app)
+        viewer_close = Gtk.Button(label="← Back")
         viewer_close.add_css_class("pill")
-        viewer_close.set_size_request(42, 42)
-        viewer_close.set_halign(Gtk.Align.END); viewer_close.set_valign(Gtk.Align.START)
-        viewer_close.set_margin_top(12); viewer_close.set_margin_end(12)
+        viewer_close.set_size_request(-1, 42)
+        viewer_close.set_halign(Gtk.Align.START); viewer_close.set_valign(Gtk.Align.START)
+        viewer_close.set_margin_top(12); viewer_close.set_margin_start(12)
         viewer_close.connect("clicked", lambda *_: self._close_photo_viewer())
         self.viewer.add_overlay(viewer_close)
         # Also close on click anywhere in the viewer backdrop
@@ -303,6 +304,9 @@ class LensWindow(Adw.ApplicationWindow):
             border-radius: 8px;
             border: 1px solid rgba(255,255,255,0.6);
             background: rgba(255,255,255,0.1);
+            /* GTK4 doesn't move the hit-area with CSS transforms, so add
+               invisible padding to enlarge the hover region a bit. */
+            padding: 10px;
             transition: transform 320ms cubic-bezier(.2,.9,.3,1.2),
                         opacity   250ms ease-out;
         }
@@ -322,9 +326,9 @@ class LensWindow(Adw.ApplicationWindow):
         .pulled { transform: translate(0px, -80px) rotate(0deg) scale(1.4);
                   box-shadow: 0 8px 20px rgba(0,0,0,0.6); }
         /* Focused card (mouse over a specific card while deck is fanned) */
-        .card-focused { transform: translate(0px, -110px) rotate(0deg) scale(2.4) !important;
+        .card-focused { transform: translate(0px, -90px) rotate(0deg) scale(1.9) !important;
                         box-shadow: 0 12px 30px rgba(0,0,0,0.7);
-                        border: 2px solid white; z-index: 999; }
+                        border: 2px solid white; }
         /* Full-screen photo viewer */
         .viewer-bg { background: rgba(0,0,0,0.95); }
         .flip:active    { transform: scale(0.9); }
