@@ -307,21 +307,20 @@ class LensWindow(Adw.ApplicationWindow):
             transition: transform 320ms cubic-bezier(.2,.9,.3,1.2),
                         opacity   250ms ease-out;
         }
-        /* Hand-of-cards fan — all rotate around a common bottom pivot.
-           Draw order: idx-0 is deepest (leftmost), idx-4 is on top (rightmost),
-           matching a hand of playing cards held together at the bottom. */
-        .deck-card { transform-origin: 50% 100%; }   /* pivot at bottom-center */
-        .state-idle.deck-idx-0 { transform: translate(80px, 8px) rotate(-30deg); }
-        .state-idle.deck-idx-1 { transform: translate(80px, 8px) rotate(-15deg); }
-        .state-idle.deck-idx-2 { transform: translate(80px, 8px) rotate(  0deg); }
-        .state-idle.deck-idx-3 { transform: translate(80px, 8px) rotate( 15deg); }
-        .state-idle.deck-idx-4 { transform: translate(80px, 8px) rotate( 30deg); }
-        /* Expanded: fan them out — anchored middle-left, spread across the deck */
-        .state-expanded.deck-idx-0 { transform: translate( 20px, -10px) rotate(-14deg) scale(1.05); }
-        .state-expanded.deck-idx-1 { transform: translate( 65px, -35px) rotate( -7deg) scale(1.08); }
-        .state-expanded.deck-idx-2 { transform: translate(110px, -45px) rotate(  0deg) scale(1.10); }
-        .state-expanded.deck-idx-3 { transform: translate(150px, -35px) rotate(  7deg) scale(1.08); }
-        .state-expanded.deck-idx-4 { transform: translate(190px, -10px) rotate( 14deg) scale(1.05); }
+        /* Hand-of-cards style: bottom-center pivot.
+           Idle = tight fan (just a hint), hold-to-expand fans wide. */
+        .deck-card { transform-origin: 50% 100%; }
+        .state-idle.deck-idx-0 { transform: translate(80px, -20px) rotate(-10deg); }
+        .state-idle.deck-idx-1 { transform: translate(80px, -20px) rotate( -5deg); }
+        .state-idle.deck-idx-2 { transform: translate(80px, -20px) rotate(  0deg); }
+        .state-idle.deck-idx-3 { transform: translate(80px, -20px) rotate(  5deg); }
+        .state-idle.deck-idx-4 { transform: translate(80px, -20px) rotate( 10deg); }
+        /* Expanded: full hand-of-cards fan around the same bottom pivot */
+        .state-expanded.deck-idx-0 { transform: translate(80px, -20px) rotate(-30deg); }
+        .state-expanded.deck-idx-1 { transform: translate(80px, -20px) rotate(-15deg); }
+        .state-expanded.deck-idx-2 { transform: translate(80px, -20px) rotate(  0deg); }
+        .state-expanded.deck-idx-3 { transform: translate(80px, -20px) rotate( 15deg); }
+        .state-expanded.deck-idx-4 { transform: translate(80px, -20px) rotate( 30deg); }
         /* "Pulled" — one card lifted farther and up */
         .pulled { transform: translate(0px, -80px) rotate(0deg) scale(1.4);
                   box-shadow: 0 8px 20px rgba(0,0,0,0.6); }
