@@ -84,18 +84,20 @@ class LensWindow(Adw.ApplicationWindow):
     def _start_pipeline(self):
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
-            # Wait for pipeline to actually reach NULL — otherwise the v4l2 device
-            # can still be held when we open it below and the flip fails silently.
             self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
             self.pipeline = None
             self.paintable = None
 
         dev = self.cameras[self.cam_idx][0]
-        # gtk4paintablesink -> capture into a GdkPaintable widget
+        # Preview branch + photo-capture branch, both fed by the same v4l2src via tee.
+        # The photo branch produces encoded JPEG buffers on the appsink,
+        # and we pull the latest one when the shutter is pressed.
         pipe_str = (
             f"v4l2src device={dev} ! videoconvert ! videoscale ! "
-            f"video/x-raw,width=1280,height=720 ! videoflip method=none ! "
-            f"gtk4paintablesink name=sink"
+            f"video/x-raw,width=1280,height=720 ! tee name=t "
+            f"t. ! queue max-size-buffers=2 leaky=downstream ! gtk4paintablesink name=sink "
+            f"t. ! queue max-size-buffers=2 leaky=downstream ! jpegenc quality=92 ! "
+            f"appsink name=photosink emit-signals=false max-buffers=1 drop=true sync=false"
         )
         self.pipeline = Gst.parse_launch(pipe_str)
         sink = self.pipeline.get_by_name("sink")
@@ -216,6 +218,27 @@ class LensWindow(Adw.ApplicationWindow):
         self.countdown_label.set_valign(Gtk.Align.CENTER)
         overlay.add_overlay(self.countdown_label)
 
+        # Full-window white flash (photo capture feedback)
+        self.flash_overlay = Gtk.Box()
+        self.flash_overlay.add_css_class("flash")
+        self.flash_overlay.set_visible(False)
+        self.flash_overlay.set_can_target(False)
+        overlay.add_overlay(self.flash_overlay)
+
+        # Recording indicator — red dot + elapsed time in top-right of viewfinder
+        rec_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        rec_row.set_halign(Gtk.Align.END); rec_row.set_valign(Gtk.Align.START)
+        rec_row.set_margin_top(60); rec_row.set_margin_end(16)
+        self.rec_dot = Gtk.Box()
+        self.rec_dot.add_css_class("rec-dot")
+        self.rec_dot.set_size_request(14, 14)
+        self.rec_time_label = Gtk.Label(label="00:00")
+        self.rec_time_label.add_css_class("rec-time")
+        rec_row.append(self.rec_dot); rec_row.append(self.rec_time_label)
+        self.rec_indicator = rec_row
+        self.rec_indicator.set_visible(False)
+        overlay.add_overlay(self.rec_indicator)
+
         # Grid overlay (rule of thirds)
         self.grid_widget = _GridOverlay()
         self.grid_widget.set_visible(False)
@@ -247,6 +270,12 @@ class LensWindow(Adw.ApplicationWindow):
         .pill-active { background: #ffcc00; color: black; }
         .countdown { color: white; font-size: 96px; font-weight: bold;
                      background: rgba(0,0,0,0.5); padding: 30px 50px; border-radius: 60px; }
+        .flash { background: white; }
+        .rec-dot { background: #ff2222; border-radius: 7px; }
+        .rec-dot.blink { background: rgba(255,34,34,0.3); }
+        .rec-time { color: white; font-family: monospace; font-size: 14px;
+                    font-weight: bold; background: rgba(0,0,0,0.5);
+                    padding: 2px 8px; border-radius: 8px; }
         """)
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), css,
@@ -342,24 +371,54 @@ class LensWindow(Adw.ApplicationWindow):
     def _take_photo(self):
         ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         path = PICTURES / f"Lens-{ts}.jpg"
-        # Snapshot from current pipeline by pulling one frame from a valve/parse
-        # Simpler: separate short-lived ffmpeg-style capture from the same device.
-        dev = self.cameras[self.cam_idx][0]
-        # Freeze main pipe briefly, capture with parallel pipe
-        cap = Gst.parse_launch(
-            f"v4l2src device={dev} num-buffers=1 ! jpegenc quality=95 ! "
-            f"filesink location={path}"
-        )
-        cap.set_state(Gst.State.PLAYING)
-        # Wait for EOS then tear down
-        bus = cap.get_bus()
-        bus.timed_pop_filtered(2 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
-        cap.set_state(Gst.State.NULL)
-        self.last_photo = str(path)
-        # Update thumbnail
+        appsink = self.pipeline.get_by_name("photosink")
+        if not appsink:
+            print("Lens: no photosink in pipeline"); return
+        sample = appsink.try_pull_sample(int(0.5 * Gst.SECOND))
+        if not sample:
+            print("Lens: no frame available for capture"); return
+        buf = sample.get_buffer()
+        ok, mapinfo = buf.map(Gst.MapFlags.READ)
+        if not ok: return
         try:
-            self.thumb.set_child(Gtk.Picture.new_for_filename(str(path)))
-        except Exception: pass
+            with open(path, "wb") as f:
+                f.write(mapinfo.data)
+        finally:
+            buf.unmap(mapinfo)
+        print(f"Lens: saved {path} ({path.stat().st_size // 1024} KB)")
+        self.last_photo = str(path)
+        # Flash animation + thumbnail update
+        self._flash()
+        try:
+            thumb_img = Gtk.Picture.new_for_filename(str(path))
+            thumb_img.set_content_fit(Gtk.ContentFit.COVER)
+            self.thumb.set_child(thumb_img)
+        except Exception as e:
+            print("thumb update:", e)
+
+    def _flash(self):
+        """Full-screen white flash overlay ~150ms — visual capture feedback."""
+        self.flash_overlay.set_visible(True)
+        self.flash_overlay.set_opacity(0.9)
+        # Fade out over 200ms
+        def fade():
+            o = self.flash_overlay.get_opacity() - 0.15
+            if o <= 0:
+                self.flash_overlay.set_visible(False)
+                return False
+            self.flash_overlay.set_opacity(o)
+            return True
+        GLib.timeout_add(20, fade)
+
+    def _rec_tick(self):
+        if not self.recording: return False
+        self.rec_seconds += 1
+        m, s = divmod(self.rec_seconds, 60)
+        self.rec_time_label.set_label(f"{m:02d}:{s:02d}")
+        # Blink dot every tick
+        if self.rec_dot.has_css_class("blink"): self.rec_dot.remove_css_class("blink")
+        else: self.rec_dot.add_css_class("blink")
+        return True
 
     def _start_recording(self):
         ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -379,6 +438,10 @@ class LensWindow(Adw.ApplicationWindow):
         self.pipeline.set_state(Gst.State.PLAYING)
         self.recording = True
         self.shutter.add_css_class("rec-shutter")
+        self.rec_seconds = 0
+        self.rec_time_label.set_label("00:00")
+        self.rec_indicator.set_visible(True)
+        GLib.timeout_add_seconds(1, self._rec_tick)
 
     def _stop_recording(self):
         # Send EOS then tear down and restart preview
@@ -388,7 +451,9 @@ class LensWindow(Adw.ApplicationWindow):
         self.pipeline.set_state(Gst.State.NULL)
         self.recording = False
         self.shutter.remove_css_class("rec-shutter")
+        self.rec_indicator.set_visible(False)
         self._start_pipeline()
+        print(f"Lens: saved video ({self.rec_seconds}s)")
 
     def _open_gallery(self, *_):
         Gio.AppInfo.launch_default_for_uri("file://" + str(PICTURES), None)
