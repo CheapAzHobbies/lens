@@ -386,10 +386,11 @@ class LensWindow(Adw.ApplicationWindow):
         if not appsink:
             print("Lens: no photosink in pipeline"); return
 
-        # Try up to 3 times over ~1 sec — first buffer can be tiny warmup data.
+        # Try up to 6 times over ~1.5 sec — first buffer can be tiny warmup data.
+        # NOTE: try_pull_sample is a GObject signal in Python, not a direct method.
         data = None
         for attempt in range(6):
-            sample = appsink.try_pull_sample(int(0.25 * Gst.SECOND))
+            sample = appsink.emit("try-pull-sample", int(0.25 * Gst.SECOND))
             if not sample:
                 print(f"Lens: attempt {attempt+1}: no sample"); continue
             buf = sample.get_buffer()
