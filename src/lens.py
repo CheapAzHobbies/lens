@@ -311,17 +311,17 @@ class LensWindow(Adw.ApplicationWindow):
         .state-idle.deck-idx-2 { transform: translate( 1px, -1px) rotate( 1deg); }
         .state-idle.deck-idx-3 { transform: translate(-1px,  0px) rotate(-0.5deg); }
         .state-idle.deck-idx-4 { transform: translate( 0px,  0px) rotate( 0deg); }
-        /* Expanded: fan them out — anchored bottom-left, spread across the deck */
-        .state-expanded.deck-idx-0 { transform: translate( 20px, -70px) rotate(-14deg) scale(1.05); }
-        .state-expanded.deck-idx-1 { transform: translate( 65px, -95px) rotate( -7deg) scale(1.08); }
-        .state-expanded.deck-idx-2 { transform: translate(110px,-105px) rotate(  0deg) scale(1.10); }
-        .state-expanded.deck-idx-3 { transform: translate(150px, -95px) rotate(  7deg) scale(1.08); }
-        .state-expanded.deck-idx-4 { transform: translate(190px, -70px) rotate( 14deg) scale(1.05); }
+        /* Expanded: fan them out — anchored middle-left, spread across the deck */
+        .state-expanded.deck-idx-0 { transform: translate( 20px, -10px) rotate(-14deg) scale(1.05); }
+        .state-expanded.deck-idx-1 { transform: translate( 65px, -35px) rotate( -7deg) scale(1.08); }
+        .state-expanded.deck-idx-2 { transform: translate(110px, -45px) rotate(  0deg) scale(1.10); }
+        .state-expanded.deck-idx-3 { transform: translate(150px, -35px) rotate(  7deg) scale(1.08); }
+        .state-expanded.deck-idx-4 { transform: translate(190px, -10px) rotate( 14deg) scale(1.05); }
         /* "Pulled" — one card lifted farther and up */
         .pulled { transform: translate(0px, -80px) rotate(0deg) scale(1.4);
                   box-shadow: 0 8px 20px rgba(0,0,0,0.6); }
         /* Focused card (mouse over a specific card while deck is fanned) */
-        .card-focused { transform: translate(100px, -170px) rotate(0deg) scale(1.7) !important;
+        .card-focused { transform: translate(100px, -95px) rotate(0deg) scale(1.5) !important;
                         box-shadow: 0 12px 30px rgba(0,0,0,0.7);
                         border: 2px solid white; }
         /* Full-screen photo viewer */
@@ -572,7 +572,7 @@ class ThumbnailDeck(Gtk.Overlay):
     # Bigger widget than the visible card so the fan-out region is inside
     # the hit area (GTK4 hit boxes don't follow CSS transforms).
     HIT_W     = 320
-    HIT_H     = 200
+    HIT_H     = 160
 
     def __init__(self, on_click=None, on_card_click=None):
         super().__init__()
@@ -644,10 +644,10 @@ class ThumbnailDeck(Gtk.Overlay):
             img.add_css_class("deck-card")
             img.add_css_class(f"deck-idx-{i}")   # for stacking transforms
 
-            # Anchor each card to the bottom-left of the deck widget so it
-            # sits where a single 56×56 thumbnail used to, even though the
-            # deck widget itself is now 220×140.
-            img.set_halign(Gtk.Align.START); img.set_valign(Gtk.Align.END)
+            # Anchor each card to the LEFT and vertically centered — this
+            # keeps the thumbnail well inside the action area (avoids the
+            # bottom-cutoff when the deck was anchored to END).
+            img.set_halign(Gtk.Align.START); img.set_valign(Gtk.Align.CENTER)
             self.cards.append(img)
             self.add_overlay(img)
         self._focused_card = None
@@ -679,14 +679,18 @@ class ThumbnailDeck(Gtk.Overlay):
         self._focused_card = target
 
     # ---- new press/hold interaction ----
-    HOLD_MS = 220   # how long to hold before fan-out starts
+    HOLD_MS   = 220   # ms to hold before fan-out starts
+    DBLCLK_MS = 280   # ms to wait for a possible second click before opening
 
     def _on_press(self, gesture, n_press, x, y):
-        # Cancel any prior hold timer
+        # If a single-click was pending from an earlier release, cancel it —
+        # a second press means the user is going for a double-click OR a hold.
+        if self._click_timer:
+            GLib.source_remove(self._click_timer); self._click_timer = None
+        # Start (or restart) hold timer
         if self._hold_timer:
             GLib.source_remove(self._hold_timer); self._hold_timer = None
         self._press_is_hold = False
-        # Start hold timer — if user holds this long, we fan out
         def _trigger():
             self._hold_timer = None
             self._press_is_hold = True
@@ -699,12 +703,16 @@ class ThumbnailDeck(Gtk.Overlay):
         if self._hold_timer:
             GLib.source_remove(self._hold_timer); self._hold_timer = None
             if n_press >= 2:
-                # Double click → open gallery folder
+                # Second click confirmed — open gallery
                 if self.on_click: self.on_click()
             else:
-                # Single click → open MOST RECENT (top of deck)
-                if self.card_paths and self.on_card_click:
-                    self.on_card_click(self.card_paths[-1])
+                # First (short) click — defer to see if a second click follows
+                def _fire_single():
+                    self._click_timer = None
+                    if self.card_paths and self.on_card_click:
+                        self.on_card_click(self.card_paths[-1])
+                    return False
+                self._click_timer = GLib.timeout_add(self.DBLCLK_MS, _fire_single)
             return
         # Otherwise we were in hold/fan mode — open the focused card
         if self._press_is_hold:
