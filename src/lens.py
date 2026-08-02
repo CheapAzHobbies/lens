@@ -60,6 +60,8 @@ class LensWindow(Adw.ApplicationWindow):
         super().__init__(application=app, title="Lens")
         # Landscape default — works well on laptops. Resizable to portrait for tablets.
         self.set_default_size(960, 640)
+        self.set_size_request(320, 400)   # allow shrinking down to phone-ish sizes
+        self.set_resizable(True)
         self.pipeline = None
         self.paintable = None
         self.cameras = list_v4l2_cameras() or [("/dev/video0", "Camera")]
@@ -140,7 +142,7 @@ class LensWindow(Adw.ApplicationWindow):
         bottom = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         bottom.set_valign(Gtk.Align.END)
         bottom.add_css_class("bottom-bar")
-        bottom.set_size_request(-1, 180)
+        # Natural min via child widgets, don't force size — lets window shrink freely
         overlay.add_overlay(bottom)
 
         # Mode pill
