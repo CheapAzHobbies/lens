@@ -125,6 +125,10 @@ class LensWindow(Adw.ApplicationWindow):
         self.picture = Gtk.Picture()
         self.picture.set_can_shrink(True)
         self.picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+        self.picture.set_hexpand(True)
+        self.picture.set_vexpand(True)
+        self.picture.set_halign(Gtk.Align.CENTER)   # center horizontally
+        self.picture.set_valign(Gtk.Align.CENTER)   # center vertically
         bg.append(self.picture)
 
         # ---- Top control row ----
@@ -137,6 +141,14 @@ class LensWindow(Adw.ApplicationWindow):
         self.btn_aspect = self._pill_button(self.aspects[0], self._toggle_aspect, width=58, tint=False)
         self.btn_timer  = self._pill_button("⏱",  self._toggle_timer,  width=58, tint=False)
         top.append(self.btn_grid); top.append(self.btn_aspect); top.append(self.btn_timer)
+
+        # Fullscreen toggle — top-right corner
+        self.btn_fullscreen = self._pill_button("⛶", self._toggle_fullscreen, width=42, tint=False)
+        self.btn_fullscreen.set_halign(Gtk.Align.END)
+        self.btn_fullscreen.set_valign(Gtk.Align.START)
+        self.btn_fullscreen.set_margin_top(12)
+        self.btn_fullscreen.set_margin_end(12)
+        overlay.add_overlay(self.btn_fullscreen)
 
         # ---- Bottom control area ----
         bottom = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -235,7 +247,9 @@ class LensWindow(Adw.ApplicationWindow):
         # Keyboard shortcuts
         ctrl = Gtk.ShortcutController()
         for accel, fn in [("space", self._on_shutter), ("Return", self._on_shutter),
-                          ("f", self._flip_camera), ("g", self._toggle_grid)]:
+                          ("f", self._flip_camera), ("g", self._toggle_grid),
+                          ("F11", self._toggle_fullscreen),
+                          ("Escape", self.unfullscreen)]:
             sc = Gtk.Shortcut.new(
                 Gtk.ShortcutTrigger.parse_string(accel),
                 Gtk.CallbackAction.new(lambda w, args, f=fn: (f(), True)[1]))
@@ -282,6 +296,10 @@ class LensWindow(Adw.ApplicationWindow):
         else:
             self.btn_photo.add_css_class("mode-active")
             self.btn_video.remove_css_class("mode-active")
+
+    def _toggle_fullscreen(self):
+        if self.is_fullscreen(): self.unfullscreen()
+        else: self.fullscreen()
 
     def _flip_camera(self):
         if len(self.cameras) < 2: return
