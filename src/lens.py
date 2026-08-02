@@ -189,8 +189,12 @@ class LensWindow(Adw.ApplicationWindow):
         act_row.set_hexpand(True)
         bottom.append(act_row)
 
-        # Stacked deck-of-cards thumbnail — hover to fan out + auto-cycle
-        self.thumb = ThumbnailDeck(on_click=self._open_gallery)
+        # Stacked deck-of-cards thumbnail — hover to fan out + auto-cycle,
+        # click a card to see it full-screen
+        self.thumb = ThumbnailDeck(
+            on_click=self._open_gallery,
+            on_card_click=self._open_photo_viewer,
+        )
         act_row.append(self.thumb)
         # Load any pre-existing photos into the deck
         self._refresh_deck()
@@ -248,6 +252,32 @@ class LensWindow(Adw.ApplicationWindow):
         self.grid_widget.set_visible(False)
         overlay.add_overlay(self.grid_widget)
 
+        # Full-screen photo viewer (last overlay so it sits on top of everything)
+        self.viewer = Gtk.Overlay()
+        self.viewer.add_css_class("viewer")
+        self.viewer.set_visible(False)
+        viewer_bg = Gtk.Box(); viewer_bg.add_css_class("viewer-bg")
+        viewer_bg.set_hexpand(True); viewer_bg.set_vexpand(True)
+        self.viewer.set_child(viewer_bg)
+        self.viewer_picture = Gtk.Picture()
+        self.viewer_picture.set_can_shrink(True)
+        self.viewer_picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+        self.viewer_picture.set_hexpand(True); self.viewer_picture.set_vexpand(True)
+        viewer_bg.append(self.viewer_picture)
+        # Close button
+        viewer_close = Gtk.Button(label="✕")
+        viewer_close.add_css_class("pill")
+        viewer_close.set_size_request(42, 42)
+        viewer_close.set_halign(Gtk.Align.END); viewer_close.set_valign(Gtk.Align.START)
+        viewer_close.set_margin_top(12); viewer_close.set_margin_end(12)
+        viewer_close.connect("clicked", lambda *_: self._close_photo_viewer())
+        self.viewer.add_overlay(viewer_close)
+        # Also close on click anywhere in the viewer backdrop
+        viewer_click = Gtk.GestureClick()
+        viewer_click.connect("released", lambda *_: self._close_photo_viewer())
+        viewer_bg.add_controller(viewer_click)
+        overlay.add_overlay(self.viewer)
+
         # CSS
         css = Gtk.CssProvider()
         css.load_from_string("""
@@ -291,6 +321,12 @@ class LensWindow(Adw.ApplicationWindow):
         /* "Pulled" — one card lifted farther and up */
         .pulled { transform: translate(0px, -80px) rotate(0deg) scale(1.4);
                   box-shadow: 0 8px 20px rgba(0,0,0,0.6); }
+        /* Focused card (mouse over a specific card while deck is fanned) */
+        .card-focused { transform: translate(0px, -110px) rotate(0deg) scale(2.4) !important;
+                        box-shadow: 0 12px 30px rgba(0,0,0,0.7);
+                        border: 2px solid white; z-index: 999; }
+        /* Full-screen photo viewer */
+        .viewer-bg { background: rgba(0,0,0,0.95); }
         .flip:active    { transform: scale(0.9); }
         .pill:active    { transform: scale(0.9); }
         .rec-shutter { background: red; border-radius: 8px;
@@ -318,10 +354,14 @@ class LensWindow(Adw.ApplicationWindow):
 
         # Keyboard shortcuts
         ctrl = Gtk.ShortcutController()
+        def _esc(*_):
+            if self.viewer.get_visible():
+                self._close_photo_viewer(); return
+            self.unfullscreen()
         for accel, fn in [("space", self._on_shutter), ("Return", self._on_shutter),
                           ("f", self._flip_camera), ("g", self._toggle_grid),
                           ("F11", self._toggle_fullscreen),
-                          ("Escape", self.unfullscreen)]:
+                          ("Escape", _esc)]:
             sc = Gtk.Shortcut.new(
                 Gtk.ShortcutTrigger.parse_string(accel),
                 Gtk.CallbackAction.new(lambda w, args, f=fn: (f(), True)[1]))
@@ -503,6 +543,17 @@ class LensWindow(Adw.ApplicationWindow):
     def _open_gallery(self, *_):
         Gio.AppInfo.launch_default_for_uri("file://" + str(PICTURES), None)
 
+    def _open_photo_viewer(self, path):
+        """Show a photo full-screen inside Lens (not the whole OS window)."""
+        try:
+            self.viewer_picture.set_filename(path)
+        except Exception as e:
+            print("viewer load:", e); return
+        self.viewer.set_visible(True)
+
+    def _close_photo_viewer(self):
+        self.viewer.set_visible(False)
+
     def _refresh_deck(self):
         """Feed the last N photos on disk into the thumbnail deck."""
         jpgs = sorted(PICTURES.glob("*.jpg"), key=lambda p: p.stat().st_mtime)
@@ -521,12 +572,14 @@ class ThumbnailDeck(Gtk.Overlay):
     THUMB_PX  = 56    # collapsed edge
     HOVER_PX  = 84    # expanded edge
 
-    def __init__(self, on_click=None):
+    def __init__(self, on_click=None, on_card_click=None):
         super().__init__()
         self.set_size_request(self.THUMB_PX, self.THUMB_PX)
         self.set_hexpand(False); self.set_vexpand(False)
         self.set_valign(Gtk.Align.CENTER); self.set_halign(Gtk.Align.START)
         self.on_click = on_click
+        self.on_card_click = on_card_click
+        self.card_paths = []
         self.cards = []        # bottom-to-top order
         self.hover_delay_id = None
         self.cycle_id = None
@@ -539,15 +592,11 @@ class ThumbnailDeck(Gtk.Overlay):
         self.placeholder.add_css_class("thumb-placeholder")
         self.set_child(self.placeholder)
 
-        # Hover
+        # Hover (deck-level)
         motion = Gtk.EventControllerMotion()
         motion.connect("enter", lambda *_: self._on_enter())
         motion.connect("leave", lambda *_: self._on_leave())
         self.add_controller(motion)
-        # Click
-        click = Gtk.GestureClick()
-        click.connect("released", lambda *_: on_click() if on_click else None)
-        self.add_controller(click)
 
     def _load_thumb(self, path, size=112):
         try:
@@ -568,6 +617,7 @@ class ThumbnailDeck(Gtk.Overlay):
             self.remove_overlay(self.cards.pop())
         self.set_child(None)
         latest = list(paths)[-self.DECK_SIZE:]
+        self.card_paths = [str(p) for p in latest]
         if not latest:
             self.set_child(self.placeholder); return
         for i, p in enumerate(latest):
@@ -577,8 +627,34 @@ class ThumbnailDeck(Gtk.Overlay):
             img.set_pixel_size(self.THUMB_PX)
             img.add_css_class("deck-card")
             img.add_css_class(f"deck-idx-{i}")   # for stacking transforms
+
+            # Per-card hover: on enter add 'card-focused' (larger, centered);
+            # on leave remove it. Also pause the auto-cycle while focused.
+            card_motion = Gtk.EventControllerMotion()
+            def _card_enter(*_, card=img):
+                if not self.expanded: return
+                self._focused_card = card
+                card.add_css_class("card-focused")
+            def _card_leave(*_, card=img):
+                if card.has_css_class("card-focused"):
+                    card.remove_css_class("card-focused")
+                if self._focused_card is card:
+                    self._focused_card = None
+            card_motion.connect("enter", _card_enter)
+            card_motion.connect("leave", _card_leave)
+            img.add_controller(card_motion)
+
+            # Per-card click: open full-screen preview of THIS card's photo.
+            click = Gtk.GestureClick()
+            def _card_click(gesture, n_press, x, y, path=str(p)):
+                if self.on_card_click: self.on_card_click(path)
+                elif self.on_click: self.on_click()
+            click.connect("released", _card_click)
+            img.add_controller(click)
+
             self.cards.append(img)
             self.add_overlay(img)
+        self._focused_card = None
         self._refresh_transforms()
 
     def _refresh_transforms(self):
@@ -614,6 +690,9 @@ class ThumbnailDeck(Gtk.Overlay):
 
     def _cycle_pull(self):
         if not self.expanded or not self.cards: return False
+        # If user is focused on a specific card, don't disturb it
+        if getattr(self, "_focused_card", None):
+            return True
         # Un-pull previous card
         for c in self.cards:
             if c.has_css_class("pulled"): c.remove_css_class("pulled")
