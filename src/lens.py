@@ -596,18 +596,23 @@ class ThumbnailDeck(Gtk.Overlay):
         self.placeholder.add_css_class("thumb-placeholder")
         self.set_child(self.placeholder)
 
-        # Hover (deck-level, single controller — tracks cursor over the whole
-        # widget, then computes which card is focused by cursor x-position.
-        # Avoids per-card enter/leave ping-pong when moving across cards.)
+        # New interaction: press-and-hold to fan out, release on a card to
+        # open it. Short click opens the most recent. Double click opens the
+        # gallery folder in the file manager.
+        self._hold_timer = None
+        self._press_is_hold = False
+
+        press = Gtk.GestureClick.new()
+        press.set_button(1)   # left mouse
+        press.connect("pressed",  self._on_press)
+        press.connect("released", self._on_release)
+        self.add_controller(press)
+
+        # Motion controller — only used while in hold mode
         motion = Gtk.EventControllerMotion()
-        motion.connect("enter", lambda *_: self._on_enter())
-        motion.connect("leave", lambda *_: self._on_leave())
         motion.connect("motion", lambda _c, x, y: self._on_motion(x, y))
+        motion.connect("leave", lambda *_: self._on_leave())
         self.add_controller(motion)
-        # Deck-level click (falls through to the focused card, if any)
-        click = Gtk.GestureClick()
-        click.connect("released", self._handle_click)
-        self.add_controller(click)
 
     def _load_thumb(self, path, size=112):
         try:
@@ -673,27 +678,64 @@ class ThumbnailDeck(Gtk.Overlay):
         target.add_css_class("card-focused")
         self._focused_card = target
 
-    def _handle_click(self, gesture, n_press, x, y):
-        """Click on the deck — if a card is focused, view it; else open gallery."""
-        if self._focused_card and self._focused_card in self.cards:
-            idx = self.cards.index(self._focused_card)
-            if idx < len(self.card_paths) and self.on_card_click:
-                self.on_card_click(self.card_paths[idx]); return
-        if self.on_click: self.on_click()
+    # ---- new press/hold interaction ----
+    HOLD_MS = 220   # how long to hold before fan-out starts
 
-    def _on_enter(self):
-        if self.hover_delay_id: return
-        self.hover_delay_id = GLib.timeout_add(500, self._expand)
+    def _on_press(self, gesture, n_press, x, y):
+        # Cancel any prior hold timer
+        if self._hold_timer:
+            GLib.source_remove(self._hold_timer); self._hold_timer = None
+        self._press_is_hold = False
+        # Start hold timer — if user holds this long, we fan out
+        def _trigger():
+            self._hold_timer = None
+            self._press_is_hold = True
+            self._expand()
+            return False
+        self._hold_timer = GLib.timeout_add(self.HOLD_MS, _trigger)
 
-    def _on_leave(self):
-        if self.hover_delay_id:
-            GLib.source_remove(self.hover_delay_id); self.hover_delay_id = None
+    def _on_release(self, gesture, n_press, x, y):
+        # If we're mid-hold-timer, release before threshold = a click
+        if self._hold_timer:
+            GLib.source_remove(self._hold_timer); self._hold_timer = None
+            if n_press >= 2:
+                # Double click → open gallery folder
+                if self.on_click: self.on_click()
+            else:
+                # Single click → open MOST RECENT (top of deck)
+                if self.card_paths and self.on_card_click:
+                    self.on_card_click(self.card_paths[-1])
+            return
+        # Otherwise we were in hold/fan mode — open the focused card
+        if self._press_is_hold:
+            if self._focused_card and self._focused_card in self.cards:
+                idx = self.cards.index(self._focused_card)
+                if idx < len(self.card_paths) and self.on_card_click:
+                    self.on_card_click(self.card_paths[idx])
+            self._press_is_hold = False
+            self._collapse()
+
+    def _collapse(self):
+        """Reverse of _expand: hide the fan, stop the cycle."""
         if self.cycle_id:
             GLib.source_remove(self.cycle_id); self.cycle_id = None
         self.expanded = False
         for c in self.cards:
+            if c.has_css_class("card-focused"): c.remove_css_class("card-focused")
             if c.has_css_class("pulled"): c.remove_css_class("pulled")
+        self._focused_card = None
         self._refresh_transforms()
+
+    def _on_enter(self):
+        # Hover no longer triggers the fan — kept for API stability but unused.
+        pass
+
+    def _on_leave(self):
+        # If the mouse leaves the deck mid-hold, cancel the fan.
+        if self._hold_timer:
+            GLib.source_remove(self._hold_timer); self._hold_timer = None
+        if self.expanded:
+            self._collapse()
 
     def _expand(self):
         self.hover_delay_id = None
