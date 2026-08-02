@@ -9,7 +9,8 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Gst", "1.0")
 gi.require_version("GstApp", "1.0")
-from gi.repository import Gtk, Adw, Gst, GLib, Gdk, Gio, GObject
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gtk, Adw, Gst, GLib, Gdk, Gio, GObject, GdkPixbuf
 
 Gst.init(None)
 
@@ -421,11 +422,17 @@ class LensWindow(Adw.ApplicationWindow):
         # Flash animation + thumbnail update
         self._flash()
         try:
-            thumb_img = Gtk.Picture.new_for_filename(str(path))
-            thumb_img.set_content_fit(Gtk.ContentFit.COVER)
-            thumb_img.set_size_request(56, 56)   # lock size — don't let it grow
-            thumb_img.set_can_shrink(True)
-            self.thumb.set_child(thumb_img)
+            # Load, center-crop to square, scale to 56×56 — locks the button size.
+            full = GdkPixbuf.Pixbuf.new_from_file(str(path))
+            side = min(full.get_width(), full.get_height())
+            x = (full.get_width()  - side) // 2
+            y = (full.get_height() - side) // 2
+            square = full.new_subpixbuf(x, y, side, side)
+            thumb_pb = square.scale_simple(112, 112, GdkPixbuf.InterpType.BILINEAR)
+            texture = Gdk.Texture.new_for_pixbuf(thumb_pb)
+            img = Gtk.Image.new_from_paintable(texture)
+            img.set_pixel_size(56)   # forces the image widget to 56×56
+            self.thumb.set_child(img)
         except Exception as e:
             print("thumb update:", e)
 
