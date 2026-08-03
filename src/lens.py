@@ -888,6 +888,7 @@ class LensWindow(Adw.ApplicationWindow):
         # --- top left: recording state
         rec_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         rec_row.set_valign(Gtk.Align.CENTER)
+        rec_row.add_css_class("hud-chip")
         self.rec_dot = Gtk.Box()
         self.rec_dot.add_css_class("rec-dot")
         self.rec_dot.set_size_request(13, 13)
@@ -903,10 +904,12 @@ class LensWindow(Adw.ApplicationWindow):
         # --- top centre: clock
         self.hud_clock = Gtk.Label(label="")
         self.hud_clock.add_css_class("hud-mono")
+        self.hud_clock.add_css_class("hud-chip")
 
         # --- top right: power
         bat_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         bat_row.set_valign(Gtk.Align.CENTER)
+        bat_row.add_css_class("hud-chip")
         self.bat_gauge = BatteryGauge()
         self.bat_label = Gtk.Label(label="--%")
         self.bat_label.add_css_class("hud-mono")
@@ -930,6 +933,7 @@ class LensWindow(Adw.ApplicationWindow):
         # sizes where the top row has already had to shed things.
         audio_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         audio_row.set_valign(Gtk.Align.CENTER)
+        audio_row.add_css_class("hud-chip")
         self.btn_mic = Gtk.Button()
         self.mic_icon = Gtk.Image.new_from_icon_name("audio-input-microphone-symbolic")
         self.mic_icon.set_pixel_size(16)
@@ -950,6 +954,7 @@ class LensWindow(Adw.ApplicationWindow):
         # --- bottom right: what is being written
         info_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         info_row.set_valign(Gtk.Align.CENTER)
+        info_row.add_css_class("hud-chip")
         self.hud_fps = Gtk.Label(label="")
         self.hud_fps.add_css_class("hud-mono")
         self.btn_res = Gtk.MenuButton()
@@ -1164,6 +1169,12 @@ class LensWindow(Adw.ApplicationWindow):
         /* Tabular figures: without this the timer and clock shuffle
            sideways every time a digit changes width. */
         .hud-mono, .hud-dim, .hud-rec { font-feature-settings: "tnum" 1; }
+        /* Each corner sits on its own scrim. A text shadow alone disappeared
+           against a bright scene, and it could never help the mic icon,
+           which is line art rather than text. */
+        .hud-chip { background: rgba(0,0,0,0.45);
+                    border-radius: 9px;
+                    padding: 3px 9px; }
         window.size-compact .hud-mono,
         window.size-compact .hud-rec { font-size: 12px; }
         window.size-compact .hud-dim { font-size: 10px; }
@@ -1172,13 +1183,13 @@ class LensWindow(Adw.ApplicationWindow):
         window.size-tiny .hud-dim { font-size: 10px; }
         .hud-mono { color: white; font-family: monospace; font-size: 13px;
                     font-weight: bold; letter-spacing: 1px;
-                    text-shadow: 0 1px 3px rgba(0,0,0,0.9); }
+                    text-shadow: 0 1px 2px rgba(0,0,0,1); }
         .hud-dim  { color: rgba(255,255,255,0.72); font-family: monospace;
                     font-size: 11px; letter-spacing: 0px;
-                    text-shadow: 0 1px 3px rgba(0,0,0,0.9); }
+                    text-shadow: 0 1px 2px rgba(0,0,0,1); }
         .hud-rec  { color: #ff3b30; font-family: monospace; font-size: 13px;
                     font-weight: bold; letter-spacing: 2px;
-                    text-shadow: 0 1px 3px rgba(0,0,0,0.9); }
+                    text-shadow: 0 1px 2px rgba(0,0,0,1); }
         .hud-rec.standby { color: rgba(255,255,255,0.75); }
         .hud-btn { background: transparent; border: none; padding: 2px 4px;
                    min-width: 0; min-height: 0; color: white; }
@@ -2183,12 +2194,22 @@ class LensWindow(Adw.ApplicationWindow):
         # machine without a mic still records video.
         self.mic_active = self.mic_available and self.mic_enabled
         src = f"pulsesrc device={self.mic_source}" if self.mic_source else "pulsesrc"
-        audio = (f" {src} ! audioconvert ! audioresample ! "
-                 f"{aenc} ! mux. ") if self.mic_active else ""
+        # Every branch feeding the muxer gets a queue, and audio gets a
+        # generous one. Without it pulsesrc fed the muxer directly while
+        # x264 was encoding 1.9MP frames on the same pipeline, so the audio
+        # branch was starved and the result crackled. audiorate patches any
+        # timestamp gaps that slip through rather than letting them become
+        # clicks.
+        aq = ("queue max-size-time=3000000000 max-size-buffers=0 "
+              "max-size-bytes=0")
+        audio = (f" {src} provide-clock=false ! {aq} ! audioconvert ! "
+                 f"audioresample ! audiorate ! {aenc} ! queue ! mux. "
+                 ) if self.mic_active else ""
         self.pipeline = Gst.parse_launch(
             f"{self._source_for(dev)} ! tee name=t "
             f"t. ! queue ! videoconvert ! gtk4paintablesink name=sink "
-            f"t. ! queue ! videoconvert ! {venc} ! mux. "
+            f"t. ! queue max-size-buffers=8 ! videoconvert ! {venc} ! "
+            f"queue ! mux. "
             f"{audio}"
             f"{muxer} name=mux ! filesink location={path}"
         )
