@@ -901,11 +901,15 @@ class LensWindow(Adw.ApplicationWindow):
         /* Accelerate into the close, decelerate out of the open. One
            symmetric ease for both directions made the hold in the middle
            read as a stall. */
-        .viewflip { transition: transform 190ms cubic-bezier(.4, 0, 1, 1); }
+        /* Front-loaded: roughly 85% of the travel in the first third, then
+           a slow creep from a narrow sliver down to closed. Reads as quick
+           while still moving the entire time the camera is waking up. */
+        .viewflip { transition: transform 190ms cubic-bezier(0, .72, .28, 1); }
         .viewflip.flip-fast  { transition-duration: 190ms; }
         .viewflip.flip-med   { transition-duration: 300ms; }
-        .viewflip.flip-slow  { transition-duration: 380ms; }
-        .viewflip.flip-vslow { transition-duration: 440ms; }
+        .viewflip.flip-slow  { transition-duration: 420ms; }
+        .viewflip.flip-vslow { transition-duration: 560ms; }
+        .viewflip.flip-xslow { transition-duration: 700ms; }
         .viewflip.opening { transition: transform 300ms cubic-bezier(0, 0, .2, 1); }
         .viewflip.flipped { transform: scaleX(0.02); }
         .viewer-bg { background: rgba(0,0,0,0.95); }
@@ -1219,16 +1223,17 @@ class LensWindow(Adw.ApplicationWindow):
         # smooth; fast then stalled does not.
         nxt = (self.cam_idx + 1) % len(self.cameras) if target is None else target
         wake = self._cam_latency.get(self.cameras[nxt][2], 380)
-        for cls in ("flip-fast", "flip-med", "flip-slow", "flip-vslow"):
+        for cls in ("flip-fast", "flip-med", "flip-slow", "flip-vslow", "flip-xslow"):
             self.frame_stack.remove_css_class(cls)
-        # Aim the close at ~85% of the wake time, but cap it. Covering the
-        # rear camera's full 770ms wake made that direction visibly slower
-        # than the other, and matching speeds matters more than hiding every
-        # last millisecond of the wait.
-        want = min(wake * 0.85, self.FLIP_MAX_MS)
+        # Cover the whole wake again, but with a front-loaded curve rather
+        # than a slower even one. The eye judges speed by the first movement,
+        # not the total, so most of the travel happens early and the rest
+        # creeps in. Capping the duration instead just moved the stall to the
+        # end.
+        want = wake * 0.9
         tier, close_ms = min(
-            (("flip-fast", 190), ("flip-med", 300),
-             ("flip-slow", 380), ("flip-vslow", 440)),
+            (("flip-fast", 190), ("flip-med", 300), ("flip-slow", 420),
+             ("flip-vslow", 560), ("flip-xslow", 700)),
             key=lambda t: abs(t[1] - want))
         self.frame_stack.add_css_class(tier)
         self._flip_t0 = time.monotonic()
