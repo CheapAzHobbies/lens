@@ -484,6 +484,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.denoise = bool(cfg.get("denoise", True))
         self._denoise_module = None
         clear_stale_denoise()
+        GLib.timeout_add_seconds(3, self._denoise_watchdog)
         self.mic_available = has_microphone()
         self.mic_enabled = bool(cfg.get("mic_enabled", True))
         self.mic_active = False
@@ -1652,6 +1653,19 @@ class LensWindow(Adw.ApplicationWindow):
         if self._denoise_module:
             unload_denoise(self._denoise_module)
             self._denoise_module = None
+
+    def _denoise_watchdog(self):
+        """Unload the module the moment nothing is using the microphone.
+
+        The close, signal and atexit paths cover shutdown, but this covers
+        the rest: leaving video mode by a route that skipped the teardown,
+        muting, a monitor that failed to start. If the module is loaded and
+        no audio consumer is live, it goes.
+        """
+        if self._denoise_module and not self._audio_mon and not self.recording:
+            print("Lens: no audio consumer, releasing the microphone")
+            self._drop_denoise()
+        return True
 
     # ---- live audio level ----
     def _start_audio_monitor(self):
