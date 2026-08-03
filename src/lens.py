@@ -353,6 +353,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.countdown_val = 0
 
         self._build_ui()
+        self._install_breakpoints()
         self._apply_settings()
         self._start_pipeline()
 
@@ -574,6 +575,8 @@ class LensWindow(Adw.ApplicationWindow):
         ballast.set_size_request(3 * 34 + 2 * 2, -1)
         top_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         top_bar.add_css_class("top-bar")
+        self._ballast = ballast
+        self._top_pills = top
         top_bar.append(ballast)
         top_bar.append(gap_l)
         top_bar.append(top)
@@ -927,6 +930,15 @@ class LensWindow(Adw.ApplicationWindow):
         .pill:active    { transform: scale(0.9); }
         /* Camcorder HUD. Monospace and a hard shadow so it stays legible
            over any scene, the way a viewfinder overlay has to be. */
+        /* Tabular figures: without this the timer and clock shuffle
+           sideways every time a digit changes width. */
+        .hud-mono, .hud-dim, .hud-rec { font-feature-settings: "tnum" 1; }
+        window.size-compact .hud-mono,
+        window.size-compact .hud-rec { font-size: 12px; }
+        window.size-compact .hud-dim { font-size: 10px; }
+        window.size-tiny .hud-mono,
+        window.size-tiny .hud-rec { font-size: 11px; }
+        window.size-tiny .hud-dim { font-size: 10px; }
         .hud-mono { color: white; font-family: monospace; font-size: 13px;
                     font-weight: bold; letter-spacing: 1px;
                     text-shadow: 0 1px 3px rgba(0,0,0,0.9); }
@@ -957,6 +969,10 @@ class LensWindow(Adw.ApplicationWindow):
         .winctl { background: rgba(255,255,255,0.10); border: none; color: white;
                   border-radius: 17px; min-width: 34px; min-height: 34px;
                   padding: 0; transition: background 120ms ease-out; }
+        window.size-compact .winctl,
+        window.size-tiny .winctl { min-width: 28px; min-height: 28px;
+                                   border-radius: 14px; }
+        window.size-compact .pill { padding: 3px 8px; font-size: 13px; }
         .winctl:hover { background: rgba(255,255,255,0.22); }
         .winctl-close:hover { background: #e01b24; }
         .cam-row { background: transparent; border: none; color: white;
@@ -1006,6 +1022,78 @@ class LensWindow(Adw.ApplicationWindow):
         return b
 
     # ---------- Actions ----------
+    def _install_breakpoints(self):
+        """Re-lay the controls when the window gets narrow.
+
+        At the 320px minimum the deck alone wants 328px, the shutter 84 and
+        the flip button 200, so everything piled on top of everything else.
+        Both breakpoints call the same recompute, which reads the real width,
+        so overlapping conditions cannot fight each other.
+        """
+        for cond in ("max-width: 640px", "max-width: 430px"):
+            try:
+                bp = Adw.Breakpoint.new(Adw.BreakpointCondition.parse(cond))
+            except Exception as e:
+                print(f"Lens: breakpoint {cond} failed: {e}", file=sys.stderr)
+                continue
+            bp.connect("apply", lambda *_: self._resize_layout())
+            bp.connect("unapply", lambda *_: self._resize_layout())
+            self.add_breakpoint(bp)
+        self._size_class = None
+        GLib.idle_add(self._resize_layout)
+
+    def _resize_layout(self, *_):
+        w = self.get_width() or self.get_default_size()[0]
+        if w <= 430:
+            cls = "tiny"
+        elif w <= 640:
+            cls = "compact"
+        else:
+            cls = "roomy"
+        if cls == self._size_class:
+            return False
+        self._size_class = cls
+        for c in ("size-tiny", "size-compact", "size-roomy"):
+            self.remove_css_class(c)
+        self.add_css_class(f"size-{cls}")
+
+        if cls == "roomy":
+            self.thumb.set_visible(True)
+            self.thumb.set_scale(112, 300, 28)
+            self.btn_flip.set_size_request(72, 72)
+            self.btn_flip.set_margin_end(128)
+            self.shutter.set_size_request(84, 84)
+        elif cls == "compact":
+            self.thumb.set_visible(True)
+            self.thumb.set_scale(72, 168, 12)
+            self.btn_flip.set_size_request(56, 56)
+            self.btn_flip.set_margin_end(16)
+            self.shutter.set_size_request(68, 68)
+        else:
+            # No room for a preview deck next to a shutter and a flip button.
+            # The deck is the one to drop: the gallery is still one tap away
+            # on the shutter row, and losing the shutter would be worse.
+            self.thumb.set_visible(False)
+            self.btn_flip.set_size_request(48, 48)
+            self.btn_flip.set_margin_end(10)
+            self.shutter.set_size_request(60, 60)
+
+        # Top bar: the window controls must survive at every width, so the
+        # decorative ballast goes first and the mode pills go next. At 380px
+        # ballast(106) + pills(174) + controls(106) overflowed and the close
+        # button was pushed off the edge.
+        self._ballast.set_visible(cls == "roomy")
+        self._top_pills.set_visible(cls != "tiny")
+        self.btn_flip.set_visible(True)
+
+        # HUD: hide by priority rather than shrink into illegibility.
+        self.hud_format.set_visible(cls == "roomy")
+        self.bat_left_label.set_visible(cls == "roomy")
+        self.hud_clock.set_visible(cls != "tiny")
+        self.bat_label.set_visible(cls != "tiny")
+        self._refresh_deck()
+        return False
+
     def _apply_settings(self):
         """Push the restored settings into the widgets, without animating."""
         ratio = {"4:3": 4 / 3, "16:9": 16 / 9, "1:1": 1.0}[self.aspects[self.aspect_idx]]
@@ -1597,6 +1685,19 @@ class ThumbnailDeck(Gtk.Overlay):
     # the last card feels like the deck snatches itself away.
     FAN_EDGE   = 110  # horizontal px past the outermost card centre
     FAN_SLOP_Y = 160  # vertical px above/below the widget
+
+    def set_scale(self, thumb_px, hit_w, margin):
+        """Resize the deck for a narrower window."""
+        if thumb_px == self.THUMB_PX and hit_w == self.HIT_W:
+            return
+        self.THUMB_PX = thumb_px
+        self.HIT_W = hit_w
+        self.set_size_request(hit_w, self.HIT_H)
+        self.set_margin_start(margin)
+        # Force the next update_photos to rebuild. It short-circuits when the
+        # file list is unchanged, which meant a resize left the old cards at
+        # the old size and the deck kept overlapping the shutter.
+        self.card_paths = []
 
     def __init__(self, on_click=None, on_card_click=None):
         super().__init__()
