@@ -425,12 +425,12 @@ class LensWindow(Adw.ApplicationWindow):
         self.mic_active = False
         self._audio_mon = None
         self._audio_mon_handler = None
-        self._hud_extras = []
+        self._hud_items = []
         self._hud_hidden = set()
         self.cur_res = None
         self._fps_count = 0
         self._fps_shown = 0
-        self.overlay_mode = int(cfg.get("overlay_mode", 0)) % 3
+        self.overlay_mode = int(cfg.get("overlay_mode", 0)) % 4
         self.grid_visible = self.overlay_mode == 1
         # How long each camera takes to deliver its first frame, keyed by
         # stable id. Measured on use and persisted, so the flip is tuned from
@@ -972,7 +972,11 @@ class LensWindow(Adw.ApplicationWindow):
         # What each row sheds when it runs out of room. The mic and its meter
         # are never shed: whether your voice is being captured matters as
         # much as whether the camera is rolling.
-        self._hud_extras = [self.hud_clock, bat_row, info_row]
+        # Every corner the viewfinder checklist can switch on and off. This
+        # used to list only the clock, battery and format row, so unchecking
+        # the recording state or the microphone hid them permanently: nothing
+        # ever set them visible again.
+        self._hud_items = [rec_row, self.hud_clock, bat_row, audio_row, info_row]
         self.rec_indicator = hud
         self.rec_indicator.set_visible(False)
         # On the picture, not the window: the readouts belong over the frame
@@ -1168,6 +1172,8 @@ class LensWindow(Adw.ApplicationWindow):
         .hud-btn:hover { background: rgba(255,255,255,0.18);
                          border-radius: 6px; }
         .hud-btn-off { color: rgba(255,255,255,0.35); }
+        .hud-btn-muted { color: #ff3b30; }
+        .hud-btn-muted:hover { background: rgba(255,59,48,0.22); }
         .thumb { background: rgba(255,255,255,0.2); border-radius: 8px;
                  border: 1px solid white; }
         /* Was rgba(0,0,0,0.55), which is invisible on a black control bar:
@@ -1358,11 +1364,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.aspect_frame.set_ratio(ratio)
         self.btn_aspect.set_label(self.aspects[self.aspect_idx])
 
-        self.grid_widget.set_visible(self.grid_visible)
-        if self.overlay_mode == 1:
-            self.btn_grid.add_css_class("pill-active")
-        elif self.overlay_mode == 2:
-            self.btn_grid.add_css_class("pill-off")
+        self._apply_overlay_mode()
 
         if self.timer_sec > 0:
             self.btn_timer.set_label(f"{self.timer_sec}s")
@@ -1396,23 +1398,30 @@ class LensWindow(Adw.ApplicationWindow):
         Folding both into one control keeps the top bar short, and gives a
         way to clear the frame completely for a clean shot.
         """
-        self.overlay_mode = (getattr(self, "overlay_mode", 0) + 1) % 3
-        self.grid_visible = self.overlay_mode == 1
-        hud_on = self.overlay_mode in (0, 1)
+        self.overlay_mode = (getattr(self, "overlay_mode", 0) + 1) % 4
+        self._apply_overlay_mode()
+        self._save_settings()
 
+    def _apply_overlay_mode(self):
+        """0 readouts, 1 readouts + thirds, 2 readouts + 2x2, 3 nothing."""
+        m = self.overlay_mode
+        self.grid_visible = m in (1, 2)
+        self.grid_widget.set_divisions(3 if m == 1 else 2)
         self.grid_widget.set_visible(self.grid_visible)
-        self.rec_indicator.set_visible(hud_on and self.video_mode)
+        self.rec_indicator.set_visible(m != 3 and self.video_mode)
         self.btn_grid.remove_css_class("pill-active")
         self.btn_grid.remove_css_class("pill-off")
-        if self.overlay_mode == 1:
+        if m == 1:
             self.btn_grid.add_css_class("pill-active")
-            self.btn_grid.set_tooltip_text("Overlay: grid and readouts")
-        elif self.overlay_mode == 2:
+            self.btn_grid.set_tooltip_text("Grid: rule of thirds")
+        elif m == 2:
+            self.btn_grid.add_css_class("pill-active")
+            self.btn_grid.set_tooltip_text("Grid: halves")
+        elif m == 3:
             self.btn_grid.add_css_class("pill-off")
-            self.btn_grid.set_tooltip_text("Overlay: off")
+            self.btn_grid.set_tooltip_text("Overlay off")
         else:
-            self.btn_grid.set_tooltip_text("Overlay: readouts only")
-        self._save_settings()
+            self.btn_grid.set_tooltip_text("Readouts only, no grid")
 
     def _toggle_aspect(self):
         old = self.aspect_frame.get_ratio()
@@ -1633,9 +1642,6 @@ class LensWindow(Adw.ApplicationWindow):
             on = wdg not in self._hud_hidden
             box.append(self._menu_row(
                 label, on, lambda w=wdg: self._toggle_hud_item(w)))
-        box.append(Gtk.Separator())
-        box.append(self._menu_row("Rule-of-thirds grid", self.grid_visible,
-                                  self._toggle_grid_only))
         self.view_popover.set_child(box)
         rect = Gdk.Rectangle()
         rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
@@ -1646,32 +1652,35 @@ class LensWindow(Adw.ApplicationWindow):
         self.view_popover.popdown()
         if wdg in self._hud_hidden:
             self._hud_hidden.remove(wdg)
+            # Switching something on while the whole overlay is off via the
+            # '#' button would otherwise do nothing visible.
+            if self.overlay_mode == 3:
+                self.overlay_mode = 0
+                self._apply_overlay_mode()
+                self._save_settings()
         else:
             self._hud_hidden.add(wdg)
         self._fit_hud()
 
-    def _toggle_grid_only(self):
-        self.view_popover.popdown()
-        self.grid_visible = not self.grid_visible
-        self.grid_widget.set_visible(self.grid_visible)
-        self._save_settings()
-
     def _refresh_mic_icon(self):
+        for c in ("hud-btn-off", "hud-btn-muted"):
+            self.btn_mic.remove_css_class(c)
         if not self.mic_available:
-            name, tip = "microphone-disabled-symbolic", "No microphone found"
-        elif self.mic_enabled:
-            name, tip = "audio-input-microphone-symbolic", "Microphone on"
-        else:
-            name, tip = "microphone-disabled-symbolic", "Microphone muted"
-        self.mic_icon.set_from_icon_name(name)
-        self.btn_mic.set_tooltip_text(tip)
-        self.btn_mic.set_sensitive(self.mic_available)
-        live = self.mic_available and self.mic_enabled
-        self.audio_meter.set_muted(not live)
-        if live:
-            self.btn_mic.remove_css_class("hud-btn-off")
-        else:
+            # Nothing to record from: state the fact, quietly.
+            self.mic_icon.set_from_icon_name("microphone-disabled-symbolic")
+            self.btn_mic.set_tooltip_text("No microphone found")
             self.btn_mic.add_css_class("hud-btn-off")
+        elif self.mic_enabled:
+            self.mic_icon.set_from_icon_name("audio-input-microphone-symbolic")
+            self.btn_mic.set_tooltip_text("Microphone on, click to mute")
+        else:
+            # Muted is a warning, not a disabled state: you are about to
+            # record something silent. Grey made it nearly invisible.
+            self.mic_icon.set_from_icon_name("microphone-disabled-symbolic")
+            self.btn_mic.set_tooltip_text("Microphone MUTED, click to unmute")
+            self.btn_mic.add_css_class("hud-btn-muted")
+        self.btn_mic.set_sensitive(self.mic_available)
+        self.audio_meter.set_muted(not (self.mic_available and self.mic_enabled))
 
     def _toggle_mic(self):
         if not self.mic_available or self.recording:
@@ -1703,16 +1712,14 @@ class LensWindow(Adw.ApplicationWindow):
             return sum(x.get_preferred_size()[1].width for x in widgets
                        if x.get_visible())
 
-        # Start from everything, so widening restores it, minus whatever the
-        # viewfinder menu has switched off.
+        # Restore exactly what the checklist says, then let the fitting below
+        # hide more if there is no room. Anything the fitting hides comes back
+        # on the next pass, because this rebuilds from the checklist rather
+        # than from current visibility.
         self._hud_top.set_visible(True)
         self._hud_bot.set_visible(True)
-        for wdg in self._hud_extras:
-            wdg.set_visible(True)
-        for wdg in (self._rec_row, self.hud_clock, self._bat_row,
-                    self._audio_row, self._info_row):
-            if wdg in self._hud_hidden:
-                wdg.set_visible(False)
+        for wdg in self._hud_items:
+            wdg.set_visible(wdg not in self._hud_hidden)
 
         # Top row is a CenterBox, so the clock is centred in the whole row
         # rather than in the space left over. Comparing the sum of the three
@@ -2665,14 +2672,21 @@ class _GridOverlay(Gtk.DrawingArea):
     def __init__(self):
         super().__init__()
         self.set_can_target(False)  # transparent to input
+        self.divisions = 3
         self.set_draw_func(self._draw)
+
+    def set_divisions(self, n):
+        self.divisions = n
+        self.queue_draw()
 
     def _draw(self, area, cr, w, h):
         cr.set_source_rgba(1, 1, 1, 0.35)
         cr.set_line_width(1)
-        for i in (1, 2):
-            cr.move_to(w * i / 3, 0); cr.line_to(w * i / 3, h); cr.stroke()
-            cr.move_to(0, h * i / 3); cr.line_to(w, h * i / 3); cr.stroke()
+        n = getattr(self, "divisions", 3)
+        for i in range(1, n):
+            x, y = w * i / n, h * i / n
+            cr.move_to(x, 0); cr.line_to(x, h); cr.stroke()
+            cr.move_to(0, y); cr.line_to(w, y); cr.stroke()
 
 
 class LensApp(Adw.Application):
