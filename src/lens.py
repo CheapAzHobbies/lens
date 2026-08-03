@@ -305,8 +305,10 @@ class LensWindow(Adw.ApplicationWindow):
         .thumb-placeholder { color: rgba(255,255,255,0.6); }
         .deck-card {
             border-radius: 22px;                 /* much rounder corners */
-            border: 3px solid white;
-            box-shadow: 0 3px 8px rgba(0,0,0,0.55);
+            /* No white border. Separation between the fanned cards comes
+               from the drop shadow instead, which reads cleaner over a
+               photo than a hard white outline. */
+            box-shadow: 0 4px 14px rgba(0,0,0,0.7);
             transition: transform 520ms cubic-bezier(.25,.46,.45,.94),
                         opacity   400ms ease-out;
         }
@@ -357,8 +359,7 @@ class LensWindow(Adw.ApplicationWindow):
             transform: translate(80px, -190px) rotate(0deg) scale(1.7);
         }
         .card-focused {
-            box-shadow: 0 18px 40px rgba(0,0,0,0.85);
-            border: 4px solid white;
+            box-shadow: 0 18px 40px rgba(0,0,0,0.9);
         }
         /* Full-screen photo viewer */
         .viewer-bg { background: rgba(0,0,0,0.95); }
