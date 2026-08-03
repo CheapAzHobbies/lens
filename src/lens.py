@@ -330,7 +330,7 @@ class LensWindow(Adw.ApplicationWindow):
         /* Focused card — user is pointing at it while holding. Pull it up
            and out of the fan, upright, so it looks like a card being drawn
            from someone's hand. Bigger scale so it's clearly the selected one. */
-        .card-focused { transform: translate(80px, -140px) rotate(0deg) scale(1.7) !important;
+        .card-focused { transform: translate(80px, -190px) rotate(0deg) scale(1.7) !important;
                         box-shadow: 0 18px 40px rgba(0,0,0,0.85);
                         border: 4px solid white; }
         /* Full-screen photo viewer */
