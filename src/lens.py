@@ -405,6 +405,7 @@ class LensWindow(Adw.ApplicationWindow):
         frame_stack = self.frame_stack
 
         self.aspect_frame = Gtk.AspectFrame.new(0.5, 0.5, 4/3, False)
+        self.aspect_frame.add_css_class("viewframe")
         self.aspect_frame.set_child(frame_stack)
         self.aspect_frame.set_hexpand(True); self.aspect_frame.set_vexpand(True)
         bg.append(self.aspect_frame)
@@ -624,6 +625,10 @@ class LensWindow(Adw.ApplicationWindow):
         css = Gtk.CssProvider()
         css.load_from_string("""
         .bg-black { background: black; }
+        /* Everything behind the viewfinder is black, so the moment the
+           picture re-measures during a flip there is nothing grey to show
+           through: the default widget background was what flashed. */
+        window, .viewframe, .viewflip, picture { background: black; }
         .bottom-bar { background: #000; }
         .mode-pill { background: rgba(255,255,255,0.15); border-radius: 16px; padding: 2px; }
         .mode-btn { background: transparent; color: white; font-weight: bold;
