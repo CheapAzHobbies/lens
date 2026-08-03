@@ -393,7 +393,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.mic_active = False
         self._audio_mon = None
         self._audio_mon_handler = None
-        self._hud_droppable = []
+        self._hud_extras = []
         self.cur_res = None
         self._fps_count = 0
         self._fps_shown = 0
@@ -604,6 +604,9 @@ class LensWindow(Adw.ApplicationWindow):
         self.frame_stack.set_child(self.picture)
         self.frame_stack.add_overlay(self.grid_widget)
         self.frame_stack.add_css_class("viewflip")
+        # Nothing in the overlay may paint outside the picture, whatever
+        # its natural width says.
+        self.frame_stack.set_overflow(Gtk.Overflow.HIDDEN)
         frame_stack = self.frame_stack
 
         self.aspect_frame = Gtk.AspectFrame.new(0.5, 0.5, 4/3, False)
@@ -865,18 +868,17 @@ class LensWindow(Adw.ApplicationWindow):
         self.hud_format = Gtk.Label(label="MKV  H.264")
         self.hud_format.add_css_class("hud-dim")
         self.hud_format.set_halign(Gtk.Align.END)
+        self._hud_bot = hud_bot
         hud_bot.append(self.hud_clock)
         hud_bot.append(self.hud_fps)
         hud_bot.append(self.hud_format)
         hud.append(hud_bot)
 
-        # Dropped in this order as the picture narrows: decoration first,
-        # then detail, then the numbers, keeping REC state and the battery
-        # icon alive as long as possible.
-        self._hud_droppable = [
-            self.hud_format, self.bat_left_label, self.audio_meter,
-            self.hud_fps, self.hud_clock, self.bat_label, self.btn_mic,
-        ]
+        # Everything that is not the recording state. The mic button stays
+        # out of this list on purpose: whether your voice is being captured
+        # matters as much as whether the camera is rolling, so it survives
+        # alongside REC and the timer.
+        self._hud_extras = [self.audio_meter, bat_row]
         self.rec_indicator = hud
         self.rec_indicator.set_visible(False)
         # On the picture, not the window: the readouts belong over the frame
@@ -1445,36 +1447,36 @@ class LensWindow(Adw.ApplicationWindow):
         self._save_settings()
 
     def _fit_hud(self, *_):
-        """Drop HUD items until the two ends stop colliding.
+        """Each row is all or nothing, and the two rows decide separately.
 
-        Measured against the picture width, not the window width. With a 1:1
-        aspect in a wide window the picture is narrow while the window is
-        not, so a window-based rule left the readouts overlapping anyway.
-        Items are dropped least-useful first, and the whole row goes if even
-        the bare state and battery will not fit.
+        Half-populating a row looks broken, so a row that will not fit is
+        either stripped to the recording state or hidden outright. The rows
+        are judged independently because the bottom one is much the wider:
+        letting it drag the top one down meant the state and timer vanished
+        on a picture that had plenty of room for them.
         """
         stack_w = self.frame_stack.get_width()
         if stack_w <= 1:
             return False
-        # hud side margins (16 each) plus a minimum gap between the two ends
+        # side margins (16 each) plus a gap so the two ends never touch
         avail = stack_w - 32 - 28
 
-        # Start from everything visible again, so widening restores them.
+        def w_of(*widgets):
+            return sum(x.get_preferred_size()[1].width for x in widgets
+                       if x.get_visible())
+
+        # --- bottom row: date, resolution, codec. All of it or none of it.
+        self._hud_bot.set_visible(True)
+        self._hud_bot.set_visible(w_of(self._hud_bot) <= avail)
+
+        # --- top row: full readouts, else just REC/STBY and the timer.
         self._hud_top.set_visible(True)
-        for wdg in self._hud_droppable:
+        for wdg in self._hud_extras:
             wdg.set_visible(True)
-
-        def need():
-            return (self._rec_row.get_preferred_size()[1].width
-                    + self._bat_row.get_preferred_size()[1].width)
-
-        for wdg in self._hud_droppable:
-            if need() <= avail:
-                break
-            wdg.set_visible(False)
-        else:
-            # Nothing left to give and it still does not fit.
-            if need() > avail:
+        if w_of(self._rec_row, self._bat_row) > avail:
+            for wdg in self._hud_extras:
+                wdg.set_visible(False)
+            if w_of(self._rec_row) > avail:
                 self._hud_top.set_visible(False)
         return False
 
