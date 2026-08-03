@@ -2,7 +2,7 @@
 Name=Lens
 Comment=Fast mobile-first camera for Linux
 Exec=/home/bao/Documents/lens/src/lens.py
-Icon=camera-photo-symbolic
+Icon=org.cheapaz.Lens
 Terminal=false
 Type=Application
 Categories=AudioVideo;Video;

@@ -307,8 +307,8 @@ class LensWindow(Adw.ApplicationWindow):
             border-radius: 22px;                 /* much rounder corners */
             border: 3px solid white;
             box-shadow: 0 3px 8px rgba(0,0,0,0.55);
-            transition: transform 320ms cubic-bezier(.2,.9,.3,1.2),
-                        opacity   250ms ease-out;
+            transition: transform 520ms cubic-bezier(.25,.46,.45,.94),
+                        opacity   400ms ease-out;
         }
         /* Hand-of-cards style: bottom-center pivot.
            Idle = tight fan (just a hint), hold-to-expand fans wide. */
