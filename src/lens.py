@@ -183,6 +183,45 @@ def best_still_mode(dev):
     return max(same or mjpg, key=lambda m: m[1] * m[2])
 
 
+DENOISE_SOURCE = "lens_denoised"
+
+
+def load_denoise():
+    """Load webrtc noise suppression and return the module id, or None.
+
+    Deliberately on demand rather than in the PipeWire config. A permanently
+    loaded module keeps a capture stream alive, and GNOME then shows the
+    microphone as in use with nothing recording, which makes the indicator
+    worthless. This is also what Discord and friends do: suppression inside
+    the app, not system-wide.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["pactl", "load-module", "module-echo-cancel",
+             "aec_method=webrtc",
+             f"source_name={DENOISE_SOURCE}",
+             "source_properties=device.description=Denoised_Microphone",
+             "aec_args=noise_suppression=1 digital_gain_control=1 "
+             "voice_detection=1 high_pass_filter=1 echo_suppression=0 "
+             "analog_gain_control=0"],
+            capture_output=True, text=True, timeout=6)
+        mid = out.stdout.strip()
+        return mid if mid.isdigit() else None
+    except Exception as e:
+        print(f"Lens: noise suppression unavailable: {e}", file=sys.stderr)
+        return None
+
+
+def unload_denoise(module_id):
+    import subprocess
+    try:
+        subprocess.run(["pactl", "unload-module", str(module_id)],
+                       capture_output=True, timeout=6)
+    except Exception:
+        pass
+
+
 def list_audio_sources():
     """[(name, description)] of real capture sources."""
     import subprocess
@@ -420,6 +459,8 @@ class LensWindow(Adw.ApplicationWindow):
         # (w, h, fps) the user pinned, or None to auto-pick
         self.mode_override = cfg.get("mode_override")
         self.mic_source = cfg.get("mic_source")     # None = system default
+        self.denoise = bool(cfg.get("denoise", True))
+        self._denoise_module = None
         self.mic_available = has_microphone()
         self.mic_enabled = bool(cfg.get("mic_enabled", True))
         self.mic_active = False
@@ -461,6 +502,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.last_photo = None
         self.countdown_val = 0
 
+        self.connect("close-request", self._on_close)
         self._build_ui()
         self._install_breakpoints()
         self._apply_settings()
@@ -1423,6 +1465,7 @@ class LensWindow(Adw.ApplicationWindow):
             "container":    self.container,
             "mode_override": self.mode_override,
             "mic_source":   self.mic_source,
+            "denoise":      self.denoise,
             "timer_sec":    self.timer_sec,
             "video_mode":   self.video_mode,
             "cam_id":       self.cameras[self.cam_idx][2],
@@ -1520,6 +1563,34 @@ class LensWindow(Adw.ApplicationWindow):
             self._stop_audio_monitor()
         self._save_settings()
 
+    def _on_close(self, *_):
+        """Release the microphone on the way out.
+
+        Without this the suppression module outlived the window and GNOME
+        kept showing the mic as in use after Lens was closed.
+        """
+        self._stop_audio_monitor()
+        self._drop_denoise()
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+        return False
+
+    def _audio_device(self):
+        """Source the pipelines should read from, denoised when enabled."""
+        if self.mic_source:
+            return self.mic_source          # an explicit pick wins
+        if self.denoise:
+            if not self._denoise_module:
+                self._denoise_module = load_denoise()
+            if self._denoise_module:
+                return DENOISE_SOURCE
+        return None                          # system default
+
+    def _drop_denoise(self):
+        if self._denoise_module:
+            unload_denoise(self._denoise_module)
+            self._denoise_module = None
+
     # ---- live audio level ----
     def _start_audio_monitor(self):
         """Small audio-only pipeline that reports levels.
@@ -1533,7 +1604,7 @@ class LensWindow(Adw.ApplicationWindow):
             return
         try:
             self._audio_mon = Gst.parse_launch(
-                (f"pulsesrc device={self.mic_source} " if self.mic_source
+                (f"pulsesrc device={dev} " if (dev := self._audio_device())
                  else "pulsesrc ") +
                 "! audioconvert ! level interval=100000000 ! fakesink sync=false")
             bus = self._audio_mon.get_bus()
@@ -1558,6 +1629,10 @@ class LensWindow(Adw.ApplicationWindow):
         self._audio_mon = None
         self._audio_mon_handler = None
         self.audio_meter.set_db(None)
+        # Nothing needs the microphone now, so let the suppression module go
+        # and with it the capture stream GNOME counts.
+        if not self.recording:
+            self._drop_denoise()
 
     def _on_level(self, bus, msg):
         st = msg.get_structure()
@@ -1654,6 +1729,9 @@ class LensWindow(Adw.ApplicationWindow):
 
     def _build_mic_menu(self):
         box = self._menu_box()
+        box.append(self._menu_row("Noise suppression", self.denoise,
+                                  self._toggle_denoise))
+        box.append(Gtk.Separator())
         box.append(self._menu_head("AUDIO INPUT"))
         box.append(self._menu_row("System default", self.mic_source is None,
                                   lambda: self._set_mic_source(None)))
@@ -1662,6 +1740,17 @@ class LensWindow(Adw.ApplicationWindow):
                                       lambda n=name: self._set_mic_source(n)))
         self.mic_popover.set_child(box)
         self.mic_popover.popup()
+
+    def _toggle_denoise(self):
+        self.mic_popover.popdown()
+        self.denoise = not self.denoise
+        self._save_settings()
+        # Rebuild the monitor so the change is audible on the meter at once.
+        self._stop_audio_monitor()
+        if not self.denoise:
+            self._drop_denoise()
+        if self.video_mode:
+            self._start_audio_monitor()
 
     def _set_mic_source(self, name):
         self.mic_popover.popdown()
@@ -2200,7 +2289,8 @@ class LensWindow(Adw.ApplicationWindow):
         # same matroska container, dropped if there is no capture source so a
         # machine without a mic still records video.
         self.mic_active = self.mic_available and self.mic_enabled
-        src = f"pulsesrc device={self.mic_source}" if self.mic_source else "pulsesrc"
+        adev = self._audio_device()
+        src = f"pulsesrc device={adev}" if adev else "pulsesrc"
         # Every branch feeding the muxer gets a queue, and audio gets a
         # generous one. Without it pulsesrc fed the muxer directly while
         # x264 was encoding 1.9MP frames on the same pipeline, so the audio
