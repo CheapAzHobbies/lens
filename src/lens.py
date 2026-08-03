@@ -902,10 +902,10 @@ class LensWindow(Adw.ApplicationWindow):
            symmetric ease for both directions made the hold in the middle
            read as a stall. */
         .viewflip { transition: transform 190ms cubic-bezier(.4, 0, 1, 1); }
-        .viewflip.flip-fast { transition-duration: 190ms; }
-        .viewflip.flip-med  { transition-duration: 380ms; }
-        .viewflip.flip-slow { transition-duration: 560ms; }
-        .viewflip.flip-vslow { transition-duration: 760ms; }
+        .viewflip.flip-fast  { transition-duration: 190ms; }
+        .viewflip.flip-med   { transition-duration: 300ms; }
+        .viewflip.flip-slow  { transition-duration: 380ms; }
+        .viewflip.flip-vslow { transition-duration: 440ms; }
         .viewflip.opening { transition: transform 300ms cubic-bezier(0, 0, .2, 1); }
         .viewflip.flipped { transform: scaleX(0.02); }
         .viewer-bg { background: rgba(0,0,0,0.95); }
@@ -1143,6 +1143,9 @@ class LensWindow(Adw.ApplicationWindow):
         self._on_maximized_changed()
 
     FLIP_MS = 140
+    # Ceiling on the close, so a slow camera does not make its direction
+    # feel sluggish next to the other one.
+    FLIP_MAX_MS = 440
 
     def _show_camera_menu(self):
         """List every camera so one can be picked directly."""
@@ -1218,12 +1221,14 @@ class LensWindow(Adw.ApplicationWindow):
         wake = self._cam_latency.get(self.cameras[nxt][2], 380)
         for cls in ("flip-fast", "flip-med", "flip-slow", "flip-vslow"):
             self.frame_stack.remove_css_class(cls)
-        # Aim the close at ~85% of the wake time: still moving when the frame
-        # lands, without dragging on afterwards.
-        want = wake * 0.85
+        # Aim the close at ~85% of the wake time, but cap it. Covering the
+        # rear camera's full 770ms wake made that direction visibly slower
+        # than the other, and matching speeds matters more than hiding every
+        # last millisecond of the wait.
+        want = min(wake * 0.85, self.FLIP_MAX_MS)
         tier, close_ms = min(
-            (("flip-fast", 190), ("flip-med", 380),
-             ("flip-slow", 560), ("flip-vslow", 760)),
+            (("flip-fast", 190), ("flip-med", 300),
+             ("flip-slow", 380), ("flip-vslow", 440)),
             key=lambda t: abs(t[1] - want))
         self.frame_stack.add_css_class(tier)
         self._flip_t0 = time.monotonic()
