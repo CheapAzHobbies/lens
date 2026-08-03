@@ -1191,10 +1191,17 @@ class LensWindow(Adw.ApplicationWindow):
                     font-weight: bold; letter-spacing: 2px;
                     text-shadow: 0 1px 2px rgba(0,0,0,1); }
         .hud-rec.standby { color: rgba(255,255,255,0.75); }
-        .hud-btn { background: transparent; border: none; padding: 2px 4px;
-                   min-width: 0; min-height: 0; color: white; }
-        .hud-btn:hover { background: rgba(255,255,255,0.18);
-                         border-radius: 6px; }
+        /* GtkMenuButton wraps an inner button, so styling only the outer
+           widget left that inner one drawing its default frame: a visible
+           box around the resolution and format readouts. Both levels have
+           to be flattened. */
+        .hud-btn, .hud-btn > button {
+            background: transparent; border: none; box-shadow: none;
+            outline: none; padding: 2px 4px;
+            min-width: 0; min-height: 0; color: inherit; }
+        .hud-btn:hover, .hud-btn > button:hover {
+            background: rgba(255,255,255,0.18); border-radius: 6px; }
+        .hud-btn:focus, .hud-btn > button:focus { outline: none; }
         .hud-btn-off { color: rgba(255,255,255,0.35); }
         /* Filled, not outlined. A red line-art glyph over a bright picture
            was almost invisible, which defeats the point of warning that the
