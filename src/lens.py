@@ -25,6 +25,13 @@ VIDEOS   = pathlib.Path.home() / "Videos"  / "Lens"
 THUMBS = pathlib.Path(
     os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache")) / "lens" / "thumbs"
 VIDEO_EXTS = (".mkv", ".mp4", ".webm", ".mov")
+
+# label -> (extension, muxer, video encoder, audio encoder)
+CONTAINERS = {
+    "MKV":  ("mkv",  "matroskamux", "x264enc tune=zerolatency bitrate=4000", "opusenc"),
+    "MP4":  ("mp4",  "mp4mux",      "x264enc tune=zerolatency bitrate=4000", "voaacenc"),
+    "WebM": ("webm", "webmmux",     "vp8enc deadline=1",                     "opusenc"),
+}
 PICTURES.mkdir(parents=True, exist_ok=True)
 VIDEOS.mkdir(parents=True, exist_ok=True)
 
@@ -174,6 +181,25 @@ def best_still_mode(dev):
     native = biggest[1] / biggest[2]
     same = [m for m in mjpg if abs(m[1] / m[2] - native) < 0.02]
     return max(same or mjpg, key=lambda m: m[1] * m[2])
+
+
+def list_audio_sources():
+    """[(name, description)] of real capture sources."""
+    import subprocess
+    try:
+        out = subprocess.run(["pactl", "list", "short", "sources"],
+                             capture_output=True, text=True, timeout=2).stdout
+    except Exception:
+        return []
+    res = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2 or "monitor" in parts[1]:
+            continue
+        # Trim the long alsa_input.pci-... prefix down to something readable
+        pretty = parts[1].split(".")[-1].replace("_", " ")
+        res.append((parts[1], pretty))
+    return res
 
 
 def has_microphone():
@@ -388,12 +414,19 @@ class LensWindow(Adw.ApplicationWindow):
         self.aspect_idx = cfg.get("aspect_idx", 0)
         if not 0 <= self.aspect_idx < len(self.aspects):
             self.aspect_idx = 0
+        self.container = cfg.get("container", "MKV")
+        if self.container not in CONTAINERS:
+            self.container = "MKV"
+        # (w, h, fps) the user pinned, or None to auto-pick
+        self.mode_override = cfg.get("mode_override")
+        self.mic_source = cfg.get("mic_source")     # None = system default
         self.mic_available = has_microphone()
         self.mic_enabled = bool(cfg.get("mic_enabled", True))
         self.mic_active = False
         self._audio_mon = None
         self._audio_mon_handler = None
         self._hud_extras = []
+        self._hud_hidden = set()
         self.cur_res = None
         self._fps_count = 0
         self._fps_shown = 0
@@ -507,6 +540,21 @@ class LensWindow(Adw.ApplicationWindow):
 
         self.pipeline.set_state(Gst.State.PLAYING)
 
+    def effective_res(self):
+        """Resolution after the aspect crop, which is what gets saved.
+
+        The sensor mode is 1600x1200, but in 1:1 the frame you see and the
+        file you get are 1200x1200. Reporting the sensor size there was
+        simply wrong.
+        """
+        if not self.cur_res:
+            return None
+        w, h = self.cur_res
+        target = {"4:3": 4 / 3, "16:9": 16 / 9, "1:1": 1.0}[self.aspects[self.aspect_idx]]
+        if w / h > target:
+            return int(h * target), h
+        return w, int(w / target)
+
     def _on_frame(self, *_):
         self._fps_count += 1
 
@@ -539,7 +587,14 @@ class LensWindow(Adw.ApplicationWindow):
 
     def _source_for(self, dev):
         """v4l2src plus the caps needed to actually get a usable framerate."""
-        mode = best_mode(dev)
+        mode = None
+        if self.mode_override:
+            ow, oh, ofps = self.mode_override
+            for m in _enumerate_modes(dev):
+                if (m[1], m[2]) == (ow, oh) and abs(m[3] - ofps) < 0.5:
+                    mode = m
+                    break
+        mode = mode or best_mode(dev)
         if not mode:
             self.cur_res = None
             return f"v4l2src device={dev} ! videoconvert"
@@ -607,6 +662,13 @@ class LensWindow(Adw.ApplicationWindow):
         # Nothing in the overlay may paint outside the picture, whatever
         # its natural width says.
         self.frame_stack.set_overflow(Gtk.Overflow.HIDDEN)
+        # Left-click anywhere on the picture for the overlay checklist.
+        self.view_popover = Gtk.Popover()
+        self.view_popover.set_parent(self.frame_stack)
+        view_click = Gtk.GestureClick.new()
+        view_click.set_button(1)
+        view_click.connect("released", self._on_view_clicked)
+        self.frame_stack.add_controller(view_click)
         frame_stack = self.frame_stack
 
         self.aspect_frame = Gtk.AspectFrame.new(0.5, 0.5, 4/3, False)
@@ -805,7 +867,10 @@ class LensWindow(Adw.ApplicationWindow):
         hud = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         hud.set_margin_top(18); hud.set_margin_bottom(18)
         hud.set_margin_start(16); hud.set_margin_end(16)
-        hud.set_can_target(False)
+        # Was can_target(False). The readouts are controls now, so the
+        # overlay has to accept clicks; plain labels do not consume them,
+        # so a click on empty overlay still reaches the viewfinder menu.
+        hud.set_can_target(True)
 
         # --- top left: recording state
         rec_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -859,6 +924,12 @@ class LensWindow(Adw.ApplicationWindow):
         self.btn_mic.add_css_class("hud-btn")
         self.btn_mic.set_valign(Gtk.Align.CENTER)
         self.btn_mic.connect("clicked", lambda *_: self._toggle_mic())
+        self.mic_popover = Gtk.Popover()
+        self.mic_popover.set_parent(self.btn_mic)
+        mic_rmb = Gtk.GestureClick.new()
+        mic_rmb.set_button(3)
+        mic_rmb.connect("pressed", lambda *_: self._build_mic_menu())
+        self.btn_mic.add_controller(mic_rmb)
         self.audio_meter = AudioMeter()
         audio_row.append(self.btn_mic)
         audio_row.append(self.audio_meter)
@@ -868,10 +939,26 @@ class LensWindow(Adw.ApplicationWindow):
         info_row.set_valign(Gtk.Align.CENTER)
         self.hud_fps = Gtk.Label(label="")
         self.hud_fps.add_css_class("hud-mono")
+        self.btn_res = Gtk.MenuButton()
+        self.btn_res.set_child(self.hud_fps)
+        self.btn_res.add_css_class("hud-btn")
+        self.btn_res.set_tooltip_text("Capture mode")
+        self.res_popover = Gtk.Popover()
+        self.btn_res.set_popover(self.res_popover)
+        self.btn_res.connect("notify::active", self._build_res_menu)
+
         self.hud_format = Gtk.Label(label="MKV  H.264")
         self.hud_format.add_css_class("hud-dim")
-        info_row.append(self.hud_fps)
-        info_row.append(self.hud_format)
+        self.btn_fmt = Gtk.MenuButton()
+        self.btn_fmt.set_child(self.hud_format)
+        self.btn_fmt.add_css_class("hud-btn")
+        self.btn_fmt.set_tooltip_text("Recording format")
+        self.fmt_popover = Gtk.Popover()
+        self.btn_fmt.set_popover(self.fmt_popover)
+        self.btn_fmt.connect("notify::active", self._build_fmt_menu)
+
+        info_row.append(self.btn_res)
+        info_row.append(self.btn_fmt)
 
         hud_bot = Gtk.CenterBox()
         hud_bot.set_valign(Gtk.Align.END)
@@ -1294,6 +1381,9 @@ class LensWindow(Adw.ApplicationWindow):
             "grid_visible": self.grid_visible,
             "overlay_mode": getattr(self, "overlay_mode", 0),
             "mic_enabled":  self.mic_enabled,
+            "container":    self.container,
+            "mode_override": self.mode_override,
+            "mic_source":   self.mic_source,
             "timer_sec":    self.timer_sec,
             "video_mode":   self.video_mode,
             "cam_id":       self.cameras[self.cam_idx][2],
@@ -1389,8 +1479,9 @@ class LensWindow(Adw.ApplicationWindow):
             return
         try:
             self._audio_mon = Gst.parse_launch(
-                "pulsesrc ! audioconvert ! level interval=100000000 ! "
-                "fakesink sync=false")
+                (f"pulsesrc device={self.mic_source} " if self.mic_source
+                 else "pulsesrc ") +
+                "! audioconvert ! level interval=100000000 ! fakesink sync=false")
             bus = self._audio_mon.get_bus()
             bus.add_signal_watch()
             self._audio_mon_handler = bus.connect("message::element", self._on_level)
@@ -1423,6 +1514,147 @@ class LensWindow(Adw.ApplicationWindow):
             self.audio_meter.set_db(max(rms) if rms else None)
         except Exception:
             pass
+
+    # ---- overlay menus ----
+    @staticmethod
+    def _menu_box():
+        b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        b.set_margin_top(6); b.set_margin_bottom(6)
+        b.set_margin_start(6); b.set_margin_end(6)
+        return b
+
+    @staticmethod
+    def _menu_head(text):
+        l = Gtk.Label(label=text)
+        l.add_css_class("hud-dim")
+        l.set_halign(Gtk.Align.START)
+        l.set_margin_bottom(4)
+        return l
+
+    def _menu_row(self, text, checked, on_click, icon="object-select-symbolic"):
+        row = Gtk.Button()
+        inner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        tick = Gtk.Image.new_from_icon_name(icon if checked else None)
+        tick.set_pixel_size(14)
+        tick.set_size_request(16, -1)
+        lbl = Gtk.Label(label=text)
+        lbl.set_halign(Gtk.Align.START); lbl.set_hexpand(True)
+        lbl.set_ellipsize(3); lbl.set_max_width_chars(30)
+        inner.append(tick); inner.append(lbl)
+        row.set_child(inner)
+        row.add_css_class("cam-row")
+        if checked:
+            row.add_css_class("cam-row-active")
+        row.connect("clicked", lambda *_: on_click())
+        return row
+
+    def _build_res_menu(self, *_):
+        if not self.btn_res.get_active():
+            return
+        box = self._menu_box()
+        box.append(self._menu_head("CAPTURE MODE"))
+        dev = self.cameras[self.cam_idx][0]
+        modes = [m for m in _enumerate_modes(dev) if m[0] == "MJPG"]
+        modes.sort(key=lambda m: (-m[1] * m[2], -m[3]))
+        auto = self.mode_override is None
+        box.append(self._menu_row("Automatic", auto, self._set_mode_auto))
+        for fourcc, w, h, fps in modes:
+            cur = (not auto and tuple(self.mode_override) == (w, h, fps))
+            box.append(self._menu_row(
+                f"{w}\u00d7{h}   {fps:g} fps", cur,
+                lambda w=w, h=h, f=fps: self._set_mode(w, h, f)))
+        self.res_popover.set_child(box)
+
+    def _set_mode_auto(self):
+        self.res_popover.popdown()
+        self.mode_override = None
+        self._save_settings()
+        self._start_pipeline()
+
+    def _set_mode(self, w, h, fps):
+        self.res_popover.popdown()
+        self.mode_override = [w, h, fps]
+        self._save_settings()
+        self._start_pipeline()
+
+    def _build_fmt_menu(self, *_):
+        if not self.btn_fmt.get_active():
+            return
+        box = self._menu_box()
+        box.append(self._menu_head("RECORD AS"))
+        for name, (ext, _mux, venc, aenc) in CONTAINERS.items():
+            v = "VP8" if venc.startswith("vp8") else "H.264"
+            a = "AAC" if aenc.startswith("voaac") else "Opus"
+            box.append(self._menu_row(f"{name}   {v} / {a}",
+                                      name == self.container,
+                                      lambda n=name: self._set_container(n)))
+        self.fmt_popover.set_child(box)
+
+    def _set_container(self, name):
+        self.fmt_popover.popdown()
+        if self.recording:
+            return          # cannot change the container mid-file
+        self.container = name
+        self._save_settings()
+        self._hud_update()
+
+    def _build_mic_menu(self):
+        box = self._menu_box()
+        box.append(self._menu_head("AUDIO INPUT"))
+        box.append(self._menu_row("System default", self.mic_source is None,
+                                  lambda: self._set_mic_source(None)))
+        for name, desc in list_audio_sources():
+            box.append(self._menu_row(desc, self.mic_source == name,
+                                      lambda n=name: self._set_mic_source(n)))
+        self.mic_popover.set_child(box)
+        self.mic_popover.popup()
+
+    def _set_mic_source(self, name):
+        self.mic_popover.popdown()
+        self.mic_source = name
+        self._save_settings()
+        # Restart the meter so it listens to the new input straight away.
+        self._stop_audio_monitor()
+        if self.video_mode:
+            self._start_audio_monitor()
+
+    def _on_view_clicked(self, gesture, n_press, x, y):
+        """Left-click the picture: choose which readouts are shown."""
+        box = self._menu_box()
+        box.append(self._menu_head("OVERLAY"))
+        items = [
+            ("Recording state", self._rec_row),
+            ("Clock",           self.hud_clock),
+            ("Battery",         self._bat_row),
+            ("Microphone",      self._audio_row),
+            ("Format and rate", self._info_row),
+        ]
+        for label, wdg in items:
+            on = wdg not in self._hud_hidden
+            box.append(self._menu_row(
+                label, on, lambda w=wdg: self._toggle_hud_item(w)))
+        box.append(Gtk.Separator())
+        box.append(self._menu_row("Rule-of-thirds grid", self.grid_visible,
+                                  self._toggle_grid_only))
+        self.view_popover.set_child(box)
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        self.view_popover.set_pointing_to(rect)
+        self.view_popover.popup()
+
+    def _toggle_hud_item(self, wdg):
+        self.view_popover.popdown()
+        if wdg in self._hud_hidden:
+            self._hud_hidden.remove(wdg)
+        else:
+            self._hud_hidden.add(wdg)
+        self._fit_hud()
+
+    def _toggle_grid_only(self):
+        self.view_popover.popdown()
+        self.grid_visible = not self.grid_visible
+        self.grid_widget.set_visible(self.grid_visible)
+        self._save_settings()
 
     def _refresh_mic_icon(self):
         if not self.mic_available:
@@ -1471,11 +1703,16 @@ class LensWindow(Adw.ApplicationWindow):
             return sum(x.get_preferred_size()[1].width for x in widgets
                        if x.get_visible())
 
-        # Start from everything, so widening restores it.
+        # Start from everything, so widening restores it, minus whatever the
+        # viewfinder menu has switched off.
         self._hud_top.set_visible(True)
         self._hud_bot.set_visible(True)
         for wdg in self._hud_extras:
             wdg.set_visible(True)
+        for wdg in (self._rec_row, self.hud_clock, self._bat_row,
+                    self._audio_row, self._info_row):
+            if wdg in self._hud_hidden:
+                wdg.set_visible(False)
 
         # Top row is a CenterBox, so the clock is centred in the whole row
         # rather than in the space left over. Comparing the sum of the three
@@ -1524,14 +1761,17 @@ class LensWindow(Adw.ApplicationWindow):
         # rate: negotiated caps say 30 but a busy machine may not hit it.
         self._fps_shown = self._fps_count
         self._fps_count = 0
-        res = f"{self.cur_res[0]}\u00d7{self.cur_res[1]}" if self.cur_res else ""
+        eff = self.effective_res()
+        res = f"{eff[0]}\u00d7{eff[1]}" if eff else ""
         rate = f"{self._fps_shown:g} FPS" if self._fps_shown else ""
         self.hud_fps.set_label("  ".join(x for x in (res, rate) if x))
         self._refresh_mic_icon()
 
-        self.hud_format.set_label(
-            "MKV  H.264  OPUS" if (self.mic_available and self.mic_enabled)
-            else "MKV  H.264  MUTE")
+        ext, _mux, venc, aenc = CONTAINERS[self.container]
+        vcodec = "VP8" if venc.startswith("vp8") else "H.264"
+        acodec = ("AAC" if aenc.startswith("voaac") else "OPUS") \
+            if (self.mic_available and self.mic_enabled) else "MUTE"
+        self.hud_format.set_label(f"{self.container.upper()}  {vcodec}  {acodec}")
 
         pct, status, energy, watts = read_battery()
         charging = status.lower().startswith("charg")
@@ -1896,7 +2136,8 @@ class LensWindow(Adw.ApplicationWindow):
 
     def _start_recording(self):
         ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        path = VIDEOS / f"Lens-{ts}.mkv"
+        ext, muxer, venc, aenc = CONTAINERS[self.container]
+        path = VIDEOS / f"Lens-{ts}.{ext}"
         # Rebuild pipeline for recording
         self.pipeline.set_state(Gst.State.NULL)
         dev = self.cameras[self.cam_idx][0]
@@ -1904,14 +2145,15 @@ class LensWindow(Adw.ApplicationWindow):
         # same matroska container, dropped if there is no capture source so a
         # machine without a mic still records video.
         self.mic_active = self.mic_available and self.mic_enabled
-        audio = (" pulsesrc ! audioconvert ! audioresample ! "
-                 "opusenc ! mux. ") if self.mic_active else ""
+        src = f"pulsesrc device={self.mic_source}" if self.mic_source else "pulsesrc"
+        audio = (f" {src} ! audioconvert ! audioresample ! "
+                 f"{aenc} ! mux. ") if self.mic_active else ""
         self.pipeline = Gst.parse_launch(
             f"{self._source_for(dev)} ! tee name=t "
             f"t. ! queue ! videoconvert ! gtk4paintablesink name=sink "
-            f"t. ! queue ! videoconvert ! x264enc tune=zerolatency bitrate=4000 ! mux. "
+            f"t. ! queue ! videoconvert ! {venc} ! mux. "
             f"{audio}"
-            f"matroskamux name=mux ! filesink location={path}"
+            f"{muxer} name=mux ! filesink location={path}"
         )
         sink = self.pipeline.get_by_name("sink")
         self.paintable = sink.props.paintable
