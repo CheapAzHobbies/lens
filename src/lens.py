@@ -869,6 +869,9 @@ class LensWindow(Adw.ApplicationWindow):
         print(f"Lens: detected {len(self.cameras)} camera(s):")
         for c in self.cameras: print(f"   {c}")
         self.recording = False
+        self._stopping = False
+        self._eos_handler = None
+        self._eos_timeout = None
         self.aspects = ["4:3", "16:9", "1:1"]
 
         # Restore what was set last time. Loaded before the pipeline starts,
@@ -1490,6 +1493,11 @@ class LensWindow(Adw.ApplicationWindow):
             on_close=self._close_photo_viewer,
             on_open_external=lambda p: Gio.AppInfo.launch_default_for_uri(
                 "file://" + str(p), None))
+        # Overlay children get their natural size unless told to expand, so
+        # without these the gallery opened at zero size and a tap on the
+        # preview looked like it did nothing at all.
+        self.viewer.set_hexpand(True); self.viewer.set_vexpand(True)
+        self.viewer.set_halign(Gtk.Align.FILL); self.viewer.set_valign(Gtk.Align.FILL)
         self.viewer.set_visible(False)
         root.add_overlay(self.viewer)
 
@@ -2037,9 +2045,15 @@ class LensWindow(Adw.ApplicationWindow):
         return False
 
     def _audio_src(self):
-        """pulsesrc plus the denoise filter, as a pipeline fragment."""
+        """pulsesrc plus the denoise filter, as a pipeline fragment.
+
+        The trailing audioconvert is required, not tidiness: audiowsincband
+        emits float, the encoders want integer, and without it negotiation
+        fails outright. The pipeline then sticks in PAUSED, the recording
+        never starts, and the file is left at zero bytes.
+        """
         src = f"pulsesrc device={self.mic_source}" if self.mic_source else "pulsesrc"
-        chain = f" ! {DENOISE_CHAIN}" if self.denoise else ""
+        chain = f" ! {DENOISE_CHAIN} ! audioconvert" if self.denoise else ""
         return f"{src} provide-clock=false ! audioconvert{chain}"
 
     # ---- live audio level ----
@@ -2748,7 +2762,9 @@ class LensWindow(Adw.ApplicationWindow):
         # branch was starved and the result crackled. audiorate patches any
         # timestamp gaps that slip through rather than letting them become
         # clicks.
-        aq = ("queue max-size-time=3000000000 max-size-buffers=0 "
+        # 1s is plenty to survive an encoder stall, and every buffered
+        # second has to drain on EOS before the file is complete.
+        aq = ("queue max-size-time=1000000000 max-size-buffers=0 "
               "max-size-bytes=0")
         audio = (f" {src} ! {aq} ! audioresample ! audiorate ! "
                  f"{aenc} ! queue ! mux. ") if self.mic_active else ""
@@ -2775,17 +2791,50 @@ class LensWindow(Adw.ApplicationWindow):
         GLib.timeout_add_seconds(1, self._rec_tick)
 
     def _stop_recording(self):
-        # Send EOS then tear down and restart preview
-        self.pipeline.send_event(Gst.Event.new_eos())
+        """Ask the pipeline to finish, and wait for it without blocking.
+
+        This used to send EOS and then block the main thread on
+        timed_pop_filtered for up to 2s. That froze the UI, and 2s was not
+        enough: the audio queue holds seconds of buffered samples that have
+        to drain through the encoder and muxer first, so the pipeline was
+        torn down mid-drain and the file came out truncated.
+        """
+        if not self.recording or self._stopping:
+            return
+        self._stopping = True
+        self.rec_state_label.set_label("SAVE")
         bus = self.pipeline.get_bus()
-        bus.timed_pop_filtered(2 * Gst.SECOND, Gst.MessageType.EOS)
-        self.pipeline.set_state(Gst.State.NULL)
+        self._eos_handler = bus.connect("message::eos", lambda *_: self._finish_stop())
+        self.pipeline.send_event(Gst.Event.new_eos())
+        # Generous backstop. Reaching it means something went wrong, and a
+        # slightly damaged file beats a hung app.
+        self._eos_timeout = GLib.timeout_add(8000, self._finish_stop)
+
+    def _finish_stop(self, *_):
+        if not self._stopping:
+            return False
+        self._stopping = False
+        if self._eos_timeout:
+            GLib.source_remove(self._eos_timeout)
+            self._eos_timeout = None
+        old = self.pipeline
+        if old:
+            if self._eos_handler:
+                try:
+                    old.get_bus().disconnect(self._eos_handler)
+                except Exception:
+                    pass
+                self._eos_handler = None
+            old.set_state(Gst.State.NULL)
+            old.get_state(Gst.CLOCK_TIME_NONE)
+        self.pipeline = None
         self.recording = False
         self.shutter_core.remove_css_class("recording")
         # Back to standby rather than hiding the HUD: still in video mode.
         self._hud_standby()
         self._start_pipeline()
         print(f"Lens: saved video ({self.rec_seconds}s)")
+        return False
 
     def _open_gallery(self, *_):
         folder = VIDEOS if self.video_mode else PICTURES
