@@ -186,6 +186,28 @@ def best_still_mode(dev):
 DENOISE_SOURCE = "lens_denoised"
 
 
+def clear_stale_denoise():
+    """Unload a suppression module left behind by a previous run.
+
+    close-request cannot help if the process was killed outright, and a
+    leaked module keeps a capture stream alive, which lights the system
+    microphone indicator with nothing running. Cleaning up at startup makes
+    that self-healing instead of permanent.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(["pactl", "list", "short", "modules"],
+                             capture_output=True, text=True, timeout=4).stdout
+    except Exception:
+        return
+    for line in out.splitlines():
+        if "module-echo-cancel" in line and DENOISE_SOURCE in line:
+            mid = line.split("\t")[0].strip()
+            if mid.isdigit():
+                print(f"Lens: clearing stale noise-suppression module {mid}")
+                unload_denoise(mid)
+
+
 def load_denoise():
     """Load webrtc noise suppression and return the module id, or None.
 
@@ -461,6 +483,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.mic_source = cfg.get("mic_source")     # None = system default
         self.denoise = bool(cfg.get("denoise", True))
         self._denoise_module = None
+        clear_stale_denoise()
         self.mic_available = has_microphone()
         self.mic_enabled = bool(cfg.get("mic_enabled", True))
         self.mic_active = False
@@ -503,6 +526,12 @@ class LensWindow(Adw.ApplicationWindow):
         self.countdown_val = 0
 
         self.connect("close-request", self._on_close)
+        # SIGTERM and SIGINT still give us a chance to let the microphone go.
+        for sig in (GLib.unix_signal_add,):
+            pass
+        import signal as _sig
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, _sig.SIGTERM, self._on_signal)
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, _sig.SIGINT, self._on_signal)
         self._build_ui()
         self._install_breakpoints()
         self._apply_settings()
@@ -704,11 +733,13 @@ class LensWindow(Adw.ApplicationWindow):
         # Nothing in the overlay may paint outside the picture, whatever
         # its natural width says.
         self.frame_stack.set_overflow(Gtk.Overflow.HIDDEN)
-        # Left-click anywhere on the picture for the overlay checklist.
+        # Right-click the picture for the overlay checklist. It is a context
+        # menu, so it belongs on the right button: left-click stays free for
+        # anything that should act on the shot itself.
         self.view_popover = Gtk.Popover()
         self.view_popover.set_parent(self.frame_stack)
         view_click = Gtk.GestureClick.new()
-        view_click.set_button(1)
+        view_click.set_button(3)
         view_click.connect("released", self._on_view_clicked)
         self.frame_stack.add_controller(view_click)
         frame_stack = self.frame_stack
@@ -975,12 +1006,12 @@ class LensWindow(Adw.ApplicationWindow):
         # sizes where the top row has already had to shed things.
         audio_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         audio_row.set_valign(Gtk.Align.CENTER)
-        audio_row.add_css_class("hud-chip")
         self.btn_mic = Gtk.Button()
         self.mic_icon = Gtk.Image.new_from_icon_name("audio-input-microphone-symbolic")
         self.mic_icon.set_pixel_size(16)
         self.btn_mic.set_child(self.mic_icon)
         self.btn_mic.add_css_class("hud-btn")
+        self.btn_mic.add_css_class("hud-chip")
         self.btn_mic.set_valign(Gtk.Align.CENTER)
         self.btn_mic.connect("clicked", lambda *_: self._toggle_mic())
         self.mic_popover = Gtk.Popover()
@@ -990,18 +1021,22 @@ class LensWindow(Adw.ApplicationWindow):
         mic_rmb.connect("pressed", lambda *_: self._build_mic_menu())
         self.btn_mic.add_controller(mic_rmb)
         self.audio_meter = AudioMeter()
+        self.audio_meter.add_css_class("hud-chip")
         audio_row.append(self.btn_mic)
         audio_row.append(self.audio_meter)
 
         # --- bottom right: what is being written
-        info_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        # No chip on the row itself: it holds two independent readouts, so a
+        # row-level background drew a box around two boxes. Each readout
+        # carries its own instead.
+        info_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         info_row.set_valign(Gtk.Align.CENTER)
-        info_row.add_css_class("hud-chip")
         self.hud_fps = Gtk.Label(label="")
         self.hud_fps.add_css_class("hud-mono")
         self.btn_res = Gtk.MenuButton()
         self.btn_res.set_child(self.hud_fps)
         self.btn_res.add_css_class("hud-btn")
+        self.btn_res.add_css_class("hud-chip")
         self.btn_res.set_tooltip_text("Capture mode")
         self.res_popover = Gtk.Popover()
         self.btn_res.set_popover(self.res_popover)
@@ -1012,6 +1047,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.btn_fmt = Gtk.MenuButton()
         self.btn_fmt.set_child(self.hud_format)
         self.btn_fmt.add_css_class("hud-btn")
+        self.btn_fmt.add_css_class("hud-chip")
         self.btn_fmt.set_tooltip_text("Recording format")
         self.fmt_popover = Gtk.Popover()
         self.btn_fmt.set_popover(self.fmt_popover)
@@ -1238,9 +1274,10 @@ class LensWindow(Adw.ApplicationWindow):
            box around the resolution and format readouts. Both levels have
            to be flattened. */
         .hud-btn, .hud-btn > button {
-            background: transparent; border: none; box-shadow: none;
-            outline: none; padding: 2px 4px;
+            border: none; box-shadow: none; outline: none;
             min-width: 0; min-height: 0; color: inherit; }
+        .hud-btn > button { background: transparent; padding: 0; }
+        .hud-btn { padding: 3px 9px; }
         .hud-btn:hover, .hud-btn > button:hover {
             background: rgba(255,255,255,0.18); border-radius: 6px; }
         .hud-btn:focus, .hud-btn > button:focus { outline: none; }
@@ -1563,6 +1600,11 @@ class LensWindow(Adw.ApplicationWindow):
             self._stop_audio_monitor()
         self._save_settings()
 
+    def _on_signal(self, *_):
+        self._on_close()
+        self.close()
+        return GLib.SOURCE_REMOVE
+
     def _on_close(self, *_):
         """Release the microphone on the way out.
 
@@ -1762,7 +1804,7 @@ class LensWindow(Adw.ApplicationWindow):
             self._start_audio_monitor()
 
     def _on_view_clicked(self, gesture, n_press, x, y):
-        """Left-click the picture: choose which readouts are shown."""
+        """Right-click the picture: choose which readouts are shown."""
         box = self._menu_box()
         box.append(self._menu_head("OVERLAY"))
         items = [
