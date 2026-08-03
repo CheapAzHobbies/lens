@@ -10,6 +10,7 @@ gi.require_version("Adw", "1")
 gi.require_version("Gst", "1.0")
 gi.require_version("GstApp", "1.0")
 gi.require_version("GdkPixbuf", "2.0")
+import cairo
 from gi.repository import Gtk, Adw, Gst, GLib, Gdk, Gio, GObject, GdkPixbuf
 
 Gst.init(None)
@@ -20,6 +21,9 @@ CONFIG_DIR = pathlib.Path(
 SETTINGS = CONFIG_DIR / "settings.json"
 PICTURES = pathlib.Path.home() / "Pictures" / "Lens"
 VIDEOS   = pathlib.Path.home() / "Videos"  / "Lens"
+THUMBS = pathlib.Path(
+    os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache")) / "lens" / "thumbs"
+VIDEO_EXTS = (".mkv", ".mp4", ".webm", ".mov")
 PICTURES.mkdir(parents=True, exist_ok=True)
 VIDEOS.mkdir(parents=True, exist_ok=True)
 
@@ -57,6 +61,36 @@ def list_v4l2_cameras():
         seen_cards.add(card)
         devs.append((str(d), card))
     return devs
+
+
+def is_video(path):
+    return str(path).lower().endswith(VIDEO_EXTS)
+
+
+def video_thumbnail(path):
+    """First frame of a clip as a jpg, cached. Returns None if it fails."""
+    src = pathlib.Path(path)
+    try:
+        THUMBS.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return None
+    out = THUMBS / (src.stem + ".jpg")
+    if out.exists() and out.stat().st_mtime >= src.stat().st_mtime:
+        return out
+    import subprocess
+    # Half a second in, to skip the black frame most captures start on.
+    # Very short clips have nothing there, so fall back to the first frame.
+    for seek in ("0.5", "0"):
+        try:
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-ss", seek, "-i", str(src),
+                 "-frames:v", "1", "-q:v", "3", str(out)],
+                capture_output=True, timeout=10)
+        except Exception:
+            return None
+        if out.exists() and out.stat().st_size > 0:
+            return out
+    return None
 
 
 def load_settings():
@@ -259,9 +293,11 @@ class LensWindow(Adw.ApplicationWindow):
         # rule-of-thirds guide means nothing.
         self.grid_widget = _GridOverlay()
         self.grid_widget.set_visible(False)
-        frame_stack = Gtk.Overlay()
-        frame_stack.set_child(self.picture)
-        frame_stack.add_overlay(self.grid_widget)
+        self.frame_stack = Gtk.Overlay()
+        self.frame_stack.set_child(self.picture)
+        self.frame_stack.add_overlay(self.grid_widget)
+        self.frame_stack.add_css_class("viewflip")
+        frame_stack = self.frame_stack
 
         self.aspect_frame = Gtk.AspectFrame.new(0.5, 0.5, 4/3, False)
         self.aspect_frame.set_child(frame_stack)
@@ -367,6 +403,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.btn_flip.set_margin_end(128)
         self.btn_flip.set_margin_bottom(40)
         self._flip_spun = False
+        self._flipping = False
         self.btn_flip.set_sensitive(len(self.cameras) > 1)
         self.btn_flip.connect("clicked", lambda *_: self._flip_camera())
         act_area.add_overlay(self.btn_flip)
@@ -389,7 +426,7 @@ class LensWindow(Adw.ApplicationWindow):
         # ---- Camcorder HUD (video mode) ----
         # Sits over the viewfinder between the top pills and the bottom bar.
         hud = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        hud.set_margin_top(62); hud.set_margin_bottom(18)
+        hud.set_margin_top(20); hud.set_margin_bottom(18)
         hud.set_margin_start(22); hud.set_margin_end(22)
         hud.set_can_target(False)
 
@@ -443,7 +480,9 @@ class LensWindow(Adw.ApplicationWindow):
 
         self.rec_indicator = hud
         self.rec_indicator.set_visible(False)
-        overlay.add_overlay(self.rec_indicator)
+        # On the picture, not the window: the readouts belong over the frame
+        # you are shooting, not floating in the letterbox bars.
+        self.frame_stack.add_overlay(self.rec_indicator)
         self.hud_timer = None
         self._power_samples = []
 
@@ -570,6 +609,11 @@ class LensWindow(Adw.ApplicationWindow):
             box-shadow: 0 18px 40px rgba(0,0,0,0.9);
         }
         /* Full-screen photo viewer */
+        /* Camera flip: the viewfinder turns edge-on, the pipeline is
+           swapped while it is invisible, then it turns back. Same trick a
+           phone uses, and it hides the teardown glitch completely. */
+        .viewflip { transition: transform 240ms ease-in-out; }
+        .viewflip.flipped { transform: perspective(1000px) rotateY(90deg); }
         .viewer-bg { background: rgba(0,0,0,0.95); }
         .flip:active    { transform: scale(0.9); }
         .pill:active    { transform: scale(0.9); }
@@ -778,8 +822,12 @@ class LensWindow(Adw.ApplicationWindow):
         if self.is_fullscreen(): self.unfullscreen()
         else: self.fullscreen()
 
+    FLIP_MS = 240
+
     def _flip_camera(self):
         if len(self.cameras) < 2: return
+        if self._flipping: return          # ignore taps during the turn
+        self._flipping = True
         # Half turn on every press, so repeated flips keep spinning the same
         # way instead of snapping back.
         self._flip_spun = not self._flip_spun
@@ -787,12 +835,27 @@ class LensWindow(Adw.ApplicationWindow):
             self.flip_icon.add_css_class("spun")
         else:
             self.flip_icon.remove_css_class("spun")
+
+        # Turn the viewfinder edge-on first, swap behind it, then turn back.
+        self.frame_stack.add_css_class("flipped")
+        GLib.timeout_add(self.FLIP_MS, self._flip_swap)
+
+    def _flip_swap(self):
         self.cam_idx = (self.cam_idx + 1) % len(self.cameras)
         self._save_settings()
         print(f"Lens: switching to camera {self.cam_idx}: {self.cameras[self.cam_idx]}")
         # Detach paintable before tearing down pipeline
         self.picture.set_paintable(None)
         self._start_pipeline()
+        # Give the new pipeline a moment to push a frame, so the viewfinder
+        # is not turning back onto a black rectangle.
+        GLib.timeout_add(120, self._flip_back)
+        return False
+
+    def _flip_back(self):
+        self.frame_stack.remove_css_class("flipped")
+        self._flipping = False
+        return False
 
     def _on_shutter(self):
         if self.video_mode:
@@ -938,10 +1001,15 @@ class LensWindow(Adw.ApplicationWindow):
         print(f"Lens: saved video ({self.rec_seconds}s)")
 
     def _open_gallery(self, *_):
-        Gio.AppInfo.launch_default_for_uri("file://" + str(PICTURES), None)
+        folder = VIDEOS if self.video_mode else PICTURES
+        Gio.AppInfo.launch_default_for_uri("file://" + str(folder), None)
 
     def _open_photo_viewer(self, path):
-        """Show a photo full-screen inside Lens (not the whole OS window)."""
+        """Show a photo full-screen inside Lens. Clips go to the system
+        player, since there is no video playback in here."""
+        if is_video(path):
+            Gio.AppInfo.launch_default_for_uri("file://" + str(path), None)
+            return
         try:
             self.viewer_picture.set_filename(path)
         except Exception as e:
@@ -959,7 +1027,10 @@ class LensWindow(Adw.ApplicationWindow):
         stale card behind.
         """
         items = []
-        for f in PICTURES.glob("*.jpg"):
+        candidates = list(PICTURES.glob("*.jpg"))
+        for ext in VIDEO_EXTS:
+            candidates += list(VIDEOS.glob("*" + ext))
+        for f in candidates:
             try:
                 items.append((f.stat().st_mtime, f))
             except OSError:
@@ -970,13 +1041,15 @@ class LensWindow(Adw.ApplicationWindow):
     def _watch_pictures(self):
         """Rebuild the deck when the photo folder changes underneath us, so
         deleting from Files updates the previews without a restart."""
-        try:
-            gfile = Gio.File.new_for_path(str(PICTURES))
-            self._pic_monitor = gfile.monitor_directory(
-                Gio.FileMonitorFlags.NONE, None)
-            self._pic_monitor.connect("changed", self._on_pictures_changed)
-        except Exception as e:
-            print(f"Lens: cannot watch {PICTURES}: {e}", file=sys.stderr)
+        self._pic_monitors = []
+        for d in (PICTURES, VIDEOS):
+            try:
+                mon = Gio.File.new_for_path(str(d)).monitor_directory(
+                    Gio.FileMonitorFlags.NONE, None)
+                mon.connect("changed", self._on_pictures_changed)
+                self._pic_monitors.append(mon)
+            except Exception as e:
+                print(f"Lens: cannot watch {d}: {e}", file=sys.stderr)
 
     def _on_pictures_changed(self, monitor, gfile, other, event):
         # A single save emits several events, so coalesce into one rebuild.
@@ -1075,6 +1148,11 @@ class ThumbnailDeck(Gtk.Overlay):
         self.add_controller(motion)
 
     def _load_thumb(self, path, size=112):
+        video = is_video(path)
+        if video:
+            path = video_thumbnail(path)
+            if not path:
+                return None
         try:
             full = GdkPixbuf.Pixbuf.new_from_file(str(path))
         except Exception:
@@ -1084,7 +1162,35 @@ class ThumbnailDeck(Gtk.Overlay):
         y = (full.get_height() - side) // 2
         sq = full.new_subpixbuf(x, y, side, side)
         scaled = sq.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR)
+        if video:
+            return self._with_play_badge(scaled, size)
         return Gdk.Texture.new_for_pixbuf(scaled)
+
+    def _with_play_badge(self, pixbuf, size):
+        """Stamp a play triangle on a thumbnail so clips read as clips."""
+        try:
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+            cr = cairo.Context(surf)
+            Gdk.cairo_set_source_pixbuf(cr, pixbuf, 0, 0)
+            cr.paint()
+            r = size * 0.17
+            cx = cy = size / 2.0
+            cr.set_source_rgba(0, 0, 0, 0.55)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+            cr.set_source_rgba(1, 1, 1, 0.95)
+            cr.move_to(cx - r * 0.33, cy - r * 0.48)
+            cr.line_to(cx + r * 0.52, cy)
+            cr.line_to(cx - r * 0.33, cy + r * 0.48)
+            cr.close_path()
+            cr.fill()
+            surf.flush()
+            return Gdk.MemoryTexture.new(
+                size, size, Gdk.MemoryFormat.B8G8R8A8_PREMULTIPLIED,
+                GLib.Bytes.new(bytes(surf.get_data())), surf.get_stride())
+        except Exception as e:
+            print(f"Lens: play badge failed: {e}", file=sys.stderr)
+            return Gdk.Texture.new_for_pixbuf(pixbuf)
 
     def update_photos(self, paths):
         """Rebuild the deck from these paths (oldest → newest at top)."""
