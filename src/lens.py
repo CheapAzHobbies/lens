@@ -424,21 +424,50 @@ class LensWindow(Adw.ApplicationWindow):
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         top.append(self.btn_grid); top.append(self.btn_aspect); top.append(self.btn_timer)
 
-        self.btn_exit = self._pill_button("✕", lambda: self.close(), width=42, tint=False)
-        self.btn_fullscreen = self._pill_button("⛶", self._toggle_fullscreen, width=42, tint=False)
+        # Standard window controls, right side, in the usual order:
+        # minimize, maximize, close.
+        def _win_button(icon, fn):
+            b = Gtk.Button()
+            img = Gtk.Image.new_from_icon_name(icon)
+            img.set_pixel_size(16)
+            b.set_child(img)
+            b.add_css_class("winctl")
+            b.set_valign(Gtk.Align.CENTER)
+            b.connect("clicked", lambda *_: fn())
+            return b
+
+        self.btn_min  = _win_button("window-minimize-symbolic", self.minimize)
+        self.btn_max  = _win_button("window-maximize-symbolic", self._toggle_maximize)
+        self.btn_exit = _win_button("window-close-symbolic", self.close)
+        self.btn_exit.add_css_class("winctl-close")
+        # Keep the old name working: F11 and the shortcut still fullscreen.
+        self.btn_fullscreen = self.btn_max
+
+        winctl = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        winctl.append(self.btn_min); winctl.append(self.btn_max); winctl.append(self.btn_exit)
+        # Track the real window state rather than toggling a flag, so the icon
+        # stays right no matter how it got maximized: the button, a
+        # double-click on the bar, or the window manager's own shortcut.
+        self.connect("notify::maximized", self._on_maximized_changed)
+        self.connect("notify::fullscreened", self._on_maximized_changed)
 
         # A plain Box with expanding spacers rather than a CenterBox. A
         # CenterBox inside the WindowHandle swallowed the drag and the window
         # would not move at all; the same handle around a Box works.
         gap_l = Gtk.Box(); gap_l.set_hexpand(True)
         gap_r = Gtk.Box(); gap_r.set_hexpand(True)
+        # Dummy on the left the same width as the control group, so the mode
+        # pills sit at the true centre of the bar rather than the centre of
+        # whatever space is left over.
+        ballast = Gtk.Box()
+        ballast.set_size_request(3 * 34 + 2 * 2, -1)
         top_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         top_bar.add_css_class("top-bar")
-        top_bar.append(self.btn_exit)
+        top_bar.append(ballast)
         top_bar.append(gap_l)
         top_bar.append(top)
         top_bar.append(gap_r)
-        top_bar.append(self.btn_fullscreen)
+        top_bar.append(winctl)
         top_bar.set_margin_top(8); top_bar.set_margin_bottom(8)
         top_bar.set_margin_start(12); top_bar.set_margin_end(12)
 
@@ -772,6 +801,11 @@ class LensWindow(Adw.ApplicationWindow):
                 padding: 4px 12px; border: none;
                 transition: background 120ms ease-out; }
         .pill:hover { background: rgba(255,255,255,0.22); }
+        .winctl { background: rgba(255,255,255,0.10); border: none; color: white;
+                  border-radius: 17px; min-width: 34px; min-height: 34px;
+                  padding: 0; transition: background 120ms ease-out; }
+        .winctl:hover { background: rgba(255,255,255,0.22); }
+        .winctl-close:hover { background: #e01b24; }
         .pill-active { background: #62a0ea; color: white; }
         .countdown { color: white; font-size: 96px; font-weight: bold;
                      background: rgba(0,0,0,0.5); padding: 30px 50px; border-radius: 60px; }
@@ -947,9 +981,22 @@ class LensWindow(Adw.ApplicationWindow):
                 self.bat_left_label.set_label("")
         return True
 
+    def _toggle_maximize(self):
+        if self.is_maximized():
+            self.unmaximize()
+        else:
+            self.maximize()
+
+    def _on_maximized_changed(self, *_):
+        big = self.is_maximized() or self.is_fullscreen()
+        self.btn_max.get_child().set_from_icon_name(
+            "window-restore-symbolic" if big else "window-maximize-symbolic")
+        self.btn_max.set_tooltip_text("Restore" if big else "Maximize")
+
     def _toggle_fullscreen(self):
         if self.is_fullscreen(): self.unfullscreen()
         else: self.fullscreen()
+        self._on_maximized_changed()
 
     FLIP_MS = 140
 
