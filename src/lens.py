@@ -901,15 +901,25 @@ class LensWindow(Adw.ApplicationWindow):
         /* Accelerate into the close, decelerate out of the open. One
            symmetric ease for both directions made the hold in the middle
            read as a stall. */
-        /* Front-loaded: roughly 85% of the travel in the first third, then
-           a slow creep from a narrow sliver down to closed. Reads as quick
-           while still moving the entire time the camera is waking up. */
-        .viewflip { transition: transform 190ms cubic-bezier(0, .72, .28, 1); }
-        .viewflip.flip-fast  { transition-duration: 190ms; }
-        .viewflip.flip-med   { transition-duration: 300ms; }
-        .viewflip.flip-slow  { transition-duration: 420ms; }
-        .viewflip.flip-vslow { transition-duration: 560ms; }
-        .viewflip.flip-xslow { transition-duration: 700ms; }
+        /* Each tier gets its own curve, front-loaded harder the longer it
+           runs, so the visible part of the close takes about the same
+           WALL-CLOCK time in every tier (88-110ms to reach 80% shut). A
+           single shared curve stretched over a longer duration made the
+           slow camera's opening movement slower too, which is what read as
+           asymmetric even when both directions were smooth. The remaining
+           travel creeps from a narrow sliver down to closed, covering the
+           rest of the wake without ever stopping. */
+        .viewflip { transition: transform 190ms cubic-bezier(0, .3, .4, 1); }
+        .viewflip.flip-fast  { transition-duration: 190ms;
+                               transition-timing-function: cubic-bezier(0, .30, .40, 1); }
+        .viewflip.flip-med   { transition-duration: 300ms;
+                               transition-timing-function: cubic-bezier(0, .50, .32, 1); }
+        .viewflip.flip-slow  { transition-duration: 420ms;
+                               transition-timing-function: cubic-bezier(0, .72, .28, 1); }
+        .viewflip.flip-vslow { transition-duration: 560ms;
+                               transition-timing-function: cubic-bezier(0, .82, .20, 1); }
+        .viewflip.flip-xslow { transition-duration: 700ms;
+                               transition-timing-function: cubic-bezier(0, .88, .15, 1); }
         .viewflip.opening { transition: transform 300ms cubic-bezier(0, 0, .2, 1); }
         .viewflip.flipped { transform: scaleX(0.02); }
         .viewer-bg { background: rgba(0,0,0,0.95); }
