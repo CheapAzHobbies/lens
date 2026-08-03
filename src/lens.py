@@ -950,7 +950,10 @@ class LensWindow(Adw.ApplicationWindow):
         # a paintable while it is being destroyed.
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
-            self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
+            # Bounded. CLOCK_TIME_NONE waits forever, and a live source that
+            # will not shut down takes the whole UI with it: this is what
+            # made switching cameras hang.
+            self.pipeline.get_state(2 * Gst.SECOND)
             self.pipeline = None
             self.paintable = None
 
@@ -2619,7 +2622,10 @@ class LensWindow(Adw.ApplicationWindow):
 
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
-            self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
+            # Bounded. CLOCK_TIME_NONE waits forever, and a live source that
+            # will not shut down takes the whole UI with it: this is what
+            # made switching cameras hang.
+            self.pipeline.get_state(2 * Gst.SECOND)
         data = None
         try:
             grab = Gst.parse_launch(
@@ -2646,7 +2652,7 @@ class LensWindow(Adw.ApplicationWindow):
                 if len(blob) > 1000 and blob[:2] == b"\xff\xd8":
                     data = blob
             grab.set_state(Gst.State.NULL)
-            grab.get_state(Gst.CLOCK_TIME_NONE)
+            grab.get_state(2 * Gst.SECOND)
         except Exception as e:
             print(f"Lens: full-res grab failed ({e}), using preview frame",
                   file=sys.stderr)
@@ -2826,7 +2832,9 @@ class LensWindow(Adw.ApplicationWindow):
                     pass
                 self._eos_handler = None
             old.set_state(Gst.State.NULL)
-            old.get_state(Gst.CLOCK_TIME_NONE)
+            # Bounded: CLOCK_TIME_NONE waits forever, and a source that will
+            # not go down would hang the whole app rather than just this.
+            old.get_state(2 * Gst.SECOND)
         self.pipeline = None
         self.recording = False
         self.shutter_core.remove_css_class("recording")
@@ -2866,9 +2874,12 @@ class LensWindow(Adw.ApplicationWindow):
             candidates += list(VIDEOS.glob("*" + ext))
         for f in candidates:
             try:
-                items.append((f.stat().st_mtime, f))
+                st = f.stat()
             except OSError:
                 continue          # deleted between the glob and the stat
+            if st.st_size == 0:
+                continue          # a failed capture, not a recording
+            items.append((st.st_mtime, f))
         items.sort(key=lambda t: t[0])
         self.thumb.update_photos([f for _, f in items])
 
