@@ -395,7 +395,15 @@ class LensWindow(Adw.ApplicationWindow):
         self.grid_widget = _GridOverlay()
         self.grid_widget.set_visible(False)
         self.frame_stack = Gtk.Overlay()
-        self.frame_stack.set_child(self.picture)
+        # An empty Box is the measured child, and the Picture rides along as
+        # an overlay. Overlay children are allocated the full area but are not
+        # measured, so the viewfinder's size stops depending on the camera's
+        # resolution. With the Picture as the measured child, swapping the
+        # feed from 1600x1200 to 1280x720 changed its natural size and the
+        # whole viewfinder re-measured mid-flip: that was the upward squish
+        # that snapped back once the new camera arrived.
+        self.frame_stack.set_child(Gtk.Box())
+        self.frame_stack.add_overlay(self.picture)
         self.frame_stack.add_overlay(self.grid_widget)
         self.frame_stack.add_css_class("viewflip")
         frame_stack = self.frame_stack
