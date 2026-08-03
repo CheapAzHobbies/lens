@@ -313,11 +313,19 @@ class LensWindow(Adw.ApplicationWindow):
         /* Hand-of-cards style: bottom-center pivot.
            Idle = tight fan (just a hint), hold-to-expand fans wide. */
         .deck-card { transform-origin: 50% 100%; }
-        .state-idle.deck-idx-0 { transform: translate(80px, -20px) rotate(-10deg); }
-        .state-idle.deck-idx-1 { transform: translate(80px, -20px) rotate( -5deg); }
-        .state-idle.deck-idx-2 { transform: translate(80px, -20px) rotate(  0deg); }
-        .state-idle.deck-idx-3 { transform: translate(80px, -20px) rotate(  5deg); }
-        .state-idle.deck-idx-4 { transform: translate(80px, -20px) rotate( 10deg); }
+        /* Idle: stacked exactly, so only the most recent photo is visible. */
+        .state-idle.deck-idx-0,
+        .state-idle.deck-idx-1,
+        .state-idle.deck-idx-2,
+        .state-idle.deck-idx-3,
+        .state-idle.deck-idx-4 { transform: translate(80px, -20px) rotate(0deg); }
+        /* Peek: hovering for a moment tips the deck open a little, as a hint
+           that there is a stack under there. Press and hold for the full fan. */
+        .state-peek.deck-idx-0 { transform: translate(80px, -20px) rotate(-14deg); }
+        .state-peek.deck-idx-1 { transform: translate(80px, -20px) rotate( -7deg); }
+        .state-peek.deck-idx-2 { transform: translate(80px, -20px) rotate(  0deg); }
+        .state-peek.deck-idx-3 { transform: translate(80px, -20px) rotate(  7deg); }
+        .state-peek.deck-idx-4 { transform: translate(80px, -20px) rotate( 14deg); }
         /* Expanded: hand-of-cards fan. Rotation alone only spread the card
            centres over ~56px, about 14px per card, which is far too small to
            aim at with a finger, so each card also slides sideways. The X
@@ -656,6 +664,7 @@ class ThumbnailDeck(Gtk.Overlay):
         self.hover_delay_id = None
         self.cycle_id = None
         self.expanded = False
+        self.peeking = False
         self.current_pull = 0
 
         # Placeholder icon when no photos yet
@@ -692,6 +701,7 @@ class ThumbnailDeck(Gtk.Overlay):
 
         # Motion controller — mouse hover only
         motion = Gtk.EventControllerMotion()
+        motion.connect("enter",  lambda _c, x, y: self._on_enter())
         motion.connect("motion", lambda _c, x, y: self._on_motion(x, y))
         motion.connect("leave", lambda *_: self._on_leave())
         self.add_controller(motion)
@@ -739,10 +749,16 @@ class ThumbnailDeck(Gtk.Overlay):
         self._refresh_transforms()
 
     def _refresh_transforms(self):
-        """Apply CSS classes based on state so cards fan when expanded."""
-        state = "expanded" if self.expanded else "idle"
+        """Apply CSS classes for the current stage: stacked, peeking or
+        fully fanned."""
+        if self.expanded:
+            state = "expanded"
+        elif self.peeking:
+            state = "peek"
+        else:
+            state = "idle"
         for i, c in enumerate(self.cards):
-            for cls in ("state-idle", "state-expanded", "pulled"):
+            for cls in ("state-idle", "state-peek", "state-expanded", "pulled"):
                 if c.has_css_class(cls): c.remove_css_class(cls)
             c.add_css_class(f"state-{state}")
 
@@ -816,6 +832,7 @@ class ThumbnailDeck(Gtk.Overlay):
         # card visually above the fan, even without z-order changes.
 
     # ---- new press/hold interaction ----
+    PEEK_MS   = 650   # ms of hover before the deck tips open a little
     HOLD_MS   = 220   # ms to hold before fan-out starts
     DBLCLK_MS = 280   # ms to wait for a possible second click before opening
 
@@ -898,8 +915,19 @@ class ThumbnailDeck(Gtk.Overlay):
         self._refresh_transforms()
 
     def _on_enter(self):
-        # Hover no longer triggers the fan — kept for API stability but unused.
-        pass
+        """Hovering for a moment opens the deck a little. Touch has no hover,
+        so on a tablet you go straight from stacked to press-and-hold."""
+        if self.expanded or self.peeking:
+            return
+        if self.hover_delay_id:
+            GLib.source_remove(self.hover_delay_id)
+        def _peek():
+            self.hover_delay_id = None
+            if not self.expanded and self.cards:
+                self.peeking = True
+                self._refresh_transforms()
+            return False
+        self.hover_delay_id = GLib.timeout_add(self.PEEK_MS, _peek)
 
     def _on_leave(self):
         # Mid-drag, ignore leave entirely. The drag gesture keeps delivering
@@ -909,12 +937,22 @@ class ThumbnailDeck(Gtk.Overlay):
         if self._press_is_hold and self.expanded:
             return
         # If the mouse leaves the deck mid-hold, cancel the fan.
+        if self.hover_delay_id:
+            GLib.source_remove(self.hover_delay_id); self.hover_delay_id = None
         if self._hold_timer:
             GLib.source_remove(self._hold_timer); self._hold_timer = None
         if self.expanded:
             self._collapse()
+        elif self.peeking:
+            self.peeking = False
+            self._refresh_transforms()
 
     def _expand(self):
+        # Drop any pending peek timer properly. Clearing the id alone left the
+        # timeout armed, so it could fire after a later collapse and tip the
+        # deck open on its own.
+        if self.hover_delay_id:
+            GLib.source_remove(self.hover_delay_id)
         self.hover_delay_id = None
         if not self.cards: return False
         self.expanded = True
