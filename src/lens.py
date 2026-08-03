@@ -372,9 +372,16 @@ class LensWindow(Adw.ApplicationWindow):
         root.set_child(column)
 
         # The viewfinder and the things that genuinely belong over the image.
+        # Wrapped in a WindowHandle because the window has no titlebar, so
+        # without this there is nothing to grab to move it. Buttons inside
+        # still get their own clicks; only empty areas start a drag, and
+        # double-click still maximises.
         overlay = Gtk.Overlay()
         overlay.set_vexpand(True); overlay.set_hexpand(True)
-        column.append(overlay)
+        view_handle = Gtk.WindowHandle()
+        view_handle.set_child(overlay)
+        view_handle.set_vexpand(True); view_handle.set_hexpand(True)
+        column.append(view_handle)
 
         # Black background + viewfinder
         bg = Gtk.Box()
