@@ -532,7 +532,9 @@ class LensWindow(Adw.ApplicationWindow):
         # ---- Camcorder HUD (video mode) ----
         # Sits over the viewfinder between the top pills and the bottom bar.
         hud = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        hud.set_margin_top(20); hud.set_margin_bottom(18)
+        # Clear the pill row, which is centred over the top of the picture.
+        # At 20px the STBY timer ran straight into the grid pill.
+        hud.set_margin_top(58); hud.set_margin_bottom(18)
         hud.set_margin_start(16); hud.set_margin_end(16)
         hud.set_can_target(False)
 
