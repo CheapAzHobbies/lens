@@ -343,19 +343,26 @@ class LensWindow(Adw.ApplicationWindow):
             # actually produced a frame, then swap and stop the old pipeline.
             state = {"swapped": False}
 
+            def _commit():
+                self.picture.set_paintable(new_paintable)
+                old_pipeline.set_state(Gst.State.NULL)
+
             def _swap(*_):
                 if state["swapped"]:
-                    return
+                    return False
                 state["swapped"] = True
                 if state.get("handler"):
                     try:
                         new_paintable.disconnect(state["handler"])
                     except Exception:
                         pass
-                self.picture.set_paintable(new_paintable)
-                old_pipeline.set_state(Gst.State.NULL)
+                # Hand the commit to the caller instead of doing it here: the
+                # flip wants to hold the old frame until the viewfinder is
+                # fully shut, otherwise the new camera pops in mid-animation.
                 if on_ready:
-                    on_ready()
+                    on_ready(_commit)
+                else:
+                    _commit()
                 return False
 
             state["handler"] = new_paintable.connect("invalidate-contents", _swap)
@@ -366,7 +373,7 @@ class LensWindow(Adw.ApplicationWindow):
         else:
             self.picture.set_paintable(new_paintable)
             if on_ready:
-                on_ready()
+                on_ready(None)
 
         self.pipeline.set_state(Gst.State.PLAYING)
 
@@ -580,6 +587,9 @@ class LensWindow(Adw.ApplicationWindow):
         self.btn_flip.set_margin_bottom(40)
         self._flip_spun = False
         self._flipping = False
+        self._flip_shut = False
+        self._flip_ready = False
+        self._flip_commit = None
         self.btn_flip.set_sensitive(len(self.cameras) > 1)
         self.btn_flip.connect("clicked", lambda *_: self._flip_camera())
         act_area.add_overlay(self.btn_flip)
@@ -796,7 +806,11 @@ class LensWindow(Adw.ApplicationWindow):
            3D projection over a GStreamer paintable rendered as a squashed
            band with a triangular artifact. A plain 2D scaleX reads as the
            same turn and composites cleanly. */
-        .viewflip { transition: transform 140ms cubic-bezier(.45,0,.55,1); }
+        /* Accelerate into the close, decelerate out of the open. One
+           symmetric ease for both directions made the hold in the middle
+           read as a stall. */
+        .viewflip { transition: transform 170ms cubic-bezier(.4, 0, 1, 1); }
+        .viewflip.opening { transition: transform 300ms cubic-bezier(0, 0, .2, 1); }
         .viewflip.flipped { transform: scaleX(0.02); }
         .viewer-bg { background: rgba(0,0,0,0.95); }
         .flip:active    { transform: scale(0.9); }
@@ -1039,25 +1053,47 @@ class LensWindow(Adw.ApplicationWindow):
         else:
             self.flip_icon.add_css_class("mirrored")
 
-        # Turn the viewfinder edge-on first, swap behind it, then turn back.
+        # Bring the new camera up *now*, in parallel with the animation,
+        # rather than waiting for the squeeze to finish first. Starting it
+        # afterwards meant the view sat shut for the few hundred ms the
+        # camera needed, which is the pause that made this look broken.
+        self._flip_shut = False
+        self._flip_commit = None
+        self._flip_ready = False
         self.frame_stack.add_css_class("flipped")
-        GLib.timeout_add(self.FLIP_MS, self._flip_swap)
+        GLib.timeout_add(self.FLIP_MS, self._flip_shut_cb)
 
-    def _flip_swap(self):
         self.cam_idx = (self.cam_idx + 1) % len(self.cameras)
         self._save_settings()
         print(f"Lens: switching to camera {self.cam_idx}: {self.cameras[self.cam_idx]}")
-        # The two cameras are separate devices, so the replacement can be
-        # brought up while the old one is still feeding the viewfinder. The
-        # picture never goes blank and the layout never jumps, which is what
-        # was interrupting the transition half way through.
-        # Open back out only once the new camera has actually produced a
-        # frame, otherwise the fan opens onto the old feed and then pops.
-        self._start_pipeline(keep_old=True, on_ready=self._flip_back)
+        # Separate devices, so the replacement runs while the old one is still
+        # feeding the viewfinder.
+        self._start_pipeline(keep_old=True, on_ready=self._flip_ready_cb)
+
+    def _flip_shut_cb(self):
+        self._flip_shut = True
+        self._flip_open_when_ready()
         return False
 
-    def _flip_back(self):
+    def _flip_ready_cb(self, commit):
+        self._flip_commit = commit
+        self._flip_ready = True
+        self._flip_open_when_ready()
+
+    def _flip_open_when_ready(self):
+        """Open back out once the view is fully shut AND the new camera has a
+        frame. Whichever finishes last drives it."""
+        if not (self._flip_shut and self._flip_ready):
+            return
+        if self._flip_commit:
+            self._flip_commit()
+            self._flip_commit = None
+        self.frame_stack.add_css_class("opening")
         self.frame_stack.remove_css_class("flipped")
+        GLib.timeout_add(320, self._flip_done)
+
+    def _flip_done(self):
+        self.frame_stack.remove_css_class("opening")
         self._flipping = False
         return False
 
