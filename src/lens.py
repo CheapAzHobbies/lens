@@ -795,18 +795,20 @@ class LensWindow(Adw.ApplicationWindow):
         root.add_overlay(self.flash_overlay)
 
         # ---- Camcorder HUD (video mode) ----
-        # Sits over the viewfinder between the top pills and the bottom bar.
+        # Four corners plus a centred clock, rather than everything crowded
+        # into the top left. Each corner owns one idea:
+        #   top left     am I rolling, and for how long
+        #   top centre   wall clock
+        #   top right    power
+        #   bottom left  sound
+        #   bottom right what is being written
         hud = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         hud.set_margin_top(18); hud.set_margin_bottom(18)
         hud.set_margin_start(16); hud.set_margin_end(16)
         hud.set_can_target(False)
 
-        hud_top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        hud_top.set_valign(Gtk.Align.START)
-
-        # REC / STBY, left
+        # --- top left: recording state
         rec_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        rec_row.set_halign(Gtk.Align.START); rec_row.set_hexpand(True)
         rec_row.set_valign(Gtk.Align.CENTER)
         self.rec_dot = Gtk.Box()
         self.rec_dot.add_css_class("rec-dot")
@@ -820,27 +822,13 @@ class LensWindow(Adw.ApplicationWindow):
         rec_row.append(self.rec_state_label)
         rec_row.append(self.rec_time_label)
 
-        # Mic state sits with the recording state, since that is what it
-        # affects. Clickable, because being unable to mute from the
-        # viewfinder would be worse than not showing it at all.
-        self.btn_mic = Gtk.Button()
-        self.mic_icon = Gtk.Image.new_from_icon_name("audio-input-microphone-symbolic")
-        self.mic_icon.set_pixel_size(14)
-        self.btn_mic.set_child(self.mic_icon)
-        self.btn_mic.add_css_class("hud-btn")
-        self.btn_mic.set_valign(Gtk.Align.CENTER)
-        self.btn_mic.set_margin_start(10)
-        self.btn_mic.connect("clicked", lambda *_: self._toggle_mic())
-        rec_row.append(self.btn_mic)
-        self.audio_meter = AudioMeter()
-        self.audio_meter.set_margin_start(4)
-        rec_row.append(self.audio_meter)
-        self._rec_row = rec_row
-        hud_top.append(rec_row)
+        # --- top centre: clock
+        self.hud_clock = Gtk.Label(label="")
+        self.hud_clock.add_css_class("hud-mono")
 
-        # Battery, right
+        # --- top right: power
         bat_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        bat_row.set_halign(Gtk.Align.END); bat_row.set_valign(Gtk.Align.CENTER)
+        bat_row.set_valign(Gtk.Align.CENTER)
         self.bat_gauge = BatteryGauge()
         self.bat_label = Gtk.Label(label="--%")
         self.bat_label.add_css_class("hud-mono")
@@ -849,36 +837,55 @@ class LensWindow(Adw.ApplicationWindow):
         bat_row.append(self.bat_gauge)
         bat_row.append(self.bat_label)
         bat_row.append(self.bat_left_label)
-        self._bat_row = bat_row
-        self._hud_top = hud_top
-        hud_top.append(bat_row)
+
+        hud_top = Gtk.CenterBox()
+        hud_top.set_valign(Gtk.Align.START)
+        hud_top.set_start_widget(rec_row)
+        hud_top.set_center_widget(self.hud_clock)
+        hud_top.set_end_widget(bat_row)
         hud.append(hud_top)
 
         spacer = Gtk.Box(); spacer.set_vexpand(True)
         hud.append(spacer)
 
-        hud_bot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
-        hud_bot.set_valign(Gtk.Align.END)
-        self.hud_clock = Gtk.Label(label="")
-        self.hud_clock.add_css_class("hud-mono")
-        self.hud_clock.set_halign(Gtk.Align.START); self.hud_clock.set_hexpand(True)
+        # --- bottom left: sound. Its own corner so the meter survives at
+        # sizes where the top row has already had to shed things.
+        audio_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        audio_row.set_valign(Gtk.Align.CENTER)
+        self.btn_mic = Gtk.Button()
+        self.mic_icon = Gtk.Image.new_from_icon_name("audio-input-microphone-symbolic")
+        self.mic_icon.set_pixel_size(14)
+        self.btn_mic.set_child(self.mic_icon)
+        self.btn_mic.add_css_class("hud-btn")
+        self.btn_mic.set_valign(Gtk.Align.CENTER)
+        self.btn_mic.connect("clicked", lambda *_: self._toggle_mic())
+        self.audio_meter = AudioMeter()
+        audio_row.append(self.btn_mic)
+        audio_row.append(self.audio_meter)
+
+        # --- bottom right: what is being written
+        info_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        info_row.set_valign(Gtk.Align.CENTER)
         self.hud_fps = Gtk.Label(label="")
         self.hud_fps.add_css_class("hud-mono")
-        self.hud_fps.set_halign(Gtk.Align.END)
         self.hud_format = Gtk.Label(label="MKV  H.264")
         self.hud_format.add_css_class("hud-dim")
-        self.hud_format.set_halign(Gtk.Align.END)
-        self._hud_bot = hud_bot
-        hud_bot.append(self.hud_clock)
-        hud_bot.append(self.hud_fps)
-        hud_bot.append(self.hud_format)
+        info_row.append(self.hud_fps)
+        info_row.append(self.hud_format)
+
+        hud_bot = Gtk.CenterBox()
+        hud_bot.set_valign(Gtk.Align.END)
+        hud_bot.set_start_widget(audio_row)
+        hud_bot.set_end_widget(info_row)
         hud.append(hud_bot)
 
-        # Everything that is not the recording state. The mic button stays
-        # out of this list on purpose: whether your voice is being captured
-        # matters as much as whether the camera is rolling, so it survives
-        # alongside REC and the timer.
-        self._hud_extras = [self.audio_meter, bat_row]
+        self._rec_row, self._bat_row = rec_row, bat_row
+        self._audio_row, self._info_row = audio_row, info_row
+        self._hud_top, self._hud_bot = hud_top, hud_bot
+        # What each row sheds when it runs out of room. The mic and its meter
+        # are never shed: whether your voice is being captured matters as
+        # much as whether the camera is rolling.
+        self._hud_extras = [self.hud_clock, bat_row, info_row]
         self.rec_indicator = hud
         self.rec_indicator.set_visible(False)
         # On the picture, not the window: the readouts belong over the frame
@@ -1447,37 +1454,41 @@ class LensWindow(Adw.ApplicationWindow):
         self._save_settings()
 
     def _fit_hud(self, *_):
-        """Each row is all or nothing, and the two rows decide separately.
+        """Shed whole corners, never half of one.
 
-        Half-populating a row looks broken, so a row that will not fit is
-        either stripped to the recording state or hidden outright. The rows
-        are judged independently because the bottom one is much the wider:
-        letting it drag the top one down meant the state and timer vanished
-        on a picture that had plenty of room for them.
+        Each row keeps its left corner and drops its right (and the clock)
+        when the picture gets narrow, so what survives longest is: am I
+        rolling and for how long, and is my voice going in. A row whose left
+        corner alone will not fit hides completely.
         """
         stack_w = self.frame_stack.get_width()
         if stack_w <= 1:
             return False
-        # side margins (16 each) plus a gap so the two ends never touch
+        # side margins (16 each) plus a gap so opposite corners never touch
         avail = stack_w - 32 - 28
 
         def w_of(*widgets):
             return sum(x.get_preferred_size()[1].width for x in widgets
                        if x.get_visible())
 
-        # --- bottom row: date, resolution, codec. All of it or none of it.
-        self._hud_bot.set_visible(True)
-        self._hud_bot.set_visible(w_of(self._hud_bot) <= avail)
-
-        # --- top row: full readouts, else just REC/STBY and the timer.
+        # Start from everything, so widening restores it.
         self._hud_top.set_visible(True)
+        self._hud_bot.set_visible(True)
         for wdg in self._hud_extras:
             wdg.set_visible(True)
-        if w_of(self._rec_row, self._bat_row) > avail:
-            for wdg in self._hud_extras:
-                wdg.set_visible(False)
+
+        # Top row: state, clock and battery. Shed clock and battery together.
+        if w_of(self._rec_row, self.hud_clock, self._bat_row) > avail:
+            self.hud_clock.set_visible(False)
+            self._bat_row.set_visible(False)
             if w_of(self._rec_row) > avail:
                 self._hud_top.set_visible(False)
+
+        # Bottom row: sound on the left, format on the right.
+        if w_of(self._audio_row, self._info_row) > avail:
+            self._info_row.set_visible(False)
+            if w_of(self._audio_row) > avail:
+                self._hud_bot.set_visible(False)
         return False
 
     def _hud_standby(self):
@@ -1493,8 +1504,10 @@ class LensWindow(Adw.ApplicationWindow):
             self.hud_timer = None
             return False
 
-        self.hud_clock.set_label(
-            datetime.datetime.now().strftime("%Y-%m-%d  %H:%M:%S"))
+        # Time only. The date costs about 170px of a picture that may only
+        # be 380 wide at 1:1, and it is already in the filename and the file
+        # metadata, so it was the least useful thing taking the most room.
+        self.hud_clock.set_label(datetime.datetime.now().strftime("%H:%M:%S"))
 
         # Frames actually delivered in the last second, which is the real
         # rate: negotiated caps say 30 but a busy machine may not hit it.
