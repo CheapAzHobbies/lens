@@ -4,7 +4,7 @@ Lens — a fast, mobile-first camera app for Linux tablets.
 GTK4 + libadwaita + GStreamer.
 """
 
-import gi, os, sys, datetime, pathlib
+import gi, os, sys, math, datetime, pathlib
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Gst", "1.0")
@@ -318,12 +318,16 @@ class LensWindow(Adw.ApplicationWindow):
         .state-idle.deck-idx-2 { transform: translate(80px, -20px) rotate(  0deg); }
         .state-idle.deck-idx-3 { transform: translate(80px, -20px) rotate(  5deg); }
         .state-idle.deck-idx-4 { transform: translate(80px, -20px) rotate( 10deg); }
-        /* Expanded: full hand-of-cards fan around the same bottom pivot */
-        .state-expanded.deck-idx-0 { transform: translate(80px, -20px) rotate(-30deg); }
-        .state-expanded.deck-idx-1 { transform: translate(80px, -20px) rotate(-15deg); }
-        .state-expanded.deck-idx-2 { transform: translate(80px, -20px) rotate(  0deg); }
-        .state-expanded.deck-idx-3 { transform: translate(80px, -20px) rotate( 15deg); }
-        .state-expanded.deck-idx-4 { transform: translate(80px, -20px) rotate( 30deg); }
+        /* Expanded: hand-of-cards fan. Rotation alone only spread the card
+           centres over ~56px, about 14px per card, which is far too small to
+           aim at with a finger, so each card also slides sideways. The X
+           values here MUST stay in step with FAN_DX + FAN_OFFSETS in
+           ThumbnailDeck or the hit zones drift away from what is drawn. */
+        .state-expanded.deck-idx-0 { transform: translate( 20px, -20px) rotate(-30deg); }
+        .state-expanded.deck-idx-1 { transform: translate( 50px, -20px) rotate(-15deg); }
+        .state-expanded.deck-idx-2 { transform: translate( 80px, -20px) rotate(  0deg); }
+        .state-expanded.deck-idx-3 { transform: translate(110px, -20px) rotate( 15deg); }
+        .state-expanded.deck-idx-4 { transform: translate(140px, -20px) rotate( 30deg); }
         /* "Pulled" — one card lifted farther and up */
         .pulled { transform: translate(0px, -80px) rotate(0deg) scale(1.4);
                   box-shadow: 0 8px 20px rgba(0,0,0,0.6); }
@@ -332,9 +336,19 @@ class LensWindow(Adw.ApplicationWindow):
            Otherwise the state-expanded transform wins and the pop-up never
            applies. Also declared AFTER the state-expanded rules so
            equal-specificity ties break in our favor. */
-        .state-expanded.card-focused,
+        /* The focused card lifts straight up from where it already is, so the
+           card under your finger is the one that rises. Sending them all to a
+           shared X made the card jump sideways out from under you. Three
+           classes here (30) beats .state-expanded.deck-idx-N (20). */
+        .state-expanded.deck-idx-0.card-focused { transform: translate( 20px, -190px) rotate(0deg) scale(1.7); }
+        .state-expanded.deck-idx-1.card-focused { transform: translate( 50px, -190px) rotate(0deg) scale(1.7); }
+        .state-expanded.deck-idx-2.card-focused { transform: translate( 80px, -190px) rotate(0deg) scale(1.7); }
+        .state-expanded.deck-idx-3.card-focused { transform: translate(110px, -190px) rotate(0deg) scale(1.7); }
+        .state-expanded.deck-idx-4.card-focused { transform: translate(140px, -190px) rotate(0deg) scale(1.7); }
         .state-idle.card-focused {
             transform: translate(80px, -190px) rotate(0deg) scale(1.7);
+        }
+        .card-focused {
             box-shadow: 0 18px 40px rgba(0,0,0,0.85);
             border: 4px solid white;
         }
@@ -615,11 +629,16 @@ class ThumbnailDeck(Gtk.Overlay):
     # centered shutter button behind it.
     HIT_W     = 300
     HIT_H     = 160
-    # How far past the fan the finger may drift before the deck deselects.
-    # Small overshoot keeps the end card held while scrubbing; go further and
-    # nothing is selected, so you can feel that you are off the deck.
-    FAN_SLOP   = 40   # horizontal, px past either end of the fan
-    FAN_SLOP_Y = 90   # vertical, px above/below the widget
+    # Geometry of the expanded fan. These MUST match the
+    # .state-expanded.deck-idx-N rules in the CSS, because the hit zones are
+    # derived from them rather than guessed at.
+    FAN_ANGLES  = (-30, -15, 0, 15, 30)     # rotate(Ndeg)
+    FAN_DX      = 80                        # base translate X
+    FAN_OFFSETS = (-60, -30, 0, 30, 60)     # per-card slide, added to FAN_DX
+    # How far past a card's centre the finger may drift before the deck
+    # deselects, on top of half the card-to-card spacing.
+    FAN_SLOP   = 26   # horizontal px
+    FAN_SLOP_Y = 90   # vertical px above/below the widget
 
     def __init__(self, on_click=None, on_card_click=None):
         super().__init__()
@@ -649,6 +668,7 @@ class ThumbnailDeck(Gtk.Overlay):
         self._hold_timer = None
         self._click_timer = None
         self._press_is_hold = False
+        self._debug = bool(os.environ.get("LENS_DEBUG"))
 
         press = Gtk.GestureClick.new()
         press.set_button(1)   # left mouse
@@ -721,34 +741,49 @@ class ThumbnailDeck(Gtk.Overlay):
                 c.remove_css_class("card-focused")
         self._focused_card = None
 
+    def _fan_centers(self):
+        """X of each expanded card, computed from the same numbers the CSS
+        uses. Previously this was a hardcoded 20..240 band while the cards
+        actually sat between 108 and 164, so where you pointed and which card
+        lit up were unrelated."""
+        n = len(self.cards)
+        if not n:
+            return []
+        c0 = self.cards[0]
+        w = c0.get_width()  or self.THUMB_PX
+        h = c0.get_height() or self.THUMB_PX
+        out = []
+        for i in range(n):
+            j = min(i, len(self.FAN_ANGLES) - 1)
+            # Card rotates about its bottom centre, so its middle swings out
+            # by (h/2)*sin(angle) from the pivot.
+            pivot = w / 2 + self.FAN_DX + self.FAN_OFFSETS[j]
+            out.append(pivot + (h / 2) * math.sin(math.radians(self.FAN_ANGLES[j])))
+        return out
+
     def _on_motion(self, x, y):
-        """Cursor moved inside the deck widget — pick focused card by x zone.
-        Zones are spread across the actual visible fan range, not the full
-        widget width, so all cards are reachable with a natural swipe."""
+        """Cursor moved inside the deck widget — focus the nearest card."""
         if not self.expanded or len(self.cards) < 2:
             return
-        # Fan visually spans roughly the leftmost card center to the rightmost
-        # card center. Cards pivot at the same bottom-center point but rotate
-        # ±30°, so their tops spread out across ~200px.
-        FAN_MIN, FAN_MAX = 20, 240
 
-        # Past the ends of the fan, or well above/below it, means the finger
-        # has moved off the deck. Deselect instead of pinning to whichever
-        # card happens to be last, so there is feedback that releasing here
-        # opens nothing. The slop keeps a small overshoot on the end cards
-        # from dropping focus while you are still scrubbing.
-        if (x < FAN_MIN - self.FAN_SLOP or x > FAN_MAX + self.FAN_SLOP
+        centers = self._fan_centers()
+        if not centers:
+            return
+
+        if self._debug:
+            print(f"[deck] x={x:7.1f} y={y:7.1f} centers="
+                  + " ".join(f"{c:.0f}" for c in centers), file=sys.stderr)
+
+        # Nearest card wins, so pointing at a card selects that card by
+        # construction. Tolerance scales with the actual spacing.
+        idx = min(range(len(centers)), key=lambda i: abs(x - centers[i]))
+        spacing = ((max(centers) - min(centers)) / (len(centers) - 1)
+                   if len(centers) > 1 else self.THUMB_PX)
+        if (abs(x - centers[idx]) > spacing / 2 + self.FAN_SLOP
                 or y < -self.FAN_SLOP_Y or y > self.HIT_H + self.FAN_SLOP_Y):
             self._clear_focus()
             return
 
-        n = len(self.cards)
-        rel = (x - FAN_MIN) / (FAN_MAX - FAN_MIN)
-        rel = max(0.0, min(1.0, rel))
-        # Equal-width band per card. Rounding to the nearest of (n-1) steps
-        # instead would give the two end cards half-width targets, which is
-        # what made the leftmost and rightmost previews hard to land on.
-        idx = min(n - 1, int(rel * n))
         target = self.cards[idx]
         if self._focused_card is target:
             return
