@@ -578,6 +578,7 @@ class LensWindow(Adw.ApplicationWindow):
         top_bar.add_css_class("top-bar")
         self._ballast = ballast
         self._top_pills = top
+        self._winctl = winctl
         top_bar.append(ballast)
         top_bar.append(gap_l)
         top_bar.append(top)
@@ -1091,23 +1092,34 @@ class LensWindow(Adw.ApplicationWindow):
         flip = max(42, min(72, int(w * 0.085) // 4 * 4))
         self.shutter.set_size_request(shutter, shutter)
         self.btn_flip.set_size_request(flip, flip)
-        self.btn_flip.set_margin_end(
-            128 if cls == "roomy" else (16 if cls == "compact" else 10))
 
         if cls != "tiny":
             self.thumb.set_visible(True)
             thumb = max(64, min(112, int(w * 0.13) // 8 * 8))
-            self.thumb.set_scale(thumb, thumb + 56, 28 if cls == "roomy" else 14)
+            deck_margin = 28 if cls == "roomy" else 14
+            self.thumb.set_scale(thumb, thumb + 56, deck_margin)
+            # Mirror the flip button about the preview: put its centre the
+            # same distance in from the right edge as the preview's centre is
+            # from the left. Both sides scale, so this has to be computed
+            # rather than fixed.
+            preview_centre = deck_margin + self.thumb.FAN_DX + thumb / 2
+            self.btn_flip.set_margin_end(max(10, int(preview_centre - flip / 2)))
         else:
             # No room for a preview deck next to a shutter and a flip button.
             # The deck is the one to drop: the gallery is still reachable, and
             # losing the shutter would make the app useless at this size.
             self.thumb.set_visible(False)
+            self.btn_flip.set_margin_end(10)
 
         # Top bar: the window controls must survive at every width, so the
         # decorative ballast goes first and the mode pills go next. At 380px
         # ballast(106) + pills(174) + controls(106) overflowed and the close
         # button was pushed off the edge.
+        # The ballast exists purely to balance the window-control group so
+        # the mode pills sit at true centre. The controls shrink at narrow
+        # widths, so a fixed 106px ballast pushed the pills off centre.
+        btn = 34 if cls == "roomy" else 28
+        self._ballast.set_size_request(btn * 3 + 4, -1)
         self._ballast.set_visible(cls == "roomy")
         self._top_pills.set_visible(cls != "tiny")
         self.btn_flip.set_visible(True)
