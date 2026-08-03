@@ -211,12 +211,23 @@ class LensWindow(Adw.ApplicationWindow):
         act_area.add_overlay(self.thumb)
         self._refresh_deck()
 
-        # Flip camera — anchored RIGHT
-        self.btn_flip = Gtk.Button(label="⟳")
-        self.btn_flip.set_size_request(56, 56); self.btn_flip.add_css_class("flip")
+        # Flip camera — anchored RIGHT, mirroring the deck on the left.
+        # The deck's visible card sits at margin(28) + card centre(56) +
+        # translate(80) = 164px in from the left edge, so the flip button is
+        # placed 164px in from the right: margin_end(128) + half of 72.
+        # translate(-20px) lifts the card 20px, and margin_bottom(40) lifts
+        # this by the same 20px under CENTER alignment.
+        self.flip_icon = Gtk.Image.new_from_icon_name("camera-switch-symbolic")
+        self.flip_icon.set_pixel_size(34)
+        self.flip_icon.add_css_class("flip-icon")
+        self.btn_flip = Gtk.Button()
+        self.btn_flip.set_child(self.flip_icon)
+        self.btn_flip.set_size_request(72, 72); self.btn_flip.add_css_class("flip")
         self.btn_flip.set_halign(Gtk.Align.END); self.btn_flip.set_valign(Gtk.Align.CENTER)
         self.btn_flip.set_hexpand(False); self.btn_flip.set_vexpand(False)
-        self.btn_flip.set_margin_end(28)
+        self.btn_flip.set_margin_end(128)
+        self.btn_flip.set_margin_bottom(40)
+        self._flip_spun = False
         self.btn_flip.set_sensitive(len(self.cameras) > 1)
         self.btn_flip.connect("clicked", lambda *_: self._flip_camera())
         act_area.add_overlay(self.btn_flip)
@@ -291,7 +302,9 @@ class LensWindow(Adw.ApplicationWindow):
         .mode-btn { background: transparent; color: white; font-weight: bold;
                     font-size: 12px; padding: 4px 24px; border-radius: 14px;
                     border: none; box-shadow: none; }
-        .mode-active { background: rgba(0,0,0,0.5); color: #ffcc00; }
+        /* Adwaita blue, the standard GNOME accent. Reads as part of the
+           desktop rather than a random highlight colour. */
+        .mode-active { background: rgba(0,0,0,0.5); color: #62a0ea; }
         .shutter { background: white; border-radius: 40px;
                    border: 4px solid white; min-width: 76px; min-height: 76px;
                    box-shadow: 0 0 0 4px rgba(0,0,0,0.4);
@@ -369,12 +382,19 @@ class LensWindow(Adw.ApplicationWindow):
                        min-width: 40px; min-height: 40px; border: 4px solid white; }
         .thumb { background: rgba(255,255,255,0.2); border-radius: 8px;
                  border: 1px solid white; }
-        .flip { background: rgba(0,0,0,0.5); border-radius: 28px;
-                color: white; font-size: 22px; font-weight: bold; border: none; }
+        .flip { background: rgba(0,0,0,0.55); border-radius: 36px;
+                color: white; border: none;
+                box-shadow: 0 2px 12px rgba(0,0,0,0.55);
+                transition: background 140ms ease-out, transform 120ms ease-out; }
+        .flip:hover { background: rgba(0,0,0,0.72); }
         .flip:disabled { opacity: 0.35; }
+        /* The icon spins rather than the button, so the press-scale on the
+           button and the spin cannot fight over the same transform. */
+        .flip-icon { transition: transform 450ms cubic-bezier(.2,.7,.3,1); }
+        .flip-icon.spun { transform: rotate(180deg); }
         .pill { background: rgba(0,0,0,0.5); border-radius: 21px; color: white;
                 font-weight: bold; font-size: 14px; padding: 4px 12px; border: none; }
-        .pill-active { background: #ffcc00; color: black; }
+        .pill-active { background: #62a0ea; color: white; }
         .countdown { color: white; font-size: 96px; font-weight: bold;
                      background: rgba(0,0,0,0.5); padding: 30px 50px; border-radius: 60px; }
         .flash { background: black; }
@@ -460,6 +480,13 @@ class LensWindow(Adw.ApplicationWindow):
 
     def _flip_camera(self):
         if len(self.cameras) < 2: return
+        # Half turn on every press, so repeated flips keep spinning the same
+        # way instead of snapping back.
+        self._flip_spun = not self._flip_spun
+        if self._flip_spun:
+            self.flip_icon.add_css_class("spun")
+        else:
+            self.flip_icon.remove_css_class("spun")
         self.cam_idx = (self.cam_idx + 1) % len(self.cameras)
         print(f"Lens: switching to camera {self.cam_idx}: {self.cameras[self.cam_idx]}")
         # Detach paintable before tearing down pipeline
