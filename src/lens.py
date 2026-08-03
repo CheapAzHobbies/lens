@@ -229,7 +229,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.countdown_label.set_valign(Gtk.Align.CENTER)
         overlay.add_overlay(self.countdown_label)
 
-        # Full-window white flash (photo capture feedback)
+        # Full-window black blink (photo capture feedback)
         self.flash_overlay = Gtk.Box()
         self.flash_overlay.add_css_class("flash")
         self.flash_overlay.set_visible(False)
@@ -340,8 +340,6 @@ class LensWindow(Adw.ApplicationWindow):
         }
         /* Full-screen photo viewer */
         .viewer-bg { background: rgba(0,0,0,0.95); }
-        /* Blur flair applied briefly during aspect-ratio transition */
-        .aspect-blur { filter: blur(6px); transition: filter 200ms ease-out; }
         .flip:active    { transform: scale(0.9); }
         .pill:active    { transform: scale(0.9); }
         .rec-shutter { background: red; border-radius: 8px;
@@ -356,7 +354,7 @@ class LensWindow(Adw.ApplicationWindow):
         .pill-active { background: #ffcc00; color: black; }
         .countdown { color: white; font-size: 96px; font-weight: bold;
                      background: rgba(0,0,0,0.5); padding: 30px 50px; border-radius: 60px; }
-        .flash { background: white; }
+        .flash { background: black; }
         .rec-dot { background: #ff2222; border-radius: 7px; }
         .rec-dot.blink { background: rgba(255,34,34,0.3); }
         .rec-time { color: white; font-family: monospace; font-size: 14px;
@@ -404,20 +402,13 @@ class LensWindow(Adw.ApplicationWindow):
         self.btn_aspect.set_label(self.aspects[self.aspect_idx])
         new = {"4:3": 4/3, "16:9": 16/9, "1:1": 1.0}[self.aspects[self.aspect_idx]]
 
-        # Smooth ratio interpolation + brief blur flair
-        self.aspect_frame.add_css_class("aspect-blur")
+        # Smooth ratio interpolation. No blur: defocusing the whole viewfinder
+        # mid-transition is uncomfortable to look at.
         target = Adw.CallbackAnimationTarget.new(
             lambda v: self.aspect_frame.set_ratio(v))
         anim = Adw.TimedAnimation.new(self.aspect_frame, old, new, 380, target)
         anim.set_easing(Adw.Easing.EASE_OUT_CUBIC)
         anim.play()
-        # Guaranteed blur clear — Adw done signal is unreliable in some versions.
-        GLib.timeout_add(420, self._clear_aspect_blur)
-
-    def _clear_aspect_blur(self):
-        if self.aspect_frame.has_css_class("aspect-blur"):
-            self.aspect_frame.remove_css_class("aspect-blur")
-        return False
 
     def _toggle_timer(self):
         seq = [0, 3, 10]
@@ -530,9 +521,11 @@ class LensWindow(Adw.ApplicationWindow):
         self._refresh_deck()
 
     def _flash(self):
-        """Full-screen white flash overlay ~150ms — visual capture feedback."""
+        """Full-screen black blink ~150ms, like a shutter closing. A white
+        flash is what a real camera does, but on a screen at night it is
+        genuinely painful, so this goes dark instead."""
         self.flash_overlay.set_visible(True)
-        self.flash_overlay.set_opacity(0.9)
+        self.flash_overlay.set_opacity(0.85)
         # Fade out over 200ms
         def fade():
             o = self.flash_overlay.get_opacity() - 0.15
@@ -749,10 +742,13 @@ class ThumbnailDeck(Gtk.Overlay):
             self._clear_focus()
             return
 
+        n = len(self.cards)
         rel = (x - FAN_MIN) / (FAN_MAX - FAN_MIN)
         rel = max(0.0, min(1.0, rel))
-        idx = int(rel * (len(self.cards) - 1) + 0.5)
-        idx = max(0, min(len(self.cards) - 1, idx))
+        # Equal-width band per card. Rounding to the nearest of (n-1) steps
+        # instead would give the two end cards half-width targets, which is
+        # what made the leftmost and rightmost previews hard to land on.
+        idx = min(n - 1, int(rel * n))
         target = self.cards[idx]
         if self._focused_card is target:
             return
