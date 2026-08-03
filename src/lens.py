@@ -525,13 +525,20 @@ class LensWindow(Adw.ApplicationWindow):
         self.last_photo = None
         self.countdown_val = 0
 
+        # Releasing the microphone has three nets, because a module that
+        # outlives the app leaves the system mic indicator lit and there is
+        # no way for the user to tell it is a ghost.
+        #   close-request  the normal path
+        #   SIGTERM/INT    kill, logout, session end
+        #   atexit         unhandled exceptions and plain interpreter exit
+        # Only SIGKILL escapes all three, and clear_stale_denoise() at
+        # startup mops that up on the next run.
         self.connect("close-request", self._on_close)
-        # SIGTERM and SIGINT still give us a chance to let the microphone go.
-        for sig in (GLib.unix_signal_add,):
-            pass
         import signal as _sig
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, _sig.SIGTERM, self._on_signal)
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, _sig.SIGINT, self._on_signal)
+        import atexit
+        atexit.register(self._drop_denoise)
         self._build_ui()
         self._install_breakpoints()
         self._apply_settings()
@@ -1273,14 +1280,27 @@ class LensWindow(Adw.ApplicationWindow):
            widget left that inner one drawing its default frame: a visible
            box around the resolution and format readouts. Both levels have
            to be flattened. */
-        .hud-btn, .hud-btn > button {
-            border: none; box-shadow: none; outline: none;
+        /* GtkMenuButton is a menubutton wrapping a real button. The inner
+           one has to be reset completely, not just given a transparent
+           background: Adwaita paints it with background-image, so clearing
+           only background-color left a second box drawn inside the chip. */
+        /* No background declaration here: .hud-chip supplies it, and this
+           rule comes later in the sheet, so setting one would win and the
+           chip would disappear. */
+        .hud-btn { padding: 0; border: none; box-shadow: none;
+                   min-width: 0; min-height: 0; }
+        .hud-btn > button,
+        .hud-btn > button:hover,
+        .hud-btn > button:active,
+        .hud-btn > button:checked,
+        .hud-btn > button:focus {
+            background-image: none;
+            background-color: transparent;
+            border: none; border-radius: 0; box-shadow: none; outline: none;
+            padding: 3px 9px; margin: 0;
             min-width: 0; min-height: 0; color: inherit; }
-        .hud-btn > button { background: transparent; padding: 0; }
-        .hud-btn { padding: 3px 9px; }
-        .hud-btn:hover, .hud-btn > button:hover {
-            background: rgba(255,255,255,0.18); border-radius: 6px; }
-        .hud-btn:focus, .hud-btn > button:focus { outline: none; }
+        /* Hover belongs to the chip, so the whole readout lights up. */
+        .hud-btn.hud-chip:hover { background-color: rgba(255,255,255,0.20); }
         .hud-btn-off { color: rgba(255,255,255,0.35); }
         /* Filled, not outlined. A red line-art glyph over a bright picture
            was almost invisible, which defeats the point of warning that the
