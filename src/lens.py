@@ -454,6 +454,454 @@ class BatteryGauge(Gtk.DrawingArea):
             cr.fill()
 
 
+class CropOverlay(Gtk.DrawingArea):
+    """Crop rectangle drawn over the picture, in widget coordinates.
+
+    Kept separate from the image so the picture itself is never re-rendered
+    while dragging: only this layer redraws, which keeps the drag smooth on
+    an 8MP photo.
+    """
+
+    HANDLE = 11
+
+    def __init__(self, on_change=None):
+        super().__init__()
+        self.rect = None          # (x, y, w, h) in widget space
+        self.frame = None         # letterboxed picture area in widget space
+        self.ratio = None         # locked aspect, or None for free
+        self.on_change = on_change
+        self.active = False
+        self._drag_mode = None
+        self._start = None
+        self.set_draw_func(self._draw)
+
+        drag = Gtk.GestureDrag.new()
+        drag.connect("drag-begin", self._begin)
+        drag.connect("drag-update", self._update)
+        self.add_controller(drag)
+
+    # ---- geometry ----
+    def set_frame(self, frame):
+        """Where the picture actually sits, after letterboxing."""
+        changed = frame != self.frame
+        self.frame = frame
+        if changed and self.active:
+            self.reset()
+
+    def reset(self):
+        if not self.frame:
+            return
+        fx, fy, fw, fh = self.frame
+        if self.ratio:
+            w, h = fw, fw / self.ratio
+            if h > fh:
+                h, w = fh, fh * self.ratio
+        else:
+            w, h = fw * 0.8, fh * 0.8
+        self.rect = (fx + (fw - w) / 2, fy + (fh - h) / 2, w, h)
+        self.queue_draw()
+        if self.on_change:
+            self.on_change()
+
+    def set_ratio(self, ratio):
+        self.ratio = ratio
+        self.reset()
+
+    def _hit(self, x, y):
+        if not self.rect:
+            return None
+        rx, ry, rw, rh = self.rect
+        h = self.HANDLE
+        near_l, near_r = abs(x - rx) < h, abs(x - (rx + rw)) < h
+        near_t, near_b = abs(y - ry) < h, abs(y - (ry + rh)) < h
+        if near_l and near_t: return "nw"
+        if near_r and near_t: return "ne"
+        if near_l and near_b: return "sw"
+        if near_r and near_b: return "se"
+        if near_l: return "w"
+        if near_r: return "e"
+        if near_t: return "n"
+        if near_b: return "s"
+        if rx <= x <= rx + rw and ry <= y <= ry + rh: return "move"
+        return None
+
+    def _begin(self, g, x, y):
+        self._drag_mode = self._hit(x, y)
+        self._start = self.rect
+
+    def _update(self, g, dx, dy):
+        if not self._drag_mode or not self._start or not self.frame:
+            return
+        fx, fy, fw, fh = self.frame
+        x, y, w, h = self._start
+        m = self._drag_mode
+        if m == "move":
+            x, y = x + dx, y + dy
+        else:
+            if "w" in m: x, w = x + dx, w - dx
+            if "e" in m: w = w + dx
+            if "n" in m: y, h = y + dy, h - dy
+            if "s" in m: h = h + dy
+            if self.ratio:
+                # Drive height from width so a locked ratio cannot drift.
+                h = w / self.ratio
+                if "n" in m:
+                    y = self._start[1] + self._start[3] - h
+        w, h = max(40, w), max(40, h)
+        x = min(max(x, fx), fx + fw - w)
+        y = min(max(y, fy), fy + fh - h)
+        w = min(w, fx + fw - x)
+        h = min(h, fy + fh - y)
+        self.rect = (x, y, w, h)
+        self.queue_draw()
+        if self.on_change:
+            self.on_change()
+
+    def _draw(self, area, cr, W, H):
+        if not (self.active and self.rect):
+            return
+        x, y, w, h = self.rect
+        # Dim everything outside the crop so the kept area reads clearly.
+        cr.set_source_rgba(0, 0, 0, 0.55)
+        cr.rectangle(0, 0, W, H)
+        cr.rectangle(x, y, w, h)
+        cr.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
+        cr.fill()
+        cr.set_fill_rule(cairo.FILL_RULE_WINDING)
+        # Thirds inside the crop, the way every camera crop tool does.
+        cr.set_source_rgba(1, 1, 1, 0.28)
+        cr.set_line_width(1)
+        for i in (1, 2):
+            cr.move_to(x + w * i / 3, y); cr.line_to(x + w * i / 3, y + h)
+            cr.move_to(x, y + h * i / 3); cr.line_to(x + w, y + h * i / 3)
+        cr.stroke()
+        cr.set_source_rgba(1, 1, 1, 0.95)
+        cr.set_line_width(2)
+        cr.rectangle(x, y, w, h)
+        cr.stroke()
+        # Corner grips
+        g = 18
+        cr.set_line_width(4)
+        for cx, cy, sx, sy in ((x, y, 1, 1), (x + w, y, -1, 1),
+                               (x, y + h, 1, -1), (x + w, y + h, -1, -1)):
+            cr.move_to(cx, cy + sy * g); cr.line_to(cx, cy); cr.line_to(cx + sx * g, cy)
+        cr.stroke()
+
+
+class GalleryView(Gtk.Box):
+    """Browse and edit what has been shot: rotate, mirror, crop, save.
+
+    Edits are non-destructive until saved, and saving writes a new file
+    rather than overwriting: losing an original to a mis-drag would be a
+    poor trade for the convenience.
+    """
+
+    THUMB = 74
+
+    def __init__(self, on_close, on_open_external):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add_css_class("gal")
+        self.on_close = on_close
+        self.on_open_external = on_open_external
+        self.paths = []
+        self.index = 0
+        self.src = None            # untouched pixbuf
+        self.rotation = 0
+        self.flip_h = False
+        self.flip_v = False
+        self._strip_buttons = []
+
+        # ---- header
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        head.add_css_class("gal-bar")
+        head.set_margin_top(8); head.set_margin_bottom(8)
+        head.set_margin_start(12); head.set_margin_end(12)
+
+        back = self._tool("go-previous-symbolic", "Back to camera",
+                          lambda: self.on_close())
+        head.append(back)
+
+        self.title = Gtk.Label(label="")
+        self.title.add_css_class("gal-title")
+        self.title.set_ellipsize(3)
+        self.title.set_hexpand(True)
+        self.title.set_halign(Gtk.Align.START)
+        self.title.set_margin_start(8)
+        head.append(self.title)
+
+        for icon, tip, cb in (
+            ("object-rotate-left-symbolic",  "Rotate left",  lambda: self._rotate(-90)),
+            ("object-rotate-right-symbolic", "Rotate right", lambda: self._rotate(90)),
+            ("object-flip-horizontal-symbolic", "Mirror horizontally", lambda: self._flip(True)),
+            ("object-flip-vertical-symbolic",   "Mirror vertically",   lambda: self._flip(False)),
+        ):
+            head.append(self._tool(icon, tip, cb))
+
+        self.btn_crop = Gtk.ToggleButton()
+        self.btn_crop.set_child(self._icon("edit-cut-symbolic"))
+        self.btn_crop.add_css_class("gal-tool")
+        self.btn_crop.set_tooltip_text("Crop")
+        self.btn_crop.connect("toggled", lambda b: self._set_cropping(b.get_active()))
+        head.append(self.btn_crop)
+
+        self.ratio_btn = Gtk.MenuButton()
+        self.ratio_btn.set_child(Gtk.Label(label="Free"))
+        self.ratio_btn.add_css_class("gal-tool")
+        self.ratio_btn.set_tooltip_text("Crop ratio")
+        self.ratio_pop = Gtk.Popover()
+        self.ratio_btn.set_popover(self.ratio_pop)
+        self.ratio_btn.set_sensitive(False)
+        self._build_ratio_menu()
+        head.append(self.ratio_btn)
+
+        self.btn_save = Gtk.Button(label="Save a copy")
+        self.btn_save.add_css_class("gal-save")
+        self.btn_save.set_sensitive(False)
+        self.btn_save.connect("clicked", lambda *_: self._save())
+        head.append(self.btn_save)
+        self.append(head)
+
+        # ---- image + crop layer
+        stack = Gtk.Overlay()
+        stack.set_hexpand(True); stack.set_vexpand(True)
+        self.pic = Gtk.Picture()
+        self.pic.set_can_shrink(True)
+        self.pic.set_content_fit(Gtk.ContentFit.CONTAIN)
+        self.pic.set_hexpand(True); self.pic.set_vexpand(True)
+        stack.set_child(self.pic)
+        self.crop = CropOverlay(on_change=lambda: None)
+        stack.add_overlay(self.crop)
+
+        # Click the left or right third to page through, like a photo viewer.
+        page = Gtk.GestureClick.new()
+        page.set_button(1)
+        page.connect("released", self._on_page_click)
+        self.pic.add_controller(page)
+        scroll = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.VERTICAL)
+        scroll.connect("scroll", self._on_scroll)
+        self.add_controller(scroll)
+
+        self.empty = Gtk.Label(label="Nothing here yet")
+        self.empty.add_css_class("gal-empty")
+        stack.add_overlay(self.empty)
+        self.empty.set_visible(False)
+        self.append(stack)
+
+        # ---- filmstrip
+        self.strip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.strip.set_margin_start(10); self.strip.set_margin_end(10)
+        sc = Gtk.ScrolledWindow()
+        sc.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        sc.set_child(self.strip)
+        sc.set_size_request(-1, self.THUMB + 26)
+        sc.add_css_class("gal-strip")
+        self.strip_scroller = sc
+        self.append(sc)
+
+    # ---- small builders ----
+    @staticmethod
+    def _icon(name):
+        i = Gtk.Image.new_from_icon_name(name)
+        i.set_pixel_size(16)
+        return i
+
+    def _tool(self, icon, tip, cb):
+        b = Gtk.Button()
+        b.set_child(self._icon(icon))
+        b.add_css_class("gal-tool")
+        b.set_tooltip_text(tip)
+        b.connect("clicked", lambda *_: cb())
+        return b
+
+    def _build_ratio_menu(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.set_margin_top(6); box.set_margin_bottom(6)
+        box.set_margin_start(6); box.set_margin_end(6)
+        for label, r in (("Free", None), ("1:1", 1.0), ("4:3", 4/3),
+                         ("3:2", 3/2), ("16:9", 16/9), ("9:16", 9/16)):
+            b = Gtk.Button(label=label)
+            b.add_css_class("cam-row")
+            b.connect("clicked", lambda _b, lb=label, rr=r: self._set_ratio(lb, rr))
+            box.append(b)
+        self.ratio_pop.set_child(box)
+
+    def _set_ratio(self, label, ratio):
+        self.ratio_pop.popdown()
+        self.ratio_btn.set_child(Gtk.Label(label=label))
+        self.crop.set_ratio(ratio)
+
+    # ---- content ----
+    def load(self, paths, start=None):
+        """Photos only. Video editing is a different job, and a crop tool
+        that silently did nothing to a clip would be worse than not offering
+        it."""
+        self.paths = [str(p) for p in paths if not is_video(p)]
+        self.index = 0
+        if start and str(start) in self.paths:
+            self.index = self.paths.index(str(start))
+        self._build_strip()
+        self._show()
+
+    def _build_strip(self):
+        while (c := self.strip.get_first_child()) is not None:
+            self.strip.remove(c)
+        self._strip_buttons = []
+        for i, p in enumerate(self.paths):
+            b = Gtk.Button()
+            b.add_css_class("gal-thumb")
+            img = Gtk.Image()
+            try:
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                    p, self.THUMB, self.THUMB, True)
+                img.set_from_paintable(Gdk.Texture.new_for_pixbuf(pb))
+            except Exception:
+                img.set_from_icon_name("image-missing-symbolic")
+            img.set_pixel_size(self.THUMB)
+            b.set_child(img)
+            b.connect("clicked", lambda _b, i=i: self.go(i))
+            self.strip.append(b)
+            self._strip_buttons.append(b)
+
+    def go(self, i):
+        if not self.paths:
+            return
+        self.index = max(0, min(len(self.paths) - 1, i))
+        self._show()
+
+    def _show(self):
+        have = bool(self.paths)
+        self.empty.set_visible(not have)
+        self.btn_crop.set_sensitive(have)
+        self.pic.set_visible(have)
+        if not have:
+            self.title.set_label("")
+            self.pic.set_paintable(None)
+            return
+        path = self.paths[self.index]
+        try:
+            self.src = GdkPixbuf.Pixbuf.new_from_file(path)
+        except Exception as e:
+            print(f"Lens: cannot open {path}: {e}", file=sys.stderr)
+            self.src = None
+        self.rotation = 0
+        self.flip_h = self.flip_v = False
+        self.btn_crop.set_active(False)
+        self.btn_save.set_sensitive(False)
+        self.title.set_label(
+            f"{pathlib.Path(path).name}    {self.index + 1} of {len(self.paths)}")
+        for i, b in enumerate(self._strip_buttons):
+            if i == self.index:
+                b.add_css_class("gal-thumb-active")
+            else:
+                b.remove_css_class("gal-thumb-active")
+        self._render()
+
+    def _edited(self):
+        """Apply rotation and mirroring to the source pixbuf."""
+        pb = self.src
+        if pb is None:
+            return None
+        if self.rotation:
+            rot = {90: GdkPixbuf.PixbufRotation.CLOCKWISE,
+                   180: GdkPixbuf.PixbufRotation.UPSIDEDOWN,
+                   270: GdkPixbuf.PixbufRotation.COUNTERCLOCKWISE}[self.rotation % 360]
+            pb = pb.rotate_simple(rot)
+        if self.flip_h:
+            pb = pb.flip(True)
+        if self.flip_v:
+            pb = pb.flip(False)
+        return pb
+
+    def _render(self):
+        pb = self._edited()
+        if pb is None:
+            return
+        self.pic.set_paintable(Gdk.Texture.new_for_pixbuf(pb))
+        GLib.idle_add(self._sync_crop_frame)
+
+    def _sync_crop_frame(self):
+        """Tell the crop layer where the letterboxed picture actually is."""
+        pb = self._edited()
+        if pb is None:
+            return False
+        W, H = self.crop.get_width(), self.crop.get_height()
+        iw, ih = pb.get_width(), pb.get_height()
+        if W <= 1 or H <= 1 or not iw or not ih:
+            return False
+        s = min(W / iw, H / ih)
+        dw, dh = iw * s, ih * s
+        self.crop.set_frame(((W - dw) / 2, (H - dh) / 2, dw, dh))
+        return False
+
+    # ---- actions ----
+    def _rotate(self, deg):
+        if self.src is None:
+            return
+        self.rotation = (self.rotation + deg) % 360
+        self.btn_save.set_sensitive(True)
+        self._render()
+
+    def _flip(self, horizontal):
+        if self.src is None:
+            return
+        if horizontal:
+            self.flip_h = not self.flip_h
+        else:
+            self.flip_v = not self.flip_v
+        self.btn_save.set_sensitive(True)
+        self._render()
+
+    def _set_cropping(self, on):
+        self.crop.active = on
+        self.ratio_btn.set_sensitive(on)
+        if on:
+            self._sync_crop_frame()
+            self.crop.reset()
+            self.btn_save.set_sensitive(True)
+        self.crop.queue_draw()
+
+    def _save(self):
+        pb = self._edited()
+        if pb is None:
+            return
+        if self.crop.active and self.crop.rect and self.crop.frame:
+            fx, fy, fw, fh = self.crop.frame
+            rx, ry, rw, rh = self.crop.rect
+            sx, sy = pb.get_width() / fw, pb.get_height() / fh
+            x = max(0, int((rx - fx) * sx)); y = max(0, int((ry - fy) * sy))
+            w = min(pb.get_width() - x, int(rw * sx))
+            h = min(pb.get_height() - y, int(rh * sy))
+            if w > 0 and h > 0:
+                pb = pb.new_subpixbuf(x, y, w, h)
+        src = pathlib.Path(self.paths[self.index])
+        out = src.with_name(f"{src.stem}-edit{src.suffix}")
+        n = 2
+        while out.exists():
+            out = src.with_name(f"{src.stem}-edit{n}{src.suffix}")
+            n += 1
+        try:
+            pb.savev(str(out), "jpeg", ["quality"], ["95"])
+            print(f"Lens: saved {out.name}")
+        except Exception as e:
+            print(f"Lens: could not save: {e}", file=sys.stderr)
+            return
+        self.btn_save.set_sensitive(False)
+
+    # ---- navigation ----
+    def _on_page_click(self, gesture, n_press, x, y):
+        w = self.pic.get_width() or 1
+        if x < w * 0.28:
+            self.go(self.index - 1)
+        elif x > w * 0.72:
+            self.go(self.index + 1)
+
+    def _on_scroll(self, ctrl, dx, dy):
+        if dy:
+            self.go(self.index + (1 if dy > 0 else -1))
+        return True
+
+
 class LensWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Lens")
@@ -1092,31 +1540,12 @@ class LensWindow(Adw.ApplicationWindow):
 
         # Grid overlay (rule of thirds)
 
-        # Full-screen photo viewer (last overlay so it sits on top of everything)
-        self.viewer = Gtk.Overlay()
-        self.viewer.add_css_class("viewer")
+        # Gallery (last overlay so it sits on top of everything)
+        self.viewer = GalleryView(
+            on_close=self._close_photo_viewer,
+            on_open_external=lambda p: Gio.AppInfo.launch_default_for_uri(
+                "file://" + str(p), None))
         self.viewer.set_visible(False)
-        viewer_bg = Gtk.Box(); viewer_bg.add_css_class("viewer-bg")
-        viewer_bg.set_hexpand(True); viewer_bg.set_vexpand(True)
-        self.viewer.set_child(viewer_bg)
-        self.viewer_picture = Gtk.Picture()
-        self.viewer_picture.set_can_shrink(True)
-        self.viewer_picture.set_content_fit(Gtk.ContentFit.CONTAIN)
-        self.viewer_picture.set_hexpand(True); self.viewer_picture.set_vexpand(True)
-        viewer_bg.append(self.viewer_picture)
-        # Back button — top-LEFT so it's clearly "back to camera" not "close app"
-        # (the ✕ in the corner already means close-app)
-        viewer_close = Gtk.Button(label="← Back")
-        viewer_close.add_css_class("pill")
-        viewer_close.set_size_request(-1, 42)
-        viewer_close.set_halign(Gtk.Align.START); viewer_close.set_valign(Gtk.Align.START)
-        viewer_close.set_margin_top(12); viewer_close.set_margin_start(12)
-        viewer_close.connect("clicked", lambda *_: self._close_photo_viewer())
-        self.viewer.add_overlay(viewer_close)
-        # Also close on click anywhere in the viewer backdrop
-        viewer_click = Gtk.GestureClick()
-        viewer_click.connect("released", lambda *_: self._close_photo_viewer())
-        viewer_bg.add_controller(viewer_click)
         root.add_overlay(self.viewer)
 
         # CSS
@@ -1217,6 +1646,25 @@ class LensWindow(Adw.ApplicationWindow):
         .card-focused {
             box-shadow: 0 18px 40px rgba(0,0,0,0.9);
         }
+        /* ---- gallery ---- */
+        .gal { background: #16161a; }
+        .gal-bar { background: #16161a; }
+        .gal-title { color: rgba(255,255,255,0.92); font-size: 14px; }
+        .gal-tool { background: rgba(255,255,255,0.08); border: none;
+                    color: white; border-radius: 8px;
+                    min-width: 34px; min-height: 34px; padding: 0 8px; }
+        .gal-tool:hover { background: rgba(255,255,255,0.18); }
+        .gal-tool:checked { background: #62a0ea; color: #fff; }
+        .gal-save { background: #62a0ea; color: white; border: none;
+                    border-radius: 8px; padding: 6px 14px; font-weight: bold; }
+        .gal-save:disabled { background: rgba(255,255,255,0.08);
+                             color: rgba(255,255,255,0.35); }
+        .gal-strip { background: #101013; border-top: 1px solid rgba(255,255,255,0.08); }
+        .gal-thumb { padding: 3px; background: transparent; border: none;
+                     border-radius: 8px; }
+        .gal-thumb:hover { background: rgba(255,255,255,0.12); }
+        .gal-thumb-active { background: #62a0ea; }
+        .gal-empty { color: rgba(255,255,255,0.45); font-size: 16px; }
         /* Full-screen photo viewer */
         /* Camera flip: the viewfinder squeezes left-to-right to a vertical
            sliver, the pipeline is swapped while it is invisible, then it
@@ -2432,15 +2880,13 @@ class LensWindow(Adw.ApplicationWindow):
         Gio.AppInfo.launch_default_for_uri("file://" + str(folder), None)
 
     def _open_photo_viewer(self, path):
-        """Show a photo full-screen inside Lens. Clips go to the system
-        player, since there is no video playback in here."""
+        """Open the gallery at this photo. Clips go to the system player,
+        since there is no video playback in here."""
         if is_video(path):
             Gio.AppInfo.launch_default_for_uri("file://" + str(path), None)
             return
-        try:
-            self.viewer_picture.set_filename(path)
-        except Exception as e:
-            print("viewer load:", e); return
+        shots = sorted(PICTURES.glob("*.jpg"), key=lambda f: f.stat().st_mtime)
+        self.viewer.load(shots, start=path)
         self.viewer.set_visible(True)
 
     def _close_photo_viewer(self):
@@ -2800,8 +3246,13 @@ class ThumbnailDeck(Gtk.Overlay):
                 # First (short) click — defer to see if a second click follows
                 def _fire_single():
                     self._click_timer = None
+                    # A tap opens the gallery at the newest shot. It used to
+                    # open a bare full-screen image, which looked like
+                    # nothing had happened.
                     if self.card_paths and self.on_card_click:
                         self.on_card_click(self.card_paths[-1])
+                    elif self.on_click:
+                        self.on_click()
                     return False
                 self._click_timer = GLib.timeout_add(self.DBLCLK_MS, _fire_single)
             return
