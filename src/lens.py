@@ -303,7 +303,7 @@ class LensWindow(Adw.ApplicationWindow):
         self._start_pipeline()
 
     # ---------- pipeline ----------
-    def _start_pipeline(self, keep_old=False):
+    def _start_pipeline(self, keep_old=False, on_ready=None):
         old_pipeline = self.pipeline
         if self.pipeline and not keep_old:
             self.pipeline.set_state(Gst.State.NULL)
@@ -327,19 +327,48 @@ class LensWindow(Adw.ApplicationWindow):
         )
         self.pipeline = Gst.parse_launch(pipe_str)
         sink = self.pipeline.get_by_name("sink")
-        self.paintable = sink.props.paintable
-        self.picture.set_paintable(self.paintable)
+        new_paintable = sink.props.paintable
+        self.paintable = new_paintable
 
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect("message::error", self._on_bus_err)
-        self.pipeline.set_state(Gst.State.PLAYING)
+
         if old_pipeline is not None:
-            # Only now that the replacement is running and its paintable is
-            # attached. Tearing the old one down first left the Picture with
-            # no content, which collapsed the layout into the grey band and
-            # black gap seen during a flip.
-            old_pipeline.set_state(Gst.State.NULL)
+            # Do NOT attach the new paintable yet. A gtk4paintablesink
+            # paintable has no content and zero intrinsic size until its first
+            # frame arrives, so attaching it early blanked the viewfinder and
+            # collapsed the aspect frame to full width, dragging the HUD out
+            # with it. Keep showing the old camera until the new one has
+            # actually produced a frame, then swap and stop the old pipeline.
+            state = {"swapped": False}
+
+            def _swap(*_):
+                if state["swapped"]:
+                    return
+                state["swapped"] = True
+                if state.get("handler"):
+                    try:
+                        new_paintable.disconnect(state["handler"])
+                    except Exception:
+                        pass
+                self.picture.set_paintable(new_paintable)
+                old_pipeline.set_state(Gst.State.NULL)
+                if on_ready:
+                    on_ready()
+                return False
+
+            state["handler"] = new_paintable.connect("invalidate-contents", _swap)
+            # If a frame never comes, swap anyway rather than leaving the
+            # viewfinder shut. 700ms, not longer: this is the worst case the
+            # flip animation has to sit closed for.
+            GLib.timeout_add(700, _swap)
+        else:
+            self.picture.set_paintable(new_paintable)
+            if on_ready:
+                on_ready()
+
+        self.pipeline.set_state(Gst.State.PLAYING)
 
     def _source_for(self, dev):
         """v4l2src plus the caps needed to actually get a usable framerate."""
@@ -1022,8 +1051,9 @@ class LensWindow(Adw.ApplicationWindow):
         # brought up while the old one is still feeding the viewfinder. The
         # picture never goes blank and the layout never jumps, which is what
         # was interrupting the transition half way through.
-        self._start_pipeline(keep_old=True)
-        GLib.timeout_add(40, self._flip_back)
+        # Open back out only once the new camera has actually produced a
+        # frame, otherwise the fan opens onto the old feed and then pops.
+        self._start_pipeline(keep_old=True, on_ready=self._flip_back)
         return False
 
     def _flip_back(self):
