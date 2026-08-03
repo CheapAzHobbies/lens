@@ -322,7 +322,8 @@ class LensWindow(Adw.ApplicationWindow):
         self.aspect_idx = cfg.get("aspect_idx", 0)
         if not 0 <= self.aspect_idx < len(self.aspects):
             self.aspect_idx = 0
-        self.grid_visible = bool(cfg.get("grid_visible", False))
+        self.overlay_mode = int(cfg.get("overlay_mode", 0)) % 3
+        self.grid_visible = self.overlay_mode == 1
         # How long each camera takes to deliver its first frame, keyed by
         # stable id. Measured on use and persisted, so the flip is tuned from
         # the second run onwards. The Z13 rear camera needs ~690ms and the
@@ -853,24 +854,24 @@ class LensWindow(Adw.ApplicationWindow):
         .state-idle.deck-idx-1,
         .state-idle.deck-idx-2,
         .state-idle.deck-idx-3,
-        .state-idle.deck-idx-4 { transform: translate(80px, -20px) rotate(0deg); }
+        .state-idle.deck-idx-4 { transform: translate(44px, -20px) rotate(0deg); }
         /* Peek: hovering for a moment tips the deck open a little, as a hint
            that there is a stack under there. Press and hold for the full fan. */
-        .state-peek.deck-idx-0 { transform: translate(80px, -20px) rotate(-14deg); }
-        .state-peek.deck-idx-1 { transform: translate(80px, -20px) rotate( -7deg); }
-        .state-peek.deck-idx-2 { transform: translate(80px, -20px) rotate(  0deg); }
-        .state-peek.deck-idx-3 { transform: translate(80px, -20px) rotate(  7deg); }
-        .state-peek.deck-idx-4 { transform: translate(80px, -20px) rotate( 14deg); }
+        .state-peek.deck-idx-0 { transform: translate(44px, -20px) rotate(-14deg); }
+        .state-peek.deck-idx-1 { transform: translate(44px, -20px) rotate( -7deg); }
+        .state-peek.deck-idx-2 { transform: translate(44px, -20px) rotate(  0deg); }
+        .state-peek.deck-idx-3 { transform: translate(44px, -20px) rotate(  7deg); }
+        .state-peek.deck-idx-4 { transform: translate(44px, -20px) rotate( 14deg); }
         /* Expanded: hand-of-cards fan. Rotation alone only spread the card
            centres over ~56px, about 14px per card, which is far too small to
            aim at with a finger, so each card also slides sideways. The X
            values here MUST stay in step with FAN_DX + FAN_OFFSETS in
            ThumbnailDeck or the hit zones drift away from what is drawn. */
-        .state-expanded.deck-idx-0 { transform: translate( 20px, -20px) rotate(-30deg); }
-        .state-expanded.deck-idx-1 { transform: translate( 50px, -20px) rotate(-15deg); }
-        .state-expanded.deck-idx-2 { transform: translate( 80px, -20px) rotate(  0deg); }
-        .state-expanded.deck-idx-3 { transform: translate(110px, -20px) rotate( 15deg); }
-        .state-expanded.deck-idx-4 { transform: translate(140px, -20px) rotate( 30deg); }
+        .state-expanded.deck-idx-0 { transform: translate(-16px, -20px) rotate(-30deg); }
+        .state-expanded.deck-idx-1 { transform: translate( 14px, -20px) rotate(-15deg); }
+        .state-expanded.deck-idx-2 { transform: translate( 44px, -20px) rotate(  0deg); }
+        .state-expanded.deck-idx-3 { transform: translate( 74px, -20px) rotate( 15deg); }
+        .state-expanded.deck-idx-4 { transform: translate(104px, -20px) rotate( 30deg); }
         /* "Pulled" — one card lifted farther and up */
         .pulled { transform: translate(0px, -80px) rotate(0deg) scale(1.4);
                   box-shadow: 0 8px 20px rgba(0,0,0,0.6); }
@@ -883,13 +884,13 @@ class LensWindow(Adw.ApplicationWindow):
            card under your finger is the one that rises. Sending them all to a
            shared X made the card jump sideways out from under you. Three
            classes here (30) beats .state-expanded.deck-idx-N (20). */
-        .state-expanded.deck-idx-0.card-focused { transform: translate( 20px, -190px) rotate(0deg) scale(1.7); }
-        .state-expanded.deck-idx-1.card-focused { transform: translate( 50px, -190px) rotate(0deg) scale(1.7); }
-        .state-expanded.deck-idx-2.card-focused { transform: translate( 80px, -190px) rotate(0deg) scale(1.7); }
-        .state-expanded.deck-idx-3.card-focused { transform: translate(110px, -190px) rotate(0deg) scale(1.7); }
-        .state-expanded.deck-idx-4.card-focused { transform: translate(140px, -190px) rotate(0deg) scale(1.7); }
+        .state-expanded.deck-idx-0.card-focused { transform: translate(-16px, -190px) rotate(0deg) scale(1.7); }
+        .state-expanded.deck-idx-1.card-focused { transform: translate( 14px, -190px) rotate(0deg) scale(1.7); }
+        .state-expanded.deck-idx-2.card-focused { transform: translate( 44px, -190px) rotate(0deg) scale(1.7); }
+        .state-expanded.deck-idx-3.card-focused { transform: translate( 74px, -190px) rotate(0deg) scale(1.7); }
+        .state-expanded.deck-idx-4.card-focused { transform: translate(104px, -190px) rotate(0deg) scale(1.7); }
         .state-idle.card-focused {
-            transform: translate(80px, -190px) rotate(0deg) scale(1.7);
+            transform: translate(44px, -190px) rotate(0deg) scale(1.7);
         }
         .card-focused {
             box-shadow: 0 18px 40px rgba(0,0,0,0.9);
@@ -980,6 +981,7 @@ class LensWindow(Adw.ApplicationWindow):
         .cam-row:hover { background: rgba(255,255,255,0.12); }
         .cam-row-active { color: #62a0ea; }
         .pill-active { background: #62a0ea; color: white; }
+        .pill-off { color: rgba(255,255,255,0.35); }
         .countdown { color: white; font-size: 96px; font-weight: bold;
                      background: rgba(0,0,0,0.5); padding: 30px 50px; border-radius: 60px; }
         .flash { background: black; }
@@ -1040,7 +1042,32 @@ class LensWindow(Adw.ApplicationWindow):
             bp.connect("unapply", lambda *_: self._resize_layout())
             self.add_breakpoint(bp)
         self._size_class = None
+        self._resize_pending = None
+        # Breakpoints only fire on threshold crossings, so also watch the
+        # window's own size for the continuous part, debounced so a drag
+        # does not rebuild thumbnails on every frame.
+        self.connect("notify::default-width", self._queue_resize_layout)
+        prev = {"w": 0}
+
+        def _poll():
+            cur = self.get_width()
+            if cur and abs(cur - prev["w"]) >= 8:
+                prev["w"] = cur
+                self._queue_resize_layout()
+            return True
+
+        GLib.timeout_add(200, _poll)
         GLib.idle_add(self._resize_layout)
+
+    def _queue_resize_layout(self, *_):
+        if self._resize_pending:
+            GLib.source_remove(self._resize_pending)
+        self._resize_pending = GLib.timeout_add(120, self._do_queued_resize)
+
+    def _do_queued_resize(self):
+        self._resize_pending = None
+        self._resize_layout()
+        return False
 
     def _resize_layout(self, *_):
         w = self.get_width() or self.get_default_size()[0]
@@ -1050,33 +1077,32 @@ class LensWindow(Adw.ApplicationWindow):
             cls = "compact"
         else:
             cls = "roomy"
-        if cls == self._size_class:
-            return False
+        # Deliberately not short-circuiting on an unchanged class: the deck
+        # size is continuous now, so it has to be recalculated on any resize.
         self._size_class = cls
         for c in ("size-tiny", "size-compact", "size-roomy"):
             self.remove_css_class(c)
         self.add_css_class(f"size-{cls}")
 
-        if cls == "roomy":
+        # Everything in the action row scales continuously with the window,
+        # rounded to 4-8px steps so a slow drag does not thrash. Snapping
+        # between two fixed sizes was what made resizing look jumpy.
+        shutter = max(52, min(84, int(w * 0.10) // 4 * 4))
+        flip = max(42, min(72, int(w * 0.085) // 4 * 4))
+        self.shutter.set_size_request(shutter, shutter)
+        self.btn_flip.set_size_request(flip, flip)
+        self.btn_flip.set_margin_end(
+            128 if cls == "roomy" else (16 if cls == "compact" else 10))
+
+        if cls != "tiny":
             self.thumb.set_visible(True)
-            self.thumb.set_scale(112, 300, 28)
-            self.btn_flip.set_size_request(72, 72)
-            self.btn_flip.set_margin_end(128)
-            self.shutter.set_size_request(84, 84)
-        elif cls == "compact":
-            self.thumb.set_visible(True)
-            self.thumb.set_scale(72, 168, 12)
-            self.btn_flip.set_size_request(56, 56)
-            self.btn_flip.set_margin_end(16)
-            self.shutter.set_size_request(68, 68)
+            thumb = max(64, min(112, int(w * 0.13) // 8 * 8))
+            self.thumb.set_scale(thumb, thumb + 56, 28 if cls == "roomy" else 14)
         else:
             # No room for a preview deck next to a shutter and a flip button.
-            # The deck is the one to drop: the gallery is still one tap away
-            # on the shutter row, and losing the shutter would be worse.
+            # The deck is the one to drop: the gallery is still reachable, and
+            # losing the shutter would make the app useless at this size.
             self.thumb.set_visible(False)
-            self.btn_flip.set_size_request(48, 48)
-            self.btn_flip.set_margin_end(10)
-            self.shutter.set_size_request(60, 60)
 
         # Top bar: the window controls must survive at every width, so the
         # decorative ballast goes first and the mode pills go next. At 380px
@@ -1101,8 +1127,10 @@ class LensWindow(Adw.ApplicationWindow):
         self.btn_aspect.set_label(self.aspects[self.aspect_idx])
 
         self.grid_widget.set_visible(self.grid_visible)
-        if self.grid_visible:
+        if self.overlay_mode == 1:
             self.btn_grid.add_css_class("pill-active")
+        elif self.overlay_mode == 2:
+            self.btn_grid.add_css_class("pill-off")
 
         if self.timer_sec > 0:
             self.btn_timer.set_label(f"{self.timer_sec}s")
@@ -1119,6 +1147,7 @@ class LensWindow(Adw.ApplicationWindow):
         save_settings({
             "aspect_idx":   self.aspect_idx,
             "grid_visible": self.grid_visible,
+            "overlay_mode": getattr(self, "overlay_mode", 0),
             "timer_sec":    self.timer_sec,
             "video_mode":   self.video_mode,
             "cam_id":       self.cameras[self.cam_idx][2],
@@ -1126,10 +1155,27 @@ class LensWindow(Adw.ApplicationWindow):
         })
 
     def _toggle_grid(self):
-        self.grid_visible = not self.grid_visible
+        """Cycle what is drawn over the picture: HUD, HUD + grid, nothing.
+
+        Folding both into one control keeps the top bar short, and gives a
+        way to clear the frame completely for a clean shot.
+        """
+        self.overlay_mode = (getattr(self, "overlay_mode", 0) + 1) % 3
+        self.grid_visible = self.overlay_mode == 1
+        hud_on = self.overlay_mode in (0, 1)
+
         self.grid_widget.set_visible(self.grid_visible)
-        if self.grid_visible: self.btn_grid.add_css_class("pill-active")
-        else: self.btn_grid.remove_css_class("pill-active")
+        self.rec_indicator.set_visible(hud_on and self.video_mode)
+        self.btn_grid.remove_css_class("pill-active")
+        self.btn_grid.remove_css_class("pill-off")
+        if self.overlay_mode == 1:
+            self.btn_grid.add_css_class("pill-active")
+            self.btn_grid.set_tooltip_text("Overlay: grid and readouts")
+        elif self.overlay_mode == 2:
+            self.btn_grid.add_css_class("pill-off")
+            self.btn_grid.set_tooltip_text("Overlay: off")
+        else:
+            self.btn_grid.set_tooltip_text("Overlay: readouts only")
         self._save_settings()
 
     def _toggle_aspect(self):
@@ -1166,7 +1212,7 @@ class LensWindow(Adw.ApplicationWindow):
             self.btn_video.add_css_class("mode-active")
             self.btn_photo.remove_css_class("mode-active")
             self.shutter_core.add_css_class("video")
-            self.rec_indicator.set_visible(True)
+            self.rec_indicator.set_visible(getattr(self, "overlay_mode", 0) in (0, 1))
             self._hud_standby()
             self._hud_update()
             if not self.hud_timer:
@@ -1677,7 +1723,8 @@ class ThumbnailDeck(Gtk.Overlay):
     # .state-expanded.deck-idx-N rules in the CSS, because the hit zones are
     # derived from them rather than guessed at.
     FAN_ANGLES  = (-30, -15, 0, 15, 30)     # rotate(Ndeg)
-    FAN_DX      = 80                        # base translate X
+    # Shifted left from 80: the preview sat too close to the shutter.
+    FAN_DX      = 44                        # base translate X
     FAN_OFFSETS = (-60, -30, 0, 30, 60)     # per-card slide, added to FAN_DX
     # Inside the fan the nearest card always wins, so there are no dead
     # zones between cards. Focus is only dropped once the finger is clearly
