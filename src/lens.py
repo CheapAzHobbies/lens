@@ -10,8 +10,9 @@ gi.require_version("Adw", "1")
 gi.require_version("Gst", "1.0")
 gi.require_version("GstApp", "1.0")
 gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Graphene", "1.0")
 import cairo
-from gi.repository import Gtk, Adw, Gst, GLib, Gdk, Gio, GObject, GdkPixbuf
+from gi.repository import Gtk, Adw, Gst, GLib, Gdk, Gio, GObject, GdkPixbuf, Graphene
 
 Gst.init(None)
 
@@ -28,17 +29,49 @@ PICTURES.mkdir(parents=True, exist_ok=True)
 VIDEOS.mkdir(parents=True, exist_ok=True)
 
 
-def list_v4l2_cameras():
-    """Return [(path, human_name)] for real video capture devices.
+def _stable_camera_ids():
+    """{/dev/videoN: stable-id} from /dev/v4l/by-id.
 
-    A single physical camera often exposes multiple /dev/videoN nodes
-    (capture, metadata, subdev). We keep only nodes that report
-    "Video Capture" in their capabilities.
+    The link names carry the vendor, model and serial, plus a -video-indexN
+    suffix identifying the *node* rather than the device. Stripping that
+    suffix gives one id per physical camera, which is what we want to group
+    on and what we persist in the config.
+    """
+    import re
+    out = {}
+    byid = pathlib.Path("/dev/v4l/by-id")
+    if not byid.is_dir():
+        return out
+    for link in sorted(byid.iterdir()):
+        try:
+            target = str(link.resolve())
+        except OSError:
+            continue
+        out[target] = re.sub(r"-video-index\d+$", "", link.name)
+    return out
+
+
+def list_v4l2_cameras():
+    """Return [(path, human_name, stable_id)], one entry per physical camera.
+
+    A single camera exposes several /dev/videoN nodes (capture, metadata,
+    subdev), so we keep only nodes reporting "Video Capture" and then take
+    the first node per physical device.
+
+    Grouping is by the /dev/v4l/by-id identity, not by the card name. Card
+    names are per *model*, so two cameras of the same model collapsed into
+    one and the second silently disappeared.
     """
     import subprocess
+    stable = _stable_camera_ids()
     devs = []
-    seen_cards = set()
-    for d in sorted(pathlib.Path("/dev").glob("video*")):
+    seen = set()
+
+    def _devnum(pth):
+        tail = pth.name[5:]
+        return int(tail) if tail.isdigit() else 9999
+
+    for d in sorted(pathlib.Path("/dev").glob("video*"), key=_devnum):
         try:
             info = subprocess.run(["v4l2-ctl", "-d", str(d), "--info"],
                                   capture_output=True, text=True, timeout=1).stdout
@@ -56,10 +89,13 @@ def list_v4l2_cameras():
                 capture = True
         if not capture:
             continue
-        if card in seen_cards:  # one node per physical camera
+        # Fall back to the card name only when by-id is unavailable, which
+        # is the old (lossy) behaviour but better than dropping the device.
+        sid = stable.get(str(d)) or f"card:{card}"
+        if sid in seen:
             continue
-        seen_cards.add(card)
-        devs.append((str(d), card))
+        seen.add(sid)
+        devs.append((str(d), card, sid))
     return devs
 
 
@@ -274,7 +310,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.set_resizable(True)
         self.pipeline = None
         self.paintable = None
-        self.cameras = list_v4l2_cameras() or [("/dev/video0", "Camera")]
+        self.cameras = list_v4l2_cameras() or [("/dev/video0", "Camera", "fallback")]
         print(f"Lens: detected {len(self.cameras)} camera(s):")
         for c in self.cameras: print(f"   {c}")
         self.recording = False
@@ -291,10 +327,20 @@ class LensWindow(Adw.ApplicationWindow):
         if self.timer_sec not in (0, 3, 10):
             self.timer_sec = 0
         self.video_mode = bool(cfg.get("video_mode", False))
-        # Cameras can come and go between runs, so never trust the old index.
-        self.cam_idx = cfg.get("cam_idx", 0)
-        if not 0 <= self.cam_idx < len(self.cameras):
-            self.cam_idx = 0
+        # Resolve the saved camera by its stable id, not by position. USB
+        # enumeration order is not stable across boots or replugs, so a saved
+        # index could silently select a different camera. Falls back to the
+        # first camera when the saved one is not present.
+        self.cam_idx = 0
+        saved = cfg.get("cam_id")
+        if saved:
+            for i, cam in enumerate(self.cameras):
+                if cam[2] == saved:
+                    self.cam_idx = i
+                    break
+            else:
+                print(f"Lens: saved camera {saved} not present, using "
+                      f"{self.cameras[0][1]}")
         self.last_photo = None
         self.countdown_val = 0
 
@@ -303,14 +349,17 @@ class LensWindow(Adw.ApplicationWindow):
         self._start_pipeline()
 
     # ---------- pipeline ----------
-    def _start_pipeline(self, keep_old=False, on_ready=None):
-        old_pipeline = self.pipeline
-        if self.pipeline and not keep_old:
+    def _start_pipeline(self, defer_attach=False, on_ready=None):
+        # Always tear the old one down first. Running two pipelines and
+        # swapping paintables out from under a live Picture segfaulted on
+        # rapid flips (gdk_device_get_n_axes assertion, then SIGSEGV). The
+        # freeze frame is what covers the gap now, so nothing is referencing
+        # a paintable while it is being destroyed.
+        if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
             self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
             self.pipeline = None
             self.paintable = None
-            old_pipeline = None
 
         dev = self.cameras[self.cam_idx][0]
         src = self._source_for(dev)
@@ -334,18 +383,15 @@ class LensWindow(Adw.ApplicationWindow):
         bus.add_signal_watch()
         bus.connect("message::error", self._on_bus_err)
 
-        if old_pipeline is not None:
-            # Do NOT attach the new paintable yet. A gtk4paintablesink
-            # paintable has no content and zero intrinsic size until its first
-            # frame arrives, so attaching it early blanked the viewfinder and
-            # collapsed the aspect frame to full width, dragging the HUD out
-            # with it. Keep showing the old camera until the new one has
-            # actually produced a frame, then swap and stop the old pipeline.
+        if defer_attach:
+            # A gtk4paintablesink paintable has no content and zero intrinsic
+            # size until its first frame lands, so attaching it early blanks
+            # the view and collapses the aspect frame. Whatever is on screen
+            # (the freeze frame) stays until the camera is actually producing.
             state = {"swapped": False}
 
             def _commit():
                 self.picture.set_paintable(new_paintable)
-                old_pipeline.set_state(Gst.State.NULL)
 
             def _swap(*_):
                 if state["swapped"]:
@@ -356,9 +402,6 @@ class LensWindow(Adw.ApplicationWindow):
                         new_paintable.disconnect(state["handler"])
                     except Exception:
                         pass
-                # Hand the commit to the caller instead of doing it here: the
-                # flip wants to hold the old frame until the viewfinder is
-                # fully shut, otherwise the new camera pops in mid-animation.
                 if on_ready:
                     on_ready(_commit)
                 else:
@@ -366,16 +409,40 @@ class LensWindow(Adw.ApplicationWindow):
                 return False
 
             state["handler"] = new_paintable.connect("invalidate-contents", _swap)
-            # If a frame never comes, swap anyway rather than leaving the
-            # viewfinder shut. 700ms, not longer: this is the worst case the
-            # flip animation has to sit closed for.
-            GLib.timeout_add(700, _swap)
+            GLib.timeout_add(1200, _swap)   # fallback if no frame ever comes
         else:
             self.picture.set_paintable(new_paintable)
             if on_ready:
                 on_ready(None)
 
         self.pipeline.set_state(Gst.State.PLAYING)
+
+    def _freeze_frame(self):
+        """Render the live viewfinder into a still texture.
+
+        A GdkTexture is itself a paintable with a real intrinsic size, so
+        holding one in the Picture keeps both the image and the layout stable
+        while the camera is swapped underneath.
+        """
+        p = self.paintable
+        if p is None:
+            return None
+        try:
+            w = int(p.get_intrinsic_width()) or self.picture.get_width()
+            h = int(p.get_intrinsic_height()) or self.picture.get_height()
+            if w <= 0 or h <= 0:
+                return None
+            snap = Gtk.Snapshot()
+            p.snapshot(snap, w, h)
+            node = snap.to_node()
+            native = self.get_native()
+            renderer = native.get_renderer() if native else None
+            if node is None or renderer is None:
+                return None
+            return renderer.render_texture(node, Graphene.Rect().init(0, 0, w, h))
+        except Exception as e:
+            print(f"Lens: freeze frame failed: {e}", file=sys.stderr)
+            return None
 
     def _source_for(self, dev):
         """v4l2src plus the caps needed to actually get a usable framerate."""
@@ -592,6 +659,23 @@ class LensWindow(Adw.ApplicationWindow):
         self._flip_commit = None
         self.btn_flip.set_sensitive(len(self.cameras) > 1)
         self.btn_flip.connect("clicked", lambda *_: self._flip_camera())
+        self.btn_flip.set_tooltip_text("Switch camera (hold to choose)")
+
+        # Hold to pick a specific camera. Tapping cycles, which is fine for
+        # two, but a machine with three or four wants to jump straight to one.
+        self.cam_popover = Gtk.Popover()
+        self.cam_popover.set_parent(self.btn_flip)
+        self.cam_popover.set_position(Gtk.PositionType.TOP)
+        self.cam_popover.set_has_arrow(True)
+        hold = Gtk.GestureLongPress.new()
+        hold.set_delay_factor(1.0)
+        hold.connect("pressed", lambda *_: self._show_camera_menu())
+        self.btn_flip.add_controller(hold)
+        # Right-click gets there too, the usual way to reach extra options.
+        rmb = Gtk.GestureClick.new()
+        rmb.set_button(3)
+        rmb.connect("pressed", lambda *_: self._show_camera_menu())
+        self.btn_flip.add_controller(rmb)
         act_area.add_overlay(self.btn_flip)
 
         # Countdown overlay
@@ -849,6 +933,10 @@ class LensWindow(Adw.ApplicationWindow):
                   padding: 0; transition: background 120ms ease-out; }
         .winctl:hover { background: rgba(255,255,255,0.22); }
         .winctl-close:hover { background: #e01b24; }
+        .cam-row { background: transparent; border: none; color: white;
+                   padding: 6px 10px; border-radius: 8px; font-size: 13px; }
+        .cam-row:hover { background: rgba(255,255,255,0.12); }
+        .cam-row-active { color: #62a0ea; }
         .pill-active { background: #62a0ea; color: white; }
         .countdown { color: white; font-size: 96px; font-weight: bold;
                      background: rgba(0,0,0,0.5); padding: 30px 50px; border-radius: 60px; }
@@ -919,7 +1007,7 @@ class LensWindow(Adw.ApplicationWindow):
             "grid_visible": self.grid_visible,
             "timer_sec":    self.timer_sec,
             "video_mode":   self.video_mode,
-            "cam_idx":      self.cam_idx,
+            "cam_id":       self.cameras[self.cam_idx][2],
         })
 
     def _toggle_grid(self):
@@ -1043,7 +1131,49 @@ class LensWindow(Adw.ApplicationWindow):
 
     FLIP_MS = 140
 
-    def _flip_camera(self):
+    def _show_camera_menu(self):
+        """List every camera so one can be picked directly."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.set_margin_top(6); box.set_margin_bottom(6)
+        box.set_margin_start(6); box.set_margin_end(6)
+        head = Gtk.Label(label="CAMERA")
+        head.add_css_class("hud-dim")
+        head.set_halign(Gtk.Align.START)
+        head.set_margin_bottom(4)
+        box.append(head)
+
+        for i, cam in enumerate(self.cameras):
+            # Card names carry a redundant "USB2.0 HD UVC WebCam: USB2.0 HD"
+            # style repeat, so keep the part before the colon.
+            name = cam[1].split(":")[0].strip() or cam[0]
+            row = Gtk.Button()
+            inner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            tick = Gtk.Image.new_from_icon_name(
+                "object-select-symbolic" if i == self.cam_idx else "camera-photo-symbolic")
+            tick.set_pixel_size(14)
+            lbl = Gtk.Label(label=name)
+            lbl.set_halign(Gtk.Align.START); lbl.set_hexpand(True)
+            lbl.set_ellipsize(3)          # PANGO_ELLIPSIZE_END
+            lbl.set_max_width_chars(28)
+            inner.append(tick); inner.append(lbl)
+            row.set_child(inner)
+            row.add_css_class("cam-row")
+            if i == self.cam_idx:
+                row.add_css_class("cam-row-active")
+            row.connect("clicked", lambda _b, idx=i: self._select_camera(idx))
+            box.append(row)
+
+        self.cam_popover.set_child(box)
+        self.cam_popover.popup()
+
+    def _select_camera(self, idx):
+        self.cam_popover.popdown()
+        if idx == self.cam_idx or self._flipping:
+            return
+        # Reuse the flip animation, just aimed at a specific camera.
+        self._flip_camera(target=idx)
+
+    def _flip_camera(self, target=None):
         if len(self.cameras) < 2: return
         if self._flipping: return          # ignore taps during the turn
         self._flipping = True
@@ -1060,15 +1190,22 @@ class LensWindow(Adw.ApplicationWindow):
         self._flip_shut = False
         self._flip_commit = None
         self._flip_ready = False
+        # Hold the last live frame as a still while the cameras swap. The
+        # view never blanks, the layout never collapses, and the old pipeline
+        # can be torn down immediately instead of racing the new one.
+        frozen = self._freeze_frame()
+        if frozen is not None:
+            self.picture.set_paintable(frozen)
         self.frame_stack.add_css_class("flipped")
         GLib.timeout_add(self.FLIP_MS, self._flip_shut_cb)
 
-        self.cam_idx = (self.cam_idx + 1) % len(self.cameras)
+        self.cam_idx = (self.cam_idx + 1) % len(self.cameras) if target is None else target
         self._save_settings()
-        print(f"Lens: switching to camera {self.cam_idx}: {self.cameras[self.cam_idx]}")
+        cam = self.cameras[self.cam_idx]
+        print(f"Lens: switching to camera {self.cam_idx}: {cam[1]} ({cam[0]})")
         # Separate devices, so the replacement runs while the old one is still
         # feeding the viewfinder.
-        self._start_pipeline(keep_old=True, on_ready=self._flip_ready_cb)
+        self._start_pipeline(defer_attach=True, on_ready=self._flip_ready_cb)
 
     def _flip_shut_cb(self):
         self._flip_shut = True
