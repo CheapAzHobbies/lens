@@ -405,10 +405,14 @@ class LensWindow(Adw.ApplicationWindow):
             lambda v: self.aspect_frame.set_ratio(v))
         anim = Adw.TimedAnimation.new(self.aspect_frame, old, new, 380, target)
         anim.set_easing(Adw.Easing.EASE_OUT_CUBIC)
-        def _done(_a, _b):
-            self.aspect_frame.remove_css_class("aspect-blur")
-        anim.connect("done", _done)
         anim.play()
+        # Guaranteed blur clear — Adw done signal is unreliable in some versions.
+        GLib.timeout_add(420, self._clear_aspect_blur)
+
+    def _clear_aspect_blur(self):
+        if self.aspect_frame.has_css_class("aspect-blur"):
+            self.aspect_frame.remove_css_class("aspect-blur")
+        return False
 
     def _toggle_timer(self):
         seq = [0, 3, 10]
@@ -609,9 +613,8 @@ class ThumbnailDeck(Gtk.Overlay):
     """
     DECK_SIZE = 5     # up to N cards visible
     THUMB_PX  = 112   # collapsed edge (was 56 — user asked for 2x)
-    # Bigger widget than the visible card so the fan-out region is inside
-    # the hit area (GTK4 hit boxes don't follow CSS transforms).
-    HIT_W     = 320
+    # Wide hit area so a natural left/right swipe covers all card zones.
+    HIT_W     = 480
     HIT_H     = 160
 
     def __init__(self, on_click=None, on_card_click=None):
@@ -706,12 +709,19 @@ class ThumbnailDeck(Gtk.Overlay):
             c.add_css_class(f"state-{state}")
 
     def _on_motion(self, x, y):
-        """Cursor moved inside the deck widget — pick focused card by x zone."""
+        """Cursor moved inside the deck widget — pick focused card by x zone.
+        Zones are spread across the actual visible fan range, not the full
+        widget width, so all cards are reachable with a natural swipe."""
         if not self.expanded or len(self.cards) < 2:
             return
-        # Divide the widget width into N zones, one per card
-        w = self.get_width() or self.HIT_W
-        idx = int((x / max(w, 1)) * len(self.cards))
+        # Fan visually spans roughly the leftmost card center to the rightmost
+        # card center. Cards pivot at the same bottom-center point but rotate
+        # ±30°, so their tops spread out across ~200px. Map cursor x in that
+        # band to card index — cursor outside the band clamps to the end.
+        FAN_MIN, FAN_MAX = 30, 260
+        rel = (x - FAN_MIN) / (FAN_MAX - FAN_MIN)
+        rel = max(0.0, min(1.0, rel))
+        idx = int(rel * (len(self.cards) - 1) + 0.5)
         idx = max(0, min(len(self.cards) - 1, idx))
         target = self.cards[idx]
         if self._focused_card is target:
