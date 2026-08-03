@@ -327,12 +327,17 @@ class LensWindow(Adw.ApplicationWindow):
         /* "Pulled" — one card lifted farther and up */
         .pulled { transform: translate(0px, -80px) rotate(0deg) scale(1.4);
                   box-shadow: 0 8px 20px rgba(0,0,0,0.6); }
-        /* Focused card — user is pointing at it while holding. Pull it up
-           and out of the fan, upright, so it looks like a card being drawn
-           from someone's hand. Bigger scale so it's clearly the selected one. */
-        .card-focused { transform: translate(80px, -190px) rotate(0deg) scale(1.7) !important;
-                        box-shadow: 0 18px 40px rgba(0,0,0,0.85);
-                        border: 4px solid white; }
+        /* Focused card — combined-class selectors so specificity matches
+           .state-expanded.deck-idx-N (both are 2 classes = 20 specificity).
+           Otherwise the state-expanded transform wins and the pop-up never
+           applies. Also declared AFTER the state-expanded rules so
+           equal-specificity ties break in our favor. */
+        .state-expanded.card-focused,
+        .state-idle.card-focused {
+            transform: translate(80px, -190px) rotate(0deg) scale(1.7);
+            box-shadow: 0 18px 40px rgba(0,0,0,0.85);
+            border: 4px solid white;
+        }
         /* Full-screen photo viewer */
         .viewer-bg { background: rgba(0,0,0,0.95); }
         /* Blur flair applied briefly during aspect-ratio transition */
