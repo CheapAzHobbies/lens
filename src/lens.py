@@ -909,9 +909,9 @@ class LensWindow(Adw.ApplicationWindow):
            asymmetric even when both directions were smooth. The remaining
            travel creeps from a narrow sliver down to closed, covering the
            rest of the wake without ever stopping. */
-        .viewflip { transition: transform 190ms cubic-bezier(0, .3, .4, 1); }
+        .viewflip { transition: transform 190ms cubic-bezier(0, .15, .55, 1); }
         .viewflip.flip-fast  { transition-duration: 190ms;
-                               transition-timing-function: cubic-bezier(0, .30, .40, 1); }
+                               transition-timing-function: cubic-bezier(0, .15, .55, 1); }
         .viewflip.flip-med   { transition-duration: 300ms;
                                transition-timing-function: cubic-bezier(0, .50, .32, 1); }
         .viewflip.flip-slow  { transition-duration: 420ms;
