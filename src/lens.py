@@ -56,6 +56,82 @@ def list_v4l2_cameras():
     return devs
 
 
+def read_battery():
+    """(percent, status, seconds_left) from sysfs, any field may be None."""
+    base = pathlib.Path("/sys/class/power_supply")
+    for name in ("BAT0", "BAT1", "BATT"):
+        d = base / name
+        if not d.is_dir():
+            continue
+
+        def rd(f):
+            try:
+                return int((d / f).read_text().strip())
+            except Exception:
+                return None
+
+        try:
+            status = (d / "status").read_text().strip()
+        except Exception:
+            status = ""
+        pct = rd("capacity")
+        # energy_*/power_* on most laptops, charge_*/current_* on some.
+        energy = rd("energy_now") or rd("charge_now")
+        power = rd("power_now") or rd("current_now")
+        secs = None
+        if energy and power and power > 0:
+            # Units are not reliable here. This machine reports energy_now in
+            # uWh but power_now in mW, so reading both as uW gives a runtime
+            # of 618 hours. Try each interpretation and keep the one that is
+            # physically believable.
+            for scale in (1, 1000):
+                cand = int(energy / (power * scale) * 3600)
+                if 300 <= cand <= 24 * 3600:
+                    secs = cand
+                    break
+        return pct, status, secs
+    return None, "", None
+
+
+class BatteryGauge(Gtk.DrawingArea):
+    """Camcorder-style battery: outline, nub, and a bar that drains."""
+
+    def __init__(self):
+        super().__init__()
+        self.level = 1.0
+        self.charging = False
+        self.set_content_width(30)
+        self.set_content_height(15)
+        self.set_valign(Gtk.Align.CENTER)
+        self.set_can_target(False)
+        self.set_draw_func(self._draw)
+
+    def set_level(self, frac, charging=False):
+        self.level = max(0.0, min(1.0, frac))
+        self.charging = charging
+        self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        if self.charging:
+            cr.set_source_rgb(0.45, 0.85, 0.45)
+        elif self.level <= 0.15:
+            cr.set_source_rgb(1.0, 0.30, 0.30)
+        elif self.level <= 0.30:
+            cr.set_source_rgb(1.0, 0.75, 0.20)
+        else:
+            cr.set_source_rgb(1.0, 1.0, 1.0)
+        body = w - 4
+        cr.set_line_width(1.5)
+        cr.rectangle(0.75, 0.75, body - 1.5, h - 1.5)
+        cr.stroke()
+        cr.rectangle(body, h / 2 - 3, 3, 6)      # the nub
+        cr.fill()
+        inner = (body - 5) * self.level
+        if inner > 0.5:
+            cr.rectangle(2.5, 2.5, inner, h - 5)
+            cr.fill()
+
+
 class LensWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Lens")
@@ -196,8 +272,14 @@ class LensWindow(Adw.ApplicationWindow):
         bottom.append(act_area)
 
         # SHUTTER — always centered in the action area
+        # Ring plus a core that morphs: white circle for photo, red circle for
+        # video standby, red square while recording.
         self.shutter = Gtk.Button()
-        self.shutter.set_size_request(80, 80); self.shutter.add_css_class("shutter")
+        self.shutter_core = Gtk.Box()
+        self.shutter_core.add_css_class("shutter-core")
+        self.shutter_core.set_hexpand(True); self.shutter_core.set_vexpand(True)
+        self.shutter.set_child(self.shutter_core)
+        self.shutter.set_size_request(84, 84); self.shutter.add_css_class("shutter")
         self.shutter.set_halign(Gtk.Align.CENTER); self.shutter.set_valign(Gtk.Align.CENTER)
         self.shutter.set_hexpand(False); self.shutter.set_vexpand(False)
         self.shutter.connect("clicked", lambda *_: self._on_shutter())
@@ -247,19 +329,65 @@ class LensWindow(Adw.ApplicationWindow):
         self.flash_overlay.set_can_target(False)
         overlay.add_overlay(self.flash_overlay)
 
-        # Recording indicator — red dot + elapsed time in top-right of viewfinder
+        # ---- Camcorder HUD (video mode) ----
+        # Sits over the viewfinder between the top pills and the bottom bar.
+        hud = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        hud.set_margin_top(62); hud.set_margin_bottom(232)
+        hud.set_margin_start(22); hud.set_margin_end(22)
+        hud.set_can_target(False)
+
+        hud_top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        hud_top.set_valign(Gtk.Align.START)
+
+        # REC / STBY, left
         rec_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        rec_row.set_halign(Gtk.Align.END); rec_row.set_valign(Gtk.Align.START)
-        rec_row.set_margin_top(60); rec_row.set_margin_end(16)
+        rec_row.set_halign(Gtk.Align.START); rec_row.set_hexpand(True)
+        rec_row.set_valign(Gtk.Align.CENTER)
         self.rec_dot = Gtk.Box()
         self.rec_dot.add_css_class("rec-dot")
-        self.rec_dot.set_size_request(14, 14)
-        self.rec_time_label = Gtk.Label(label="00:00")
-        self.rec_time_label.add_css_class("rec-time")
-        rec_row.append(self.rec_dot); rec_row.append(self.rec_time_label)
-        self.rec_indicator = rec_row
+        self.rec_dot.set_size_request(13, 13)
+        self.rec_dot.set_valign(Gtk.Align.CENTER)
+        self.rec_state_label = Gtk.Label(label="STBY")
+        self.rec_state_label.add_css_class("hud-rec")
+        self.rec_time_label = Gtk.Label(label="00:00:00")
+        self.rec_time_label.add_css_class("hud-mono")
+        rec_row.append(self.rec_dot)
+        rec_row.append(self.rec_state_label)
+        rec_row.append(self.rec_time_label)
+        hud_top.append(rec_row)
+
+        # Battery, right
+        bat_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        bat_row.set_halign(Gtk.Align.END); bat_row.set_valign(Gtk.Align.CENTER)
+        self.bat_gauge = BatteryGauge()
+        self.bat_label = Gtk.Label(label="--%")
+        self.bat_label.add_css_class("hud-mono")
+        self.bat_left_label = Gtk.Label(label="")
+        self.bat_left_label.add_css_class("hud-dim")
+        bat_row.append(self.bat_gauge)
+        bat_row.append(self.bat_label)
+        bat_row.append(self.bat_left_label)
+        hud_top.append(bat_row)
+        hud.append(hud_top)
+
+        spacer = Gtk.Box(); spacer.set_vexpand(True)
+        hud.append(spacer)
+
+        hud_bot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        hud_bot.set_valign(Gtk.Align.END)
+        self.hud_clock = Gtk.Label(label="")
+        self.hud_clock.add_css_class("hud-mono")
+        self.hud_clock.set_halign(Gtk.Align.START); self.hud_clock.set_hexpand(True)
+        self.hud_format = Gtk.Label(label="MKV  H.264  4Mb/s")
+        self.hud_format.add_css_class("hud-dim")
+        self.hud_format.set_halign(Gtk.Align.END)
+        hud_bot.append(self.hud_clock); hud_bot.append(self.hud_format)
+        hud.append(hud_bot)
+
+        self.rec_indicator = hud
         self.rec_indicator.set_visible(False)
         overlay.add_overlay(self.rec_indicator)
+        self.hud_timer = None
 
         # Grid overlay (rule of thirds)
         self.grid_widget = _GridOverlay()
@@ -305,10 +433,22 @@ class LensWindow(Adw.ApplicationWindow):
         /* Adwaita blue, the standard GNOME accent. Reads as part of the
            desktop rather than a random highlight colour. */
         .mode-active { background: rgba(0,0,0,0.5); color: #62a0ea; }
-        .shutter { background: white; border-radius: 40px;
-                   border: 4px solid white; min-width: 76px; min-height: 76px;
-                   box-shadow: 0 0 0 4px rgba(0,0,0,0.4);
-                   transition: transform 80ms ease-out, background 100ms; }
+        .shutter { background: transparent; border-radius: 42px; padding: 0;
+                   border: 3px solid rgba(255,255,255,0.95);
+                   min-width: 78px; min-height: 78px;
+                   box-shadow: 0 0 0 1px rgba(0,0,0,0.45),
+                               0 3px 16px rgba(0,0,0,0.55);
+                   transition: transform 110ms ease-out, background 140ms; }
+        .shutter:hover  { background: rgba(255,255,255,0.12); }
+        .shutter:active { transform: scale(0.93); }
+        /* The core carries the shape change so the ring stays put. */
+        .shutter-core { background: white; border-radius: 34px; margin: 7px;
+                        transition: background   200ms ease-out,
+                                    border-radius 260ms cubic-bezier(.2,.7,.3,1),
+                                    margin        260ms cubic-bezier(.2,.7,.3,1); }
+        .shutter-core.video     { background: #ff3b30; }
+        .shutter-core.recording { background: #ff3b30; border-radius: 7px;
+                                  margin: 21px; }
         .shutter:active { background: #ddd; transform: scale(0.88); }
         .shutter:hover  { background: #f5f5f5; }
         .thumb          { min-width: 56px; min-height: 56px; padding: 0; }
@@ -378,8 +518,18 @@ class LensWindow(Adw.ApplicationWindow):
         .viewer-bg { background: rgba(0,0,0,0.95); }
         .flip:active    { transform: scale(0.9); }
         .pill:active    { transform: scale(0.9); }
-        .rec-shutter { background: red; border-radius: 8px;
-                       min-width: 40px; min-height: 40px; border: 4px solid white; }
+        /* Camcorder HUD. Monospace and a hard shadow so it stays legible
+           over any scene, the way a viewfinder overlay has to be. */
+        .hud-mono { color: white; font-family: monospace; font-size: 15px;
+                    font-weight: bold; letter-spacing: 1px;
+                    text-shadow: 0 1px 3px rgba(0,0,0,0.9); }
+        .hud-dim  { color: rgba(255,255,255,0.72); font-family: monospace;
+                    font-size: 12px; letter-spacing: 1px;
+                    text-shadow: 0 1px 3px rgba(0,0,0,0.9); }
+        .hud-rec  { color: #ff3b30; font-family: monospace; font-size: 15px;
+                    font-weight: bold; letter-spacing: 2px;
+                    text-shadow: 0 1px 3px rgba(0,0,0,0.9); }
+        .hud-rec.standby { color: rgba(255,255,255,0.75); }
         .thumb { background: rgba(255,255,255,0.2); border-radius: 8px;
                  border: 1px solid white; }
         .flip { background: rgba(0,0,0,0.55); border-radius: 36px;
@@ -398,8 +548,12 @@ class LensWindow(Adw.ApplicationWindow):
         .countdown { color: white; font-size: 96px; font-weight: bold;
                      background: rgba(0,0,0,0.5); padding: 30px 50px; border-radius: 60px; }
         .flash { background: black; }
-        .rec-dot { background: #ff2222; border-radius: 7px; }
-        .rec-dot.blink { background: rgba(255,34,34,0.3); }
+        .rec-dot { background: #ff3b30; border-radius: 7px;
+                   box-shadow: 0 0 8px rgba(255,59,48,0.9);
+                   transition: opacity 180ms ease-out; }
+        .rec-dot.blink   { opacity: 0.15; }
+        .rec-dot.standby { background: rgba(255,255,255,0.55);
+                           box-shadow: none; opacity: 1; }
         .rec-time { color: white; font-family: monospace; font-size: 14px;
                     font-weight: bold; background: rgba(0,0,0,0.5);
                     padding: 2px 8px; border-radius: 8px; }
@@ -470,9 +624,54 @@ class LensWindow(Adw.ApplicationWindow):
         if video:
             self.btn_video.add_css_class("mode-active")
             self.btn_photo.remove_css_class("mode-active")
+            self.shutter_core.add_css_class("video")
+            self.rec_indicator.set_visible(True)
+            self._hud_standby()
+            self._hud_update()
+            if not self.hud_timer:
+                self.hud_timer = GLib.timeout_add_seconds(1, self._hud_update)
         else:
             self.btn_photo.add_css_class("mode-active")
             self.btn_video.remove_css_class("mode-active")
+            self.shutter_core.remove_css_class("video")
+            self.rec_indicator.set_visible(False)
+            if self.hud_timer:
+                GLib.source_remove(self.hud_timer); self.hud_timer = None
+
+    def _hud_standby(self):
+        self.rec_state_label.set_label("STBY")
+        self.rec_state_label.add_css_class("standby")
+        self.rec_dot.add_css_class("standby")
+        self.rec_dot.remove_css_class("blink")
+        self.rec_time_label.set_label("00:00:00")
+
+    def _hud_update(self):
+        """Once a second: clock, battery, and the remaining-record estimate."""
+        if not self.video_mode:
+            self.hud_timer = None
+            return False
+
+        self.hud_clock.set_label(
+            datetime.datetime.now().strftime("%Y-%m-%d  %H:%M:%S"))
+
+        pct, status, secs = read_battery()
+        charging = status.lower().startswith("charg")
+        if pct is None:
+            self.bat_label.set_label("--%")
+            self.bat_left_label.set_label("")
+        else:
+            self.bat_gauge.set_level(pct / 100.0, charging)
+            self.bat_label.set_label(f"{pct}%")
+            if charging:
+                self.bat_left_label.set_label("CHG")
+            elif secs:
+                # Runtime on battery is the ceiling on how long you can keep
+                # recording, which is the number that actually matters here.
+                self.bat_left_label.set_label(
+                    f"REC {secs // 3600}:{(secs % 3600) // 60:02d} LEFT")
+            else:
+                self.bat_left_label.set_label("")
+        return True
 
     def _toggle_fullscreen(self):
         if self.is_fullscreen(): self.unfullscreen()
@@ -589,8 +788,9 @@ class LensWindow(Adw.ApplicationWindow):
     def _rec_tick(self):
         if not self.recording: return False
         self.rec_seconds += 1
-        m, s = divmod(self.rec_seconds, 60)
-        self.rec_time_label.set_label(f"{m:02d}:{s:02d}")
+        h, rem = divmod(self.rec_seconds, 3600)
+        m, s = divmod(rem, 60)
+        self.rec_time_label.set_label(f"{h:02d}:{m:02d}:{s:02d}")
         # Blink dot every tick
         if self.rec_dot.has_css_class("blink"): self.rec_dot.remove_css_class("blink")
         else: self.rec_dot.add_css_class("blink")
@@ -613,9 +813,12 @@ class LensWindow(Adw.ApplicationWindow):
         self.picture.set_paintable(self.paintable)
         self.pipeline.set_state(Gst.State.PLAYING)
         self.recording = True
-        self.shutter.add_css_class("rec-shutter")
+        self.shutter_core.add_css_class("recording")
         self.rec_seconds = 0
-        self.rec_time_label.set_label("00:00")
+        self.rec_time_label.set_label("00:00:00")
+        self.rec_state_label.set_label("REC")
+        self.rec_state_label.remove_css_class("standby")
+        self.rec_dot.remove_css_class("standby")
         self.rec_indicator.set_visible(True)
         GLib.timeout_add_seconds(1, self._rec_tick)
 
@@ -626,8 +829,9 @@ class LensWindow(Adw.ApplicationWindow):
         bus.timed_pop_filtered(2 * Gst.SECOND, Gst.MessageType.EOS)
         self.pipeline.set_state(Gst.State.NULL)
         self.recording = False
-        self.shutter.remove_css_class("rec-shutter")
-        self.rec_indicator.set_visible(False)
+        self.shutter_core.remove_css_class("recording")
+        # Back to standby rather than hiding the HUD: still in video mode.
+        self._hud_standby()
         self._start_pipeline()
         print(f"Lens: saved video ({self.rec_seconds}s)")
 
