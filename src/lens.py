@@ -622,6 +622,11 @@ class ThumbnailDeck(Gtk.Overlay):
     # centered shutter button behind it.
     HIT_W     = 300
     HIT_H     = 160
+    # How far past the fan the finger may drift before the deck deselects.
+    # Small overshoot keeps the end card held while scrubbing; go further and
+    # nothing is selected, so you can feel that you are off the deck.
+    FAN_SLOP   = 40   # horizontal, px past either end of the fan
+    FAN_SLOP_Y = 90   # vertical, px above/below the widget
 
     def __init__(self, on_click=None, on_card_click=None):
         super().__init__()
@@ -714,6 +719,15 @@ class ThumbnailDeck(Gtk.Overlay):
                 if c.has_css_class(cls): c.remove_css_class(cls)
             c.add_css_class(f"state-{state}")
 
+    def _clear_focus(self):
+        """Drop the focused card so nothing is raised."""
+        if self._focused_card is None:
+            return
+        for c in self.cards:
+            if c.has_css_class("card-focused"):
+                c.remove_css_class("card-focused")
+        self._focused_card = None
+
     def _on_motion(self, x, y):
         """Cursor moved inside the deck widget — pick focused card by x zone.
         Zones are spread across the actual visible fan range, not the full
@@ -722,9 +736,19 @@ class ThumbnailDeck(Gtk.Overlay):
             return
         # Fan visually spans roughly the leftmost card center to the rightmost
         # card center. Cards pivot at the same bottom-center point but rotate
-        # ±30°, so their tops spread out across ~200px. Map cursor x in that
-        # band to card index — cursor outside the band clamps to the end.
+        # ±30°, so their tops spread out across ~200px.
         FAN_MIN, FAN_MAX = 20, 240
+
+        # Past the ends of the fan, or well above/below it, means the finger
+        # has moved off the deck. Deselect instead of pinning to whichever
+        # card happens to be last, so there is feedback that releasing here
+        # opens nothing. The slop keeps a small overshoot on the end cards
+        # from dropping focus while you are still scrubbing.
+        if (x < FAN_MIN - self.FAN_SLOP or x > FAN_MAX + self.FAN_SLOP
+                or y < -self.FAN_SLOP_Y or y > self.HIT_H + self.FAN_SLOP_Y):
+            self._clear_focus()
+            return
+
         rel = (x - FAN_MIN) / (FAN_MAX - FAN_MIN)
         rel = max(0.0, min(1.0, rel))
         idx = int(rel * (len(self.cards) - 1) + 0.5)
@@ -803,6 +827,12 @@ class ThumbnailDeck(Gtk.Overlay):
         pass
 
     def _on_leave(self):
+        # Mid-drag the pointer legitimately wanders outside the widget while
+        # scrubbing the fan. Tearing the deck down there would make the far
+        # cards unreachable, so just deselect and let the finger come back.
+        if self._press_is_hold and self.expanded:
+            self._clear_focus()
+            return
         # If the mouse leaves the deck mid-hold, cancel the fan.
         if self._hold_timer:
             GLib.source_remove(self._hold_timer); self._hold_timer = None
