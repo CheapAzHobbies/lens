@@ -1477,12 +1477,23 @@ class LensWindow(Adw.ApplicationWindow):
         for wdg in self._hud_extras:
             wdg.set_visible(True)
 
-        # Top row: state, clock and battery. Shed clock and battery together.
-        if w_of(self._rec_row, self.hud_clock, self._bat_row) > avail:
-            self.hud_clock.set_visible(False)
-            self._bat_row.set_visible(False)
-            if w_of(self._rec_row) > avail:
-                self._hud_top.set_visible(False)
+        # Top row is a CenterBox, so the clock is centred in the whole row
+        # rather than in the space left over. Comparing the sum of the three
+        # groups is not enough: a wide left corner reaches past where the
+        # centred clock starts and they overlap even when the total fits.
+        # What matters is whether each side clears its half.
+        inner = stack_w - 32
+        gap = 20
+        clock_w = self.hud_clock.get_preferred_size()[1].width
+        rec_w = w_of(self._rec_row)
+        bat_w = self._bat_row.get_preferred_size()[1].width
+        half = (inner - clock_w) / 2 - gap
+        if rec_w > half or bat_w > half:
+            self.hud_clock.set_visible(False)          # centre corner goes
+            if rec_w + bat_w + gap > inner:
+                self._bat_row.set_visible(False)       # then the right one
+                if rec_w > inner:
+                    self._hud_top.set_visible(False)
 
         # Bottom row: sound on the left, format on the right.
         if w_of(self._audio_row, self._info_row) > avail:
@@ -1514,7 +1525,7 @@ class LensWindow(Adw.ApplicationWindow):
         self._fps_shown = self._fps_count
         self._fps_count = 0
         res = f"{self.cur_res[0]}\u00d7{self.cur_res[1]}" if self.cur_res else ""
-        rate = f"{self._fps_shown:g}P" if self._fps_shown else ""
+        rate = f"{self._fps_shown:g} FPS" if self._fps_shown else ""
         self.hud_fps.set_label("  ".join(x for x in (res, rate) if x))
         self._refresh_mic_icon()
 
