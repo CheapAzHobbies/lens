@@ -63,6 +63,52 @@ def list_v4l2_cameras():
     return devs
 
 
+def best_mode(dev):
+    """Pick a sane capture mode for a device: (fourcc, w, h, fps) or None.
+
+    Without a caps filter GStreamer takes whatever v4l2src offers first,
+    which on the Z13 rear camera is YUYV 2592x1944 at *2 fps*. That is the
+    "laggy rear camera". The same sensor does MJPG 1600x1200 at 30.
+    """
+    import subprocess, re
+    try:
+        out = subprocess.run(["v4l2-ctl", "-d", dev, "--list-formats-ext"],
+                             capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        return None
+    fmt = size = None
+    modes = []
+    for line in out.splitlines():
+        m = re.search(r"\]: '(\w+)'", line)
+        if m:
+            fmt = m.group(1); continue
+        m = re.search(r"Size: Discrete (\d+)x(\d+)", line)
+        if m:
+            size = (int(m.group(1)), int(m.group(2))); continue
+        m = re.search(r"\(([\d.]+) fps\)", line)
+        if m and fmt and size:
+            modes.append((fmt, size[0], size[1], float(m.group(1))))
+    if not modes:
+        return None
+    # Smooth first, then detail. Cap the pixel count so decode stays cheap;
+    # stills are cropped from this frame anyway.
+    usable = [m for m in modes if m[3] >= 20 and m[1] * m[2] <= 2_100_000]
+    if not usable:
+        usable = [m for m in modes if m[3] >= 10] or modes
+    # Prefer MJPG: the raw modes on these sensors are the slow ones.
+    mjpg = [m for m in usable if m[0] == "MJPG"]
+    pool = mjpg or usable
+    # Stick to the sensor's native aspect. The Z13 rear sensor is 4:3, and
+    # picking one of its 16:9 modes squashes the picture, which is the
+    # stretching this app had before it stopped forcing caps at all.
+    biggest = max(modes, key=lambda m: m[1] * m[2])
+    native = biggest[1] / biggest[2]
+    same = [m for m in pool if abs(m[1] / m[2] - native) < 0.02]
+    if same:
+        pool = same
+    return max(pool, key=lambda m: (m[1] * m[2], m[3]))
+
+
 def is_video(path):
     return str(path).lower().endswith(VIDEO_EXTS)
 
@@ -234,13 +280,14 @@ class LensWindow(Adw.ApplicationWindow):
             self.paintable = None
 
         dev = self.cameras[self.cam_idx][0]
+        src = self._source_for(dev)
         # Preview branch + photo-capture branch, both fed by the same v4l2src via tee.
         # The photo branch produces encoded JPEG buffers on the appsink,
         # and we pull the latest one when the shutter is pressed.
         # Let the camera pick its native resolution — forcing 1280x720 stretched
         # 4:3 sensors (like the Z13 rear camera at 2592x1944) into 16:9.
         pipe_str = (
-            f"v4l2src device={dev} ! videoconvert ! tee name=t "
+            f"{src} ! tee name=t "
             f"t. ! queue max-size-buffers=2 leaky=downstream ! gtk4paintablesink name=sink "
             f"t. ! queue max-size-buffers=2 leaky=downstream ! jpegenc quality=92 ! "
             f"appsink name=photosink emit-signals=false max-buffers=1 drop=true sync=false"
@@ -254,6 +301,21 @@ class LensWindow(Adw.ApplicationWindow):
         bus.add_signal_watch()
         bus.connect("message::error", self._on_bus_err)
         self.pipeline.set_state(Gst.State.PLAYING)
+
+    def _source_for(self, dev):
+        """v4l2src plus the caps needed to actually get a usable framerate."""
+        mode = best_mode(dev)
+        if not mode:
+            return f"v4l2src device={dev} ! videoconvert"
+        fourcc, w, h, fps = mode
+        print(f"Lens: {dev} -> {fourcc} {w}x{h} @ {fps:g}fps")
+        rate = int(round(fps))
+        if fourcc == "MJPG":
+            return (f"v4l2src device={dev} ! "
+                    f"image/jpeg,width={w},height={h},framerate={rate}/1 ! "
+                    f"jpegdec ! videoconvert")
+        return (f"v4l2src device={dev} ! "
+                f"video/x-raw,width={w},height={h},framerate={rate}/1 ! videoconvert")
 
     def _on_bus_err(self, bus, msg):
         err, dbg = msg.parse_error()
@@ -427,7 +489,7 @@ class LensWindow(Adw.ApplicationWindow):
         # Sits over the viewfinder between the top pills and the bottom bar.
         hud = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         hud.set_margin_top(20); hud.set_margin_bottom(18)
-        hud.set_margin_start(22); hud.set_margin_end(22)
+        hud.set_margin_start(16); hud.set_margin_end(16)
         hud.set_can_target(False)
 
         hud_top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
@@ -609,23 +671,26 @@ class LensWindow(Adw.ApplicationWindow):
             box-shadow: 0 18px 40px rgba(0,0,0,0.9);
         }
         /* Full-screen photo viewer */
-        /* Camera flip: the viewfinder turns edge-on, the pipeline is
-           swapped while it is invisible, then it turns back. Same trick a
-           phone uses, and it hides the teardown glitch completely. */
-        .viewflip { transition: transform 240ms ease-in-out; }
-        .viewflip.flipped { transform: perspective(1000px) rotateY(90deg); }
+        /* Camera flip: the viewfinder squeezes left-to-right to a vertical
+           sliver, the pipeline is swapped while it is invisible, then it
+           opens back out. This used to be perspective()+rotateY(), but GTK's
+           3D projection over a GStreamer paintable rendered as a squashed
+           band with a triangular artifact. A plain 2D scaleX reads as the
+           same turn and composites cleanly. */
+        .viewflip { transition: transform 200ms cubic-bezier(.45,0,.55,1); }
+        .viewflip.flipped { transform: scaleX(0.02); }
         .viewer-bg { background: rgba(0,0,0,0.95); }
         .flip:active    { transform: scale(0.9); }
         .pill:active    { transform: scale(0.9); }
         /* Camcorder HUD. Monospace and a hard shadow so it stays legible
            over any scene, the way a viewfinder overlay has to be. */
-        .hud-mono { color: white; font-family: monospace; font-size: 15px;
+        .hud-mono { color: white; font-family: monospace; font-size: 13px;
                     font-weight: bold; letter-spacing: 1px;
                     text-shadow: 0 1px 3px rgba(0,0,0,0.9); }
         .hud-dim  { color: rgba(255,255,255,0.72); font-family: monospace;
-                    font-size: 12px; letter-spacing: 1px;
+                    font-size: 11px; letter-spacing: 0px;
                     text-shadow: 0 1px 3px rgba(0,0,0,0.9); }
-        .hud-rec  { color: #ff3b30; font-family: monospace; font-size: 15px;
+        .hud-rec  { color: #ff3b30; font-family: monospace; font-size: 13px;
                     font-weight: bold; letter-spacing: 2px;
                     text-shadow: 0 1px 3px rgba(0,0,0,0.9); }
         .hud-rec.standby { color: rgba(255,255,255,0.75); }
@@ -637,10 +702,14 @@ class LensWindow(Adw.ApplicationWindow):
                 transition: background 140ms ease-out, transform 120ms ease-out; }
         .flip:hover { background: rgba(0,0,0,0.72); }
         .flip:disabled { opacity: 0.35; }
-        /* The icon spins rather than the button, so the press-scale on the
-           button and the spin cannot fight over the same transform. */
-        .flip-icon { transition: transform 450ms cubic-bezier(.2,.7,.3,1); }
-        .flip-icon.spun { transform: rotate(180deg); }
+        /* Full turn, not a half one: rotate(180deg) left the camera glyph
+           resting upside down. A keyframe animation returns it to 0 on its
+           own, so there is no state to keep track of. */
+        @keyframes flip-spin {
+            from { transform: rotate(0deg); }
+            to   { transform: rotate(360deg); }
+        }
+        .flip-icon.spun { animation: flip-spin 450ms cubic-bezier(.2,.7,.3,1); }
         .pill { background: rgba(0,0,0,0.5); border-radius: 21px; color: white;
                 font-weight: bold; font-size: 14px; padding: 4px 12px; border: none; }
         .pill-active { background: #62a0ea; color: white; }
@@ -813,7 +882,7 @@ class LensWindow(Adw.ApplicationWindow):
                 # Runtime on battery is the ceiling on how long you can keep
                 # recording, which is the number that actually matters here.
                 self.bat_left_label.set_label(
-                    f"REC {secs // 3600}:{(secs % 3600) // 60:02d} LEFT")
+                    f"{secs // 3600}:{(secs % 3600) // 60:02d}")
             else:
                 self.bat_left_label.set_label("")
         return True
@@ -822,23 +891,25 @@ class LensWindow(Adw.ApplicationWindow):
         if self.is_fullscreen(): self.unfullscreen()
         else: self.fullscreen()
 
-    FLIP_MS = 240
+    FLIP_MS = 200
 
     def _flip_camera(self):
         if len(self.cameras) < 2: return
         if self._flipping: return          # ignore taps during the turn
         self._flipping = True
-        # Half turn on every press, so repeated flips keep spinning the same
-        # way instead of snapping back.
-        self._flip_spun = not self._flip_spun
-        if self._flip_spun:
-            self.flip_icon.add_css_class("spun")
-        else:
-            self.flip_icon.remove_css_class("spun")
+        # Retrigger the spin animation: drop the class, then re-add it on the
+        # next tick so the keyframes restart even on rapid presses.
+        self.flip_icon.remove_css_class("spun")
+        GLib.idle_add(self._spin_flip_icon)
 
         # Turn the viewfinder edge-on first, swap behind it, then turn back.
         self.frame_stack.add_css_class("flipped")
         GLib.timeout_add(self.FLIP_MS, self._flip_swap)
+
+    def _spin_flip_icon(self):
+        self.flip_icon.add_css_class("spun")
+        GLib.timeout_add(480, lambda: (self.flip_icon.remove_css_class("spun"), False)[1])
+        return False
 
     def _flip_swap(self):
         self.cam_idx = (self.cam_idx + 1) % len(self.cameras)
@@ -968,7 +1039,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.pipeline.set_state(Gst.State.NULL)
         dev = self.cameras[self.cam_idx][0]
         self.pipeline = Gst.parse_launch(
-            f"v4l2src device={dev} ! tee name=t "
+            f"{self._source_for(dev)} ! tee name=t "
             f"t. ! queue ! videoconvert ! gtk4paintablesink name=sink "
             f"t. ! queue ! videoconvert ! x264enc tune=zerolatency bitrate=4000 ! "
             f"matroskamux ! filesink location={path}"
