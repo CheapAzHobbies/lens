@@ -393,6 +393,8 @@ class LensWindow(Adw.ApplicationWindow):
         self.mic_active = False
         self._audio_mon = None
         self._audio_mon_handler = None
+        self._hud_droppable = []
+        self.cur_res = None
         self._fps_count = 0
         self._fps_shown = 0
         self.overlay_mode = int(cfg.get("overlay_mode", 0)) % 3
@@ -539,8 +541,10 @@ class LensWindow(Adw.ApplicationWindow):
         """v4l2src plus the caps needed to actually get a usable framerate."""
         mode = best_mode(dev)
         if not mode:
+            self.cur_res = None
             return f"v4l2src device={dev} ! videoconvert"
         fourcc, w, h, fps = mode
+        self.cur_res = (w, h)
         print(f"Lens: {dev} -> {fourcc} {w}x{h} @ {fps:g}fps")
         rate = int(round(fps))
         if fourcc == "MJPG":
@@ -828,6 +832,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.audio_meter = AudioMeter()
         self.audio_meter.set_margin_start(4)
         rec_row.append(self.audio_meter)
+        self._rec_row = rec_row
         hud_top.append(rec_row)
 
         # Battery, right
@@ -841,6 +846,8 @@ class LensWindow(Adw.ApplicationWindow):
         bat_row.append(self.bat_gauge)
         bat_row.append(self.bat_label)
         bat_row.append(self.bat_left_label)
+        self._bat_row = bat_row
+        self._hud_top = hud_top
         hud_top.append(bat_row)
         hud.append(hud_top)
 
@@ -863,6 +870,13 @@ class LensWindow(Adw.ApplicationWindow):
         hud_bot.append(self.hud_format)
         hud.append(hud_bot)
 
+        # Dropped in this order as the picture narrows: decoration first,
+        # then detail, then the numbers, keeping REC state and the battery
+        # icon alive as long as possible.
+        self._hud_droppable = [
+            self.hud_format, self.bat_left_label, self.audio_meter,
+            self.hud_fps, self.hud_clock, self.bat_label, self.btn_mic,
+        ]
         self.rec_indicator = hud
         self.rec_indicator.set_visible(False)
         # On the picture, not the window: the readouts belong over the frame
@@ -1238,13 +1252,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.btn_flip.set_visible(True)
 
         # HUD: hide by priority rather than shrink into illegibility.
-        self.hud_format.set_visible(cls == "roomy")
-        self.hud_fps.set_visible(cls != "tiny")
-        self.btn_mic.set_visible(cls != "tiny")
-        self.audio_meter.set_visible(cls == "roomy")
-        self.bat_left_label.set_visible(cls == "roomy")
-        self.hud_clock.set_visible(cls != "tiny")
-        self.bat_label.set_visible(cls != "tiny")
+        GLib.idle_add(self._fit_hud)
         self._refresh_deck()
         return False
 
@@ -1320,6 +1328,8 @@ class LensWindow(Adw.ApplicationWindow):
         anim = Adw.TimedAnimation.new(self.aspect_frame, old, new, 380, target)
         anim.set_easing(Adw.Easing.EASE_OUT_CUBIC)
         anim.play()
+        # Aspect changes resize the picture without resizing the window.
+        GLib.timeout_add(420, self._fit_hud)
         self._save_settings()
 
     def _toggle_timer(self):
@@ -1431,7 +1441,42 @@ class LensWindow(Adw.ApplicationWindow):
         else:
             self._stop_audio_monitor()
         self._refresh_mic_icon()
+        self._fit_hud()
         self._save_settings()
+
+    def _fit_hud(self, *_):
+        """Drop HUD items until the two ends stop colliding.
+
+        Measured against the picture width, not the window width. With a 1:1
+        aspect in a wide window the picture is narrow while the window is
+        not, so a window-based rule left the readouts overlapping anyway.
+        Items are dropped least-useful first, and the whole row goes if even
+        the bare state and battery will not fit.
+        """
+        stack_w = self.frame_stack.get_width()
+        if stack_w <= 1:
+            return False
+        # hud side margins (16 each) plus a minimum gap between the two ends
+        avail = stack_w - 32 - 28
+
+        # Start from everything visible again, so widening restores them.
+        self._hud_top.set_visible(True)
+        for wdg in self._hud_droppable:
+            wdg.set_visible(True)
+
+        def need():
+            return (self._rec_row.get_preferred_size()[1].width
+                    + self._bat_row.get_preferred_size()[1].width)
+
+        for wdg in self._hud_droppable:
+            if need() <= avail:
+                break
+            wdg.set_visible(False)
+        else:
+            # Nothing left to give and it still does not fit.
+            if need() > avail:
+                self._hud_top.set_visible(False)
+        return False
 
     def _hud_standby(self):
         self.rec_state_label.set_label("STBY")
@@ -1453,7 +1498,9 @@ class LensWindow(Adw.ApplicationWindow):
         # rate: negotiated caps say 30 but a busy machine may not hit it.
         self._fps_shown = self._fps_count
         self._fps_count = 0
-        self.hud_fps.set_label(f"{self._fps_shown:g} FPS" if self._fps_shown else "")
+        res = f"{self.cur_res[0]}\u00d7{self.cur_res[1]}" if self.cur_res else ""
+        rate = f"{self._fps_shown:g}P" if self._fps_shown else ""
+        self.hud_fps.set_label("  ".join(x for x in (res, rate) if x))
         self._refresh_mic_icon()
 
         self.hud_format.set_label(
