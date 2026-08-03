@@ -330,9 +330,9 @@ class LensWindow(Adw.ApplicationWindow):
         /* Focused card — user is pointing at it while holding. Pull it up
            and out of the fan, upright, so it looks like a card being drawn
            from someone's hand. Bigger scale so it's clearly the selected one. */
-        .card-focused { transform: translate(80px, -110px) rotate(0deg) scale(1.5) !important;
-                        box-shadow: 0 14px 34px rgba(0,0,0,0.75);
-                        border: 3px solid white; }
+        .card-focused { transform: translate(80px, -140px) rotate(0deg) scale(1.7) !important;
+                        box-shadow: 0 18px 40px rgba(0,0,0,0.85);
+                        border: 4px solid white; }
         /* Full-screen photo viewer */
         .viewer-bg { background: rgba(0,0,0,0.95); }
         /* Blur flair applied briefly during aspect-ratio transition */
@@ -613,8 +613,9 @@ class ThumbnailDeck(Gtk.Overlay):
     """
     DECK_SIZE = 5     # up to N cards visible
     THUMB_PX  = 112   # collapsed edge (was 56 — user asked for 2x)
-    # Wide hit area so a natural left/right swipe covers all card zones.
-    HIT_W     = 480
+    # Wide enough for the fan-out swipe but not so wide it covers the
+    # centered shutter button behind it.
+    HIT_W     = 300
     HIT_H     = 160
 
     def __init__(self, on_click=None, on_card_click=None):
@@ -718,7 +719,7 @@ class ThumbnailDeck(Gtk.Overlay):
         # card center. Cards pivot at the same bottom-center point but rotate
         # ±30°, so their tops spread out across ~200px. Map cursor x in that
         # band to card index — cursor outside the band clamps to the end.
-        FAN_MIN, FAN_MAX = 30, 260
+        FAN_MIN, FAN_MAX = 20, 240
         rel = (x - FAN_MIN) / (FAN_MAX - FAN_MIN)
         rel = max(0.0, min(1.0, rel))
         idx = int(rel * (len(self.cards) - 1) + 0.5)
@@ -731,6 +732,10 @@ class ThumbnailDeck(Gtk.Overlay):
                 c.remove_css_class("card-focused")
         target.add_css_class("card-focused")
         self._focused_card = target
+        # Raise the focused card to the top of the overlay z-order so it
+        # visibly comes forward over the other cards.
+        self.remove_overlay(target)
+        self.add_overlay(target)
 
     # ---- new press/hold interaction ----
     HOLD_MS   = 220   # ms to hold before fan-out starts
