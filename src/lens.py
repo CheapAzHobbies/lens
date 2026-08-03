@@ -2318,10 +2318,11 @@ class ThumbnailDeck(Gtk.Overlay):
         self.HIT_W = hit_w
         self.set_size_request(hit_w, self.HIT_H)
         self.set_margin_start(margin)
-        # Force the next update_photos to rebuild. It short-circuits when the
-        # file list is unchanged, which meant a resize left the old cards at
-        # the old size and the deck kept overlapping the shutter.
-        self.card_paths = []
+        # Force the next update_photos to rebuild, without throwing away
+        # card_paths. Clearing that list was destroying the card-to-file
+        # mapping, so releasing on a card looked up an index into an empty
+        # list and opened nothing, and a plain tap did the same.
+        self._needs_rebuild = True
 
     def __init__(self, on_click=None, on_card_click=None):
         super().__init__()
@@ -2334,6 +2335,7 @@ class ThumbnailDeck(Gtk.Overlay):
         self.on_card_click = on_card_click
         self.card_paths = []
         self._pending_photos = None
+        self._needs_rebuild = False
         self.cards = []        # bottom-to-top order
         self.hover_delay_id = None
         self.cycle_id = None
@@ -2359,7 +2361,6 @@ class ThumbnailDeck(Gtk.Overlay):
         press.set_button(1)   # left mouse
         press.connect("pressed",  self._on_press)
         press.connect("released", self._on_release)
-        press.connect("cancel",   self._abort_hold)
         self.add_controller(press)
 
         # Touch scrubbing goes through a drag gesture, not the motion
@@ -2371,10 +2372,13 @@ class ThumbnailDeck(Gtk.Overlay):
         drag.connect("drag-begin",  self._on_drag_begin)
         drag.connect("drag-update", self._on_drag_update)
         drag.connect("drag-end",    self._on_drag_end)
-        # A drag does not always finish with drag-end. Releasing away from
+        # A drag does not always finish with drag-end: releasing away from
         # the cards, or the sequence being taken over, ends it via cancel or
-        # end instead, and without these the fan stayed open until the
-        # pointer wandered back over the deck.
+        # end instead, and the fan stayed open. Both are handled, but the
+        # cleanup is deferred to an idle callback because 'end' can arrive
+        # BEFORE 'drag-end'. Running it immediately cleared _press_is_hold
+        # first, so _finish_hold bailed out and releasing on a card opened
+        # nothing at all.
         drag.connect("cancel", self._abort_hold)
         drag.connect("end",    self._abort_hold)
         self.add_controller(drag)
@@ -2436,7 +2440,8 @@ class ThumbnailDeck(Gtk.Overlay):
         """Rebuild the deck from these paths (oldest → newest at top)."""
         latest = list(paths)[-self.DECK_SIZE:]
         new_paths = [str(p) for p in latest]
-        if new_paths == self.card_paths and self.cards:
+        if (new_paths == self.card_paths and self.cards
+                and not self._needs_rebuild):
             return                      # nothing actually changed
         if self.expanded:
             # Rebuilding now would destroy the cards under the finger. Hold
@@ -2444,6 +2449,7 @@ class ThumbnailDeck(Gtk.Overlay):
             self._pending_photos = list(paths)
             return
         self._pending_photos = None
+        self._needs_rebuild = False
         # Clear existing
         while self.cards:
             self.remove_overlay(self.cards.pop())
@@ -2595,17 +2601,25 @@ class ThumbnailDeck(Gtk.Overlay):
         self._finish_hold()
 
     def _abort_hold(self, *_):
-        """End a hold without opening anything, and always close the fan."""
+        """Close the fan once the gesture is over, whatever ended it.
+
+        Deferred: 'end' can arrive before 'drag-end', so acting immediately
+        would tear the hold down before the release had a chance to open the
+        card under the finger.
+        """
         if self._hold_timer:
             GLib.source_remove(self._hold_timer)
             self._hold_timer = None
-        if not self._press_is_hold:
-            # Still collapse if the fan is somehow open with nothing held.
-            if self.expanded:
-                self._collapse()
-            return
-        self._press_is_hold = False
-        self._collapse()
+        GLib.idle_add(self._abort_hold_now)
+
+    def _abort_hold_now(self):
+        if self._press_is_hold:
+            self._press_is_hold = False
+            self._collapse()
+        elif self.expanded:
+            # Open with nothing held: only reachable if a gesture vanished.
+            self._collapse()
+        return False
 
     def _finish_hold(self):
         """End a hold-and-scrub: open whatever card is focused, then close
