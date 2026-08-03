@@ -635,10 +635,12 @@ class ThumbnailDeck(Gtk.Overlay):
     FAN_ANGLES  = (-30, -15, 0, 15, 30)     # rotate(Ndeg)
     FAN_DX      = 80                        # base translate X
     FAN_OFFSETS = (-60, -30, 0, 30, 60)     # per-card slide, added to FAN_DX
-    # How far past a card's centre the finger may drift before the deck
-    # deselects, on top of half the card-to-card spacing.
-    FAN_SLOP   = 26   # horizontal px
-    FAN_SLOP_Y = 90   # vertical px above/below the widget
+    # Inside the fan the nearest card always wins, so there are no dead
+    # zones between cards. Focus is only dropped once the finger is clearly
+    # past either end, which needs to be a generous distance or overshooting
+    # the last card feels like the deck snatches itself away.
+    FAN_EDGE   = 110  # horizontal px past the outermost card centre
+    FAN_SLOP_Y = 160  # vertical px above/below the widget
 
     def __init__(self, on_click=None, on_card_click=None):
         super().__init__()
@@ -676,7 +678,19 @@ class ThumbnailDeck(Gtk.Overlay):
         press.connect("released", self._on_release)
         self.add_controller(press)
 
-        # Motion controller — only used while in hold mode
+        # Touch scrubbing goes through a drag gesture, not the motion
+        # controller. EventControllerMotion only sees pointer-emulation
+        # events, so a finger held still stops producing them and the deck
+        # went dead until you lifted off. A drag gesture keeps the sequence
+        # for as long as the finger is down, including outside the widget.
+        drag = Gtk.GestureDrag.new()
+        drag.connect("drag-begin",  self._on_drag_begin)
+        drag.connect("drag-update", self._on_drag_update)
+        drag.connect("drag-end",    self._on_drag_end)
+        self.add_controller(drag)
+        self._drag_start = (0.0, 0.0)
+
+        # Motion controller — mouse hover only
         motion = Gtk.EventControllerMotion()
         motion.connect("motion", lambda _c, x, y: self._on_motion(x, y))
         motion.connect("leave", lambda *_: self._on_leave())
@@ -762,7 +776,13 @@ class ThumbnailDeck(Gtk.Overlay):
         return out
 
     def _on_motion(self, x, y):
-        """Cursor moved inside the deck widget — focus the nearest card."""
+        """Pointer moved over the deck. Touch scrubbing comes through
+        _on_drag_update instead, because motion events are not reliable for a
+        finger that is held still."""
+        self._update_focus(x, y)
+
+    def _update_focus(self, x, y):
+        """Focus the card nearest to x, or nothing if clearly off the fan."""
         if not self.expanded or len(self.cards) < 2:
             return
 
@@ -775,11 +795,9 @@ class ThumbnailDeck(Gtk.Overlay):
                   + " ".join(f"{c:.0f}" for c in centers), file=sys.stderr)
 
         # Nearest card wins, so pointing at a card selects that card by
-        # construction. Tolerance scales with the actual spacing.
+        # construction, and anywhere across the fan keeps a selection.
         idx = min(range(len(centers)), key=lambda i: abs(x - centers[i]))
-        spacing = ((max(centers) - min(centers)) / (len(centers) - 1)
-                   if len(centers) > 1 else self.THUMB_PX)
-        if (abs(x - centers[idx]) > spacing / 2 + self.FAN_SLOP
+        if (x < min(centers) - self.FAN_EDGE or x > max(centers) + self.FAN_EDGE
                 or y < -self.FAN_SLOP_Y or y > self.HIT_H + self.FAN_SLOP_Y):
             self._clear_focus()
             return
@@ -834,13 +852,39 @@ class ThumbnailDeck(Gtk.Overlay):
                 self._click_timer = GLib.timeout_add(self.DBLCLK_MS, _fire_single)
             return
         # Otherwise we were in hold/fan mode — open the focused card
-        if self._press_is_hold:
-            if self._focused_card and self._focused_card in self.cards:
-                idx = self.cards.index(self._focused_card)
-                if idx < len(self.card_paths) and self.on_card_click:
-                    self.on_card_click(self.card_paths[idx])
-            self._press_is_hold = False
-            self._collapse()
+        self._finish_hold()
+
+    def _finish_hold(self):
+        """End a hold-and-scrub: open whatever card is focused, then close
+        the fan. Releasing with nothing focused opens nothing."""
+        if not self._press_is_hold:
+            return
+        if self._focused_card and self._focused_card in self.cards:
+            idx = self.cards.index(self._focused_card)
+            if idx < len(self.card_paths) and self.on_card_click:
+                self.on_card_click(self.card_paths[idx])
+        self._press_is_hold = False
+        self._collapse()
+
+    # ---- touch drag scrubbing ----
+    def _on_drag_begin(self, gesture, sx, sy):
+        self._drag_start = (sx, sy)
+
+    def _on_drag_update(self, gesture, ox, oy):
+        if not self._press_is_hold:
+            return
+        sx, sy = self._drag_start
+        self._update_focus(sx + ox, sy + oy)
+
+    def _on_drag_end(self, gesture, ox, oy):
+        # Once the drag threshold is passed this gesture claims the touch
+        # sequence, which cancels the click gesture, so its "released" never
+        # arrives and the hold has to be finished from here.
+        if not self._press_is_hold:
+            return
+        sx, sy = self._drag_start
+        self._update_focus(sx + ox, sy + oy)
+        self._finish_hold()
 
     def _collapse(self):
         """Reverse of _expand: hide the fan, stop the cycle."""
@@ -858,11 +902,11 @@ class ThumbnailDeck(Gtk.Overlay):
         pass
 
     def _on_leave(self):
-        # Mid-drag the pointer legitimately wanders outside the widget while
-        # scrubbing the fan. Tearing the deck down there would make the far
-        # cards unreachable, so just deselect and let the finger come back.
+        # Mid-drag, ignore leave entirely. The drag gesture keeps delivering
+        # real coordinates outside the widget, so _update_focus is the one
+        # that decides whether anything is selected. Clearing here as well
+        # made it impossible to scrub back in after overshooting.
         if self._press_is_hold and self.expanded:
-            self._clear_focus()
             return
         # If the mouse leaves the deck mid-hold, cancel the fan.
         if self._hold_timer:
