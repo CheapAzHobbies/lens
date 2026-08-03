@@ -274,6 +274,60 @@ def read_battery():
     return None, "", None, None
 
 
+class AudioMeter(Gtk.DrawingArea):
+    """Segmented level meter, camcorder style.
+
+    Green up to about -12dBFS, amber to -3, red at the top, so clipping is
+    visible before it happens rather than after.
+    """
+
+    SEGMENTS = 9
+
+    def __init__(self):
+        super().__init__()
+        self.level = 0.0       # 0..1
+        self.muted = False
+        self.set_content_width(46)
+        self.set_content_height(11)
+        self.set_valign(Gtk.Align.CENTER)
+        self.set_can_target(False)
+        self.set_draw_func(self._draw)
+
+    def set_db(self, db):
+        """dBFS in, 0..1 out. -50dB is the floor: below that it is silence."""
+        if db is None or db < -50:
+            frac = 0.0
+        else:
+            frac = max(0.0, min(1.0, (db + 50.0) / 50.0))
+        # Fall faster than nothing but slower than the signal, so the meter
+        # reads as a meter rather than a strobe.
+        self.level = frac if frac > self.level else self.level * 0.65 + frac * 0.35
+        self.queue_draw()
+
+    def set_muted(self, muted):
+        if muted != self.muted:
+            self.muted = muted
+            self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        gap = 2
+        seg_w = (w - gap * (self.SEGMENTS - 1)) / self.SEGMENTS
+        lit = 0 if self.muted else int(self.level * self.SEGMENTS + 0.5)
+        for i in range(self.SEGMENTS):
+            frac = (i + 1) / self.SEGMENTS
+            if i < lit:
+                if frac > 0.88:
+                    cr.set_source_rgb(1.0, 0.28, 0.24)      # clipping
+                elif frac > 0.72:
+                    cr.set_source_rgb(1.0, 0.75, 0.20)
+                else:
+                    cr.set_source_rgb(0.35, 0.86, 0.45)
+            else:
+                cr.set_source_rgba(1, 1, 1, 0.16)
+            cr.rectangle(i * (seg_w + gap), 0, seg_w, h)
+            cr.fill()
+
+
 class BatteryGauge(Gtk.DrawingArea):
     """Camcorder-style battery: outline, nub, and a bar that drains."""
 
@@ -337,6 +391,8 @@ class LensWindow(Adw.ApplicationWindow):
         self.mic_available = has_microphone()
         self.mic_enabled = bool(cfg.get("mic_enabled", True))
         self.mic_active = False
+        self._audio_mon = None
+        self._audio_mon_handler = None
         self._fps_count = 0
         self._fps_shown = 0
         self.overlay_mode = int(cfg.get("overlay_mode", 0)) % 3
@@ -769,6 +825,9 @@ class LensWindow(Adw.ApplicationWindow):
         self.btn_mic.set_margin_start(10)
         self.btn_mic.connect("clicked", lambda *_: self._toggle_mic())
         rec_row.append(self.btn_mic)
+        self.audio_meter = AudioMeter()
+        self.audio_meter.set_margin_start(4)
+        rec_row.append(self.audio_meter)
         hud_top.append(rec_row)
 
         # Battery, right
@@ -1182,6 +1241,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.hud_format.set_visible(cls == "roomy")
         self.hud_fps.set_visible(cls != "tiny")
         self.btn_mic.set_visible(cls != "tiny")
+        self.audio_meter.set_visible(cls == "roomy")
         self.bat_left_label.set_visible(cls == "roomy")
         self.hud_clock.set_visible(cls != "tiny")
         self.bat_label.set_visible(cls != "tiny")
@@ -1282,6 +1342,7 @@ class LensWindow(Adw.ApplicationWindow):
             self.btn_photo.remove_css_class("mode-active")
             self.shutter_core.add_css_class("video")
             self.rec_indicator.set_visible(getattr(self, "overlay_mode", 0) in (0, 1))
+            self._start_audio_monitor()
             self._hud_standby()
             self._hud_update()
             if not self.hud_timer:
@@ -1293,7 +1354,56 @@ class LensWindow(Adw.ApplicationWindow):
             self.rec_indicator.set_visible(False)
             if self.hud_timer:
                 GLib.source_remove(self.hud_timer); self.hud_timer = None
+            self._stop_audio_monitor()
         self._save_settings()
+
+    # ---- live audio level ----
+    def _start_audio_monitor(self):
+        """Small audio-only pipeline that reports levels.
+
+        Separate from the recording pipeline so the meter works in standby:
+        the point is to see the mic is picking you up *before* you hit
+        record. Only runs in video mode with the mic on, so the microphone
+        is not live while you are taking photos.
+        """
+        if self._audio_mon or not (self.mic_available and self.mic_enabled):
+            return
+        try:
+            self._audio_mon = Gst.parse_launch(
+                "pulsesrc ! audioconvert ! level interval=100000000 ! "
+                "fakesink sync=false")
+            bus = self._audio_mon.get_bus()
+            bus.add_signal_watch()
+            self._audio_mon_handler = bus.connect("message::element", self._on_level)
+            self._audio_mon.set_state(Gst.State.PLAYING)
+        except Exception as e:
+            print(f"Lens: audio monitor failed: {e}", file=sys.stderr)
+            self._audio_mon = None
+
+    def _stop_audio_monitor(self):
+        if not self._audio_mon:
+            return
+        try:
+            bus = self._audio_mon.get_bus()
+            if self._audio_mon_handler:
+                bus.disconnect(self._audio_mon_handler)
+            bus.remove_signal_watch()
+            self._audio_mon.set_state(Gst.State.NULL)
+        except Exception:
+            pass
+        self._audio_mon = None
+        self._audio_mon_handler = None
+        self.audio_meter.set_db(None)
+
+    def _on_level(self, bus, msg):
+        st = msg.get_structure()
+        if not st or st.get_name() != "level":
+            return
+        try:
+            rms = st.get_value("rms")
+            self.audio_meter.set_db(max(rms) if rms else None)
+        except Exception:
+            pass
 
     def _refresh_mic_icon(self):
         if not self.mic_available:
@@ -1306,6 +1416,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.btn_mic.set_tooltip_text(tip)
         self.btn_mic.set_sensitive(self.mic_available)
         live = self.mic_available and self.mic_enabled
+        self.audio_meter.set_muted(not live)
         if live:
             self.btn_mic.remove_css_class("hud-btn-off")
         else:
@@ -1315,6 +1426,10 @@ class LensWindow(Adw.ApplicationWindow):
         if not self.mic_available or self.recording:
             return          # changing it mid-take would split the file
         self.mic_enabled = not self.mic_enabled
+        if self.mic_enabled and self.video_mode:
+            self._start_audio_monitor()
+        else:
+            self._stop_audio_monitor()
         self._refresh_mic_icon()
         self._save_settings()
 
