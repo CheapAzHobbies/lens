@@ -395,15 +395,11 @@ class LensWindow(Adw.ApplicationWindow):
         self.grid_widget = _GridOverlay()
         self.grid_widget.set_visible(False)
         self.frame_stack = Gtk.Overlay()
-        # An empty Box is the measured child, and the Picture rides along as
-        # an overlay. Overlay children are allocated the full area but are not
-        # measured, so the viewfinder's size stops depending on the camera's
-        # resolution. With the Picture as the measured child, swapping the
-        # feed from 1600x1200 to 1280x720 changed its natural size and the
-        # whole viewfinder re-measured mid-flip: that was the upward squish
-        # that snapped back once the new camera arrived.
-        self.frame_stack.set_child(Gtk.Box())
-        self.frame_stack.add_overlay(self.picture)
+        # The Picture is the measured child. Making it an unmeasured overlay
+        # instead (to stop it re-measuring on a feed swap) left the aspect
+        # frame with a zero-height child, which collapsed the viewfinder into
+        # a permanent band. Not worth it.
+        self.frame_stack.set_child(self.picture)
         self.frame_stack.add_overlay(self.grid_widget)
         self.frame_stack.add_css_class("viewflip")
         frame_stack = self.frame_stack
@@ -724,7 +720,7 @@ class LensWindow(Adw.ApplicationWindow):
            3D projection over a GStreamer paintable rendered as a squashed
            band with a triangular artifact. A plain 2D scaleX reads as the
            same turn and composites cleanly. */
-        .viewflip { transition: transform 200ms cubic-bezier(.45,0,.55,1); }
+        .viewflip { transition: transform 140ms cubic-bezier(.45,0,.55,1); }
         .viewflip.flipped { transform: scaleX(0.02); }
         .viewer-bg { background: rgba(0,0,0,0.95); }
         .flip:active    { transform: scale(0.9); }
@@ -749,15 +745,10 @@ class LensWindow(Adw.ApplicationWindow):
                 transition: background 140ms ease-out, transform 120ms ease-out; }
         .flip:hover { background: rgba(0,0,0,0.72); }
         .flip:disabled { opacity: 0.35; }
-        /* Horizontal flip, matching what the arrows on the glyph mean and
-           matching the viewfinder's own turn. Rotating it read as wrong,
-           because the arrows do not point around a circle. */
-        @keyframes flip-turn {
-            0%   { transform: scaleX(1); }
-            50%  { transform: scaleX(-1); }
-            100% { transform: scaleX(1); }
-        }
-        .flip-icon.spun { animation: flip-turn 460ms cubic-bezier(.45,0,.55,1); }
+        /* Mirrors horizontally and stays that way, so the icon shows which
+           camera you are on rather than just animating and resetting. */
+        .flip-icon { transition: transform 260ms cubic-bezier(.45,0,.55,1); }
+        .flip-icon.mirrored { transform: scaleX(-1); }
         .pill { background: rgba(0,0,0,0.5); border-radius: 21px; color: white;
                 font-weight: bold; font-size: 14px; padding: 4px 12px; border: none; }
         .pill-active { background: #62a0ea; color: white; }
@@ -939,25 +930,21 @@ class LensWindow(Adw.ApplicationWindow):
         if self.is_fullscreen(): self.unfullscreen()
         else: self.fullscreen()
 
-    FLIP_MS = 200
+    FLIP_MS = 140
 
     def _flip_camera(self):
         if len(self.cameras) < 2: return
         if self._flipping: return          # ignore taps during the turn
         self._flipping = True
-        # Retrigger the spin animation: drop the class, then re-add it on the
-        # next tick so the keyframes restart even on rapid presses.
-        self.flip_icon.remove_css_class("spun")
-        GLib.idle_add(self._spin_flip_icon)
+        # Toggle the mirror and leave it there until the next press.
+        if self.flip_icon.has_css_class("mirrored"):
+            self.flip_icon.remove_css_class("mirrored")
+        else:
+            self.flip_icon.add_css_class("mirrored")
 
         # Turn the viewfinder edge-on first, swap behind it, then turn back.
         self.frame_stack.add_css_class("flipped")
         GLib.timeout_add(self.FLIP_MS, self._flip_swap)
-
-    def _spin_flip_icon(self):
-        self.flip_icon.add_css_class("spun")
-        GLib.timeout_add(480, lambda: (self.flip_icon.remove_css_class("spun"), False)[1])
-        return False
 
     def _flip_swap(self):
         self.cam_idx = (self.cam_idx + 1) % len(self.cameras)
