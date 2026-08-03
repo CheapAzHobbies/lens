@@ -176,6 +176,18 @@ def best_still_mode(dev):
     return max(same or mjpg, key=lambda m: m[1] * m[2])
 
 
+def has_microphone():
+    """True if PipeWire/Pulse reports a real capture source."""
+    import subprocess
+    try:
+        out = subprocess.run(["pactl", "list", "short", "sources"],
+                             capture_output=True, text=True, timeout=2).stdout
+    except Exception:
+        return False
+    return any(l.strip() and "monitor" not in l.split("\t")[1]
+               for l in out.splitlines() if "\t" in l)
+
+
 def is_video(path):
     return str(path).lower().endswith(VIDEO_EXTS)
 
@@ -322,6 +334,11 @@ class LensWindow(Adw.ApplicationWindow):
         self.aspect_idx = cfg.get("aspect_idx", 0)
         if not 0 <= self.aspect_idx < len(self.aspects):
             self.aspect_idx = 0
+        self.mic_available = has_microphone()
+        self.mic_enabled = bool(cfg.get("mic_enabled", True))
+        self.mic_active = False
+        self._fps_count = 0
+        self._fps_shown = 0
         self.overlay_mode = int(cfg.get("overlay_mode", 0)) % 3
         self.grid_visible = self.overlay_mode == 1
         # How long each camera takes to deliver its first frame, keyed by
@@ -393,6 +410,11 @@ class LensWindow(Adw.ApplicationWindow):
         bus.add_signal_watch()
         bus.connect("message::error", self._on_bus_err)
 
+        # Count delivered frames so the HUD can show the rate actually being
+        # displayed, not the rate the caps asked for.
+        self._fps_count = 0
+        new_paintable.connect("invalidate-contents", self._on_frame)
+
         if defer_attach:
             # A gtk4paintablesink paintable has no content and zero intrinsic
             # size until its first frame lands, so attaching it early blanks
@@ -426,6 +448,9 @@ class LensWindow(Adw.ApplicationWindow):
                 on_ready(None)
 
         self.pipeline.set_state(Gst.State.PLAYING)
+
+    def _on_frame(self, *_):
+        self._fps_count += 1
 
     def _freeze_frame(self):
         """Render the live viewfinder into a still texture.
@@ -731,6 +756,19 @@ class LensWindow(Adw.ApplicationWindow):
         rec_row.append(self.rec_dot)
         rec_row.append(self.rec_state_label)
         rec_row.append(self.rec_time_label)
+
+        # Mic state sits with the recording state, since that is what it
+        # affects. Clickable, because being unable to mute from the
+        # viewfinder would be worse than not showing it at all.
+        self.btn_mic = Gtk.Button()
+        self.mic_icon = Gtk.Image.new_from_icon_name("audio-input-microphone-symbolic")
+        self.mic_icon.set_pixel_size(14)
+        self.btn_mic.set_child(self.mic_icon)
+        self.btn_mic.add_css_class("hud-btn")
+        self.btn_mic.set_valign(Gtk.Align.CENTER)
+        self.btn_mic.set_margin_start(10)
+        self.btn_mic.connect("clicked", lambda *_: self._toggle_mic())
+        rec_row.append(self.btn_mic)
         hud_top.append(rec_row)
 
         # Battery, right
@@ -750,15 +788,20 @@ class LensWindow(Adw.ApplicationWindow):
         spacer = Gtk.Box(); spacer.set_vexpand(True)
         hud.append(spacer)
 
-        hud_bot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        hud_bot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
         hud_bot.set_valign(Gtk.Align.END)
         self.hud_clock = Gtk.Label(label="")
         self.hud_clock.add_css_class("hud-mono")
         self.hud_clock.set_halign(Gtk.Align.START); self.hud_clock.set_hexpand(True)
-        self.hud_format = Gtk.Label(label="MKV  H.264  4Mb/s")
+        self.hud_fps = Gtk.Label(label="")
+        self.hud_fps.add_css_class("hud-mono")
+        self.hud_fps.set_halign(Gtk.Align.END)
+        self.hud_format = Gtk.Label(label="MKV  H.264")
         self.hud_format.add_css_class("hud-dim")
         self.hud_format.set_halign(Gtk.Align.END)
-        hud_bot.append(self.hud_clock); hud_bot.append(self.hud_format)
+        hud_bot.append(self.hud_clock)
+        hud_bot.append(self.hud_fps)
+        hud_bot.append(self.hud_format)
         hud.append(hud_bot)
 
         self.rec_indicator = hud
@@ -951,13 +994,20 @@ class LensWindow(Adw.ApplicationWindow):
                     font-weight: bold; letter-spacing: 2px;
                     text-shadow: 0 1px 3px rgba(0,0,0,0.9); }
         .hud-rec.standby { color: rgba(255,255,255,0.75); }
+        .hud-btn { background: transparent; border: none; padding: 2px 4px;
+                   min-width: 0; min-height: 0; color: white; }
+        .hud-btn:hover { background: rgba(255,255,255,0.18);
+                         border-radius: 6px; }
+        .hud-btn-off { color: rgba(255,255,255,0.35); }
         .thumb { background: rgba(255,255,255,0.2); border-radius: 8px;
                  border: 1px solid white; }
-        .flip { background: rgba(0,0,0,0.55); border-radius: 36px;
+        /* Was rgba(0,0,0,0.55), which is invisible on a black control bar:
+           the button was already 84px but only its 36px icon read, so it
+           looked tiny next to the preview it is supposed to mirror. */
+        .flip { background: rgba(255,255,255,0.10); border-radius: 48px;
                 color: white; border: none;
-                box-shadow: 0 2px 12px rgba(0,0,0,0.55);
                 transition: background 140ms ease-out, transform 120ms ease-out; }
-        .flip:hover { background: rgba(0,0,0,0.72); }
+        .flip:hover { background: rgba(255,255,255,0.20); }
         .flip:disabled { opacity: 0.35; }
         /* Mirrors horizontally and stays that way, so the icon shows which
            camera you are on rather than just animating and resetting. */
@@ -1089,13 +1139,17 @@ class LensWindow(Adw.ApplicationWindow):
         # rounded to 4-8px steps so a slow drag does not thrash. Snapping
         # between two fixed sizes was what made resizing look jumpy.
         shutter = max(52, min(84, int(w * 0.10) // 4 * 4))
-        flip = max(42, min(72, int(w * 0.085) // 4 * 4))
+        thumb = max(64, min(112, int(w * 0.13) // 8 * 8))
+        # Tie the flip button to the preview rather than to the window, since
+        # the two are mirrored: a 72px button opposite a 112px preview looked
+        # lopsided even with their centres lined up exactly.
+        flip = max(44, min(96, int(thumb * 0.78) // 4 * 4))
         self.shutter.set_size_request(shutter, shutter)
         self.btn_flip.set_size_request(flip, flip)
+        self.flip_icon.set_pixel_size(max(20, int(flip * 0.44)))
 
         if cls != "tiny":
             self.thumb.set_visible(True)
-            thumb = max(64, min(112, int(w * 0.13) // 8 * 8))
             deck_margin = 28 if cls == "roomy" else 14
             self.thumb.set_scale(thumb, thumb + 56, deck_margin)
             # Mirror the flip button about the preview: put its centre the
@@ -1126,6 +1180,8 @@ class LensWindow(Adw.ApplicationWindow):
 
         # HUD: hide by priority rather than shrink into illegibility.
         self.hud_format.set_visible(cls == "roomy")
+        self.hud_fps.set_visible(cls != "tiny")
+        self.btn_mic.set_visible(cls != "tiny")
         self.bat_left_label.set_visible(cls == "roomy")
         self.hud_clock.set_visible(cls != "tiny")
         self.bat_label.set_visible(cls != "tiny")
@@ -1160,6 +1216,7 @@ class LensWindow(Adw.ApplicationWindow):
             "aspect_idx":   self.aspect_idx,
             "grid_visible": self.grid_visible,
             "overlay_mode": getattr(self, "overlay_mode", 0),
+            "mic_enabled":  self.mic_enabled,
             "timer_sec":    self.timer_sec,
             "video_mode":   self.video_mode,
             "cam_id":       self.cameras[self.cam_idx][2],
@@ -1238,6 +1295,29 @@ class LensWindow(Adw.ApplicationWindow):
                 GLib.source_remove(self.hud_timer); self.hud_timer = None
         self._save_settings()
 
+    def _refresh_mic_icon(self):
+        if not self.mic_available:
+            name, tip = "microphone-disabled-symbolic", "No microphone found"
+        elif self.mic_enabled:
+            name, tip = "audio-input-microphone-symbolic", "Microphone on"
+        else:
+            name, tip = "microphone-disabled-symbolic", "Microphone muted"
+        self.mic_icon.set_from_icon_name(name)
+        self.btn_mic.set_tooltip_text(tip)
+        self.btn_mic.set_sensitive(self.mic_available)
+        live = self.mic_available and self.mic_enabled
+        if live:
+            self.btn_mic.remove_css_class("hud-btn-off")
+        else:
+            self.btn_mic.add_css_class("hud-btn-off")
+
+    def _toggle_mic(self):
+        if not self.mic_available or self.recording:
+            return          # changing it mid-take would split the file
+        self.mic_enabled = not self.mic_enabled
+        self._refresh_mic_icon()
+        self._save_settings()
+
     def _hud_standby(self):
         self.rec_state_label.set_label("STBY")
         self.rec_state_label.add_css_class("standby")
@@ -1253,6 +1333,17 @@ class LensWindow(Adw.ApplicationWindow):
 
         self.hud_clock.set_label(
             datetime.datetime.now().strftime("%Y-%m-%d  %H:%M:%S"))
+
+        # Frames actually delivered in the last second, which is the real
+        # rate: negotiated caps say 30 but a busy machine may not hit it.
+        self._fps_shown = self._fps_count
+        self._fps_count = 0
+        self.hud_fps.set_label(f"{self._fps_shown:g} FPS" if self._fps_shown else "")
+        self._refresh_mic_icon()
+
+        self.hud_format.set_label(
+            "MKV  H.264  OPUS" if (self.mic_available and self.mic_enabled)
+            else "MKV  H.264  MUTE")
 
         pct, status, energy, watts = read_battery()
         charging = status.lower().startswith("charg")
@@ -1621,11 +1712,18 @@ class LensWindow(Adw.ApplicationWindow):
         # Rebuild pipeline for recording
         self.pipeline.set_state(Gst.State.NULL)
         dev = self.cameras[self.cam_idx][0]
+        # Clips were silent: there was no audio branch at all. Opus into the
+        # same matroska container, dropped if there is no capture source so a
+        # machine without a mic still records video.
+        self.mic_active = self.mic_available and self.mic_enabled
+        audio = (" pulsesrc ! audioconvert ! audioresample ! "
+                 "opusenc ! mux. ") if self.mic_active else ""
         self.pipeline = Gst.parse_launch(
             f"{self._source_for(dev)} ! tee name=t "
             f"t. ! queue ! videoconvert ! gtk4paintablesink name=sink "
-            f"t. ! queue ! videoconvert ! x264enc tune=zerolatency bitrate=4000 ! "
-            f"matroskamux ! filesink location={path}"
+            f"t. ! queue ! videoconvert ! x264enc tune=zerolatency bitrate=4000 ! mux. "
+            f"{audio}"
+            f"matroskamux name=mux ! filesink location={path}"
         )
         sink = self.pipeline.get_by_name("sink")
         self.paintable = sink.props.paintable
