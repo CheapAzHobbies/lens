@@ -4,7 +4,7 @@ Lens — a fast, mobile-first camera app for Linux tablets.
 GTK4 + libadwaita + GStreamer.
 """
 
-import gi, os, sys, math, datetime, pathlib
+import gi, os, sys, math, json, datetime, pathlib
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Gst", "1.0")
@@ -15,6 +15,9 @@ from gi.repository import Gtk, Adw, Gst, GLib, Gdk, Gio, GObject, GdkPixbuf
 Gst.init(None)
 
 APP_ID = "org.cheapaz.Lens"
+CONFIG_DIR = pathlib.Path(
+    os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / "lens"
+SETTINGS = CONFIG_DIR / "settings.json"
 PICTURES = pathlib.Path.home() / "Pictures" / "Lens"
 VIDEOS   = pathlib.Path.home() / "Videos"  / "Lens"
 PICTURES.mkdir(parents=True, exist_ok=True)
@@ -56,8 +59,27 @@ def list_v4l2_cameras():
     return devs
 
 
+def load_settings():
+    try:
+        return json.loads(SETTINGS.read_text())
+    except Exception:
+        return {}
+
+
+def save_settings(data):
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        SETTINGS.write_text(json.dumps(data, indent=2))
+    except Exception as e:
+        print(f"Lens: could not save settings: {e}", file=sys.stderr)
+
+
 def read_battery():
-    """(percent, status, seconds_left) from sysfs, any field may be None."""
+    """(percent, status, energy_uWh, power_uW) from sysfs.
+
+    Power is returned rather than a runtime so the caller can average it;
+    a single instantaneous reading swings wildly. Any field may be None.
+    """
     base = pathlib.Path("/sys/class/power_supply")
     for name in ("BAT0", "BAT1", "BATT"):
         d = base / name
@@ -78,19 +100,19 @@ def read_battery():
         # energy_*/power_* on most laptops, charge_*/current_* on some.
         energy = rd("energy_now") or rd("charge_now")
         power = rd("power_now") or rd("current_now")
-        secs = None
+        watts = None
         if energy and power and power > 0:
             # Units are not reliable here. This machine reports energy_now in
             # uWh but power_now in mW, so reading both as uW gives a runtime
             # of 618 hours. Try each interpretation and keep the one that is
             # physically believable.
             for scale in (1, 1000):
-                cand = int(energy / (power * scale) * 3600)
+                cand = energy / (power * scale) * 3600
                 if 300 <= cand <= 24 * 3600:
-                    secs = cand
+                    watts = power * scale
                     break
-        return pct, status, secs
-    return None, "", None
+        return pct, status, energy, watts
+    return None, "", None, None
 
 
 class BatteryGauge(Gtk.DrawingArea):
@@ -142,19 +164,31 @@ class LensWindow(Adw.ApplicationWindow):
         self.pipeline = None
         self.paintable = None
         self.cameras = list_v4l2_cameras() or [("/dev/video0", "Camera")]
-        self.cam_idx = 0
         print(f"Lens: detected {len(self.cameras)} camera(s):")
         for c in self.cameras: print(f"   {c}")
-        self.video_mode = False
         self.recording = False
-        self.grid_visible = False
-        self.timer_sec = 0
-        self.aspect_idx = 0  # 0=4:3, 1=16:9, 2=1:1
         self.aspects = ["4:3", "16:9", "1:1"]
+
+        # Restore what was set last time. Loaded before the pipeline starts,
+        # since cam_idx decides which device it opens.
+        cfg = load_settings()
+        self.aspect_idx = cfg.get("aspect_idx", 0)
+        if not 0 <= self.aspect_idx < len(self.aspects):
+            self.aspect_idx = 0
+        self.grid_visible = bool(cfg.get("grid_visible", False))
+        self.timer_sec = cfg.get("timer_sec", 0)
+        if self.timer_sec not in (0, 3, 10):
+            self.timer_sec = 0
+        self.video_mode = bool(cfg.get("video_mode", False))
+        # Cameras can come and go between runs, so never trust the old index.
+        self.cam_idx = cfg.get("cam_idx", 0)
+        if not 0 <= self.cam_idx < len(self.cameras):
+            self.cam_idx = 0
         self.last_photo = None
         self.countdown_val = 0
 
         self._build_ui()
+        self._apply_settings()
         self._start_pipeline()
 
     # ---------- pipeline ----------
@@ -193,8 +227,19 @@ class LensWindow(Adw.ApplicationWindow):
 
     # ---------- UI ----------
     def _build_ui(self):
+        # Root overlay only carries things that must cover the whole window
+        # (capture flash, full-screen viewer). Everything else lives in a
+        # vertical split so the controls sit below the picture rather than on
+        # top of it.
+        root = Gtk.Overlay()
+        self.set_content(root)
+        column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root.set_child(column)
+
+        # The viewfinder and the things that genuinely belong over the image.
         overlay = Gtk.Overlay()
-        self.set_content(overlay)
+        overlay.set_vexpand(True); overlay.set_hexpand(True)
+        column.append(overlay)
 
         # Black background + viewfinder
         bg = Gtk.Box()
@@ -209,8 +254,17 @@ class LensWindow(Adw.ApplicationWindow):
         self.picture.set_content_fit(Gtk.ContentFit.COVER)  # fill + crop
         self.picture.set_hexpand(True); self.picture.set_vexpand(True)
 
+        # Grid lives inside the aspect frame, over the picture only. On the
+        # window overlay it drew across the letterbox bars too, where a
+        # rule-of-thirds guide means nothing.
+        self.grid_widget = _GridOverlay()
+        self.grid_widget.set_visible(False)
+        frame_stack = Gtk.Overlay()
+        frame_stack.set_child(self.picture)
+        frame_stack.add_overlay(self.grid_widget)
+
         self.aspect_frame = Gtk.AspectFrame.new(0.5, 0.5, 4/3, False)
-        self.aspect_frame.set_child(self.picture)
+        self.aspect_frame.set_child(frame_stack)
         self.aspect_frame.set_hexpand(True); self.aspect_frame.set_vexpand(True)
         bg.append(self.aspect_frame)
 
@@ -246,7 +300,7 @@ class LensWindow(Adw.ApplicationWindow):
         bottom.set_valign(Gtk.Align.END)
         bottom.add_css_class("bottom-bar")
         # Natural min via child widgets, don't force size — lets window shrink freely
-        overlay.add_overlay(bottom)
+        column.append(bottom)
 
         # Mode pill
         mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
@@ -291,7 +345,10 @@ class LensWindow(Adw.ApplicationWindow):
             on_card_click=self._open_photo_viewer,
         )
         act_area.add_overlay(self.thumb)
+        self._deck_refresh_id = None
+        self._pic_monitor = None
         self._refresh_deck()
+        self._watch_pictures()
 
         # Flip camera — anchored RIGHT, mirroring the deck on the left.
         # The deck's visible card sits at margin(28) + card centre(56) +
@@ -327,12 +384,12 @@ class LensWindow(Adw.ApplicationWindow):
         self.flash_overlay.add_css_class("flash")
         self.flash_overlay.set_visible(False)
         self.flash_overlay.set_can_target(False)
-        overlay.add_overlay(self.flash_overlay)
+        root.add_overlay(self.flash_overlay)
 
         # ---- Camcorder HUD (video mode) ----
         # Sits over the viewfinder between the top pills and the bottom bar.
         hud = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        hud.set_margin_top(62); hud.set_margin_bottom(232)
+        hud.set_margin_top(62); hud.set_margin_bottom(18)
         hud.set_margin_start(22); hud.set_margin_end(22)
         hud.set_can_target(False)
 
@@ -388,11 +445,9 @@ class LensWindow(Adw.ApplicationWindow):
         self.rec_indicator.set_visible(False)
         overlay.add_overlay(self.rec_indicator)
         self.hud_timer = None
+        self._power_samples = []
 
         # Grid overlay (rule of thirds)
-        self.grid_widget = _GridOverlay()
-        self.grid_widget.set_visible(False)
-        overlay.add_overlay(self.grid_widget)
 
         # Full-screen photo viewer (last overlay so it sits on top of everything)
         self.viewer = Gtk.Overlay()
@@ -419,13 +474,13 @@ class LensWindow(Adw.ApplicationWindow):
         viewer_click = Gtk.GestureClick()
         viewer_click.connect("released", lambda *_: self._close_photo_viewer())
         viewer_bg.add_controller(viewer_click)
-        overlay.add_overlay(self.viewer)
+        root.add_overlay(self.viewer)
 
         # CSS
         css = Gtk.CssProvider()
         css.load_from_string("""
         .bg-black { background: black; }
-        .bottom-bar { background: rgba(0,0,0,0.8); }
+        .bottom-bar { background: #000; }
         .mode-pill { background: rgba(255,255,255,0.15); border-radius: 16px; padding: 2px; }
         .mode-btn { background: transparent; color: white; font-weight: bold;
                     font-size: 12px; padding: 4px 24px; border-radius: 14px;
@@ -587,11 +642,42 @@ class LensWindow(Adw.ApplicationWindow):
         return b
 
     # ---------- Actions ----------
+    def _apply_settings(self):
+        """Push the restored settings into the widgets, without animating."""
+        ratio = {"4:3": 4 / 3, "16:9": 16 / 9, "1:1": 1.0}[self.aspects[self.aspect_idx]]
+        self.aspect_frame.set_ratio(ratio)
+        self.btn_aspect.set_label(self.aspects[self.aspect_idx])
+
+        self.grid_widget.set_visible(self.grid_visible)
+        if self.grid_visible:
+            self.btn_grid.add_css_class("pill-active")
+
+        if self.timer_sec > 0:
+            self.btn_timer.set_label(f"{self.timer_sec}s")
+            self.btn_timer.add_css_class("pill-active")
+
+        # _set_video_mode does the HUD and shutter work, so route through it
+        # rather than duplicating. It early-returns while recording, which
+        # cannot be the case at startup.
+        want_video = self.video_mode
+        self.video_mode = False
+        self._set_video_mode(want_video)
+
+    def _save_settings(self):
+        save_settings({
+            "aspect_idx":   self.aspect_idx,
+            "grid_visible": self.grid_visible,
+            "timer_sec":    self.timer_sec,
+            "video_mode":   self.video_mode,
+            "cam_idx":      self.cam_idx,
+        })
+
     def _toggle_grid(self):
         self.grid_visible = not self.grid_visible
         self.grid_widget.set_visible(self.grid_visible)
         if self.grid_visible: self.btn_grid.add_css_class("pill-active")
         else: self.btn_grid.remove_css_class("pill-active")
+        self._save_settings()
 
     def _toggle_aspect(self):
         old = self.aspect_frame.get_ratio()
@@ -606,6 +692,7 @@ class LensWindow(Adw.ApplicationWindow):
         anim = Adw.TimedAnimation.new(self.aspect_frame, old, new, 380, target)
         anim.set_easing(Adw.Easing.EASE_OUT_CUBIC)
         anim.play()
+        self._save_settings()
 
     def _toggle_timer(self):
         seq = [0, 3, 10]
@@ -617,6 +704,7 @@ class LensWindow(Adw.ApplicationWindow):
         else:
             self.btn_timer.set_label("⏱")
             self.btn_timer.remove_css_class("pill-active")
+        self._save_settings()
 
     def _set_video_mode(self, video):
         if self.recording: return
@@ -637,6 +725,7 @@ class LensWindow(Adw.ApplicationWindow):
             self.rec_indicator.set_visible(False)
             if self.hud_timer:
                 GLib.source_remove(self.hud_timer); self.hud_timer = None
+        self._save_settings()
 
     def _hud_standby(self):
         self.rec_state_label.set_label("STBY")
@@ -654,8 +743,20 @@ class LensWindow(Adw.ApplicationWindow):
         self.hud_clock.set_label(
             datetime.datetime.now().strftime("%Y-%m-%d  %H:%M:%S"))
 
-        pct, status, secs = read_battery()
+        pct, status, energy, watts = read_battery()
         charging = status.lower().startswith("charg")
+
+        # power_now is instantaneous and jumps around, which made the estimate
+        # swing between 2:35 and 0:37 between ticks. Average the last 30
+        # samples so the number is steady enough to act on.
+        if watts:
+            self._power_samples.append(watts)
+            del self._power_samples[:-30]
+        secs = None
+        if energy and self._power_samples:
+            avg = sum(self._power_samples) / len(self._power_samples)
+            if avg > 0:
+                secs = int(energy / avg * 3600)
         if pct is None:
             self.bat_label.set_label("--%")
             self.bat_left_label.set_label("")
@@ -687,6 +788,7 @@ class LensWindow(Adw.ApplicationWindow):
         else:
             self.flip_icon.remove_css_class("spun")
         self.cam_idx = (self.cam_idx + 1) % len(self.cameras)
+        self._save_settings()
         print(f"Lens: switching to camera {self.cam_idx}: {self.cameras[self.cam_idx]}")
         # Detach paintable before tearing down pipeline
         self.picture.set_paintable(None)
@@ -850,9 +952,42 @@ class LensWindow(Adw.ApplicationWindow):
         self.viewer.set_visible(False)
 
     def _refresh_deck(self):
-        """Feed the last N photos on disk into the thumbnail deck."""
-        jpgs = sorted(PICTURES.glob("*.jpg"), key=lambda p: p.stat().st_mtime)
-        self.thumb.update_photos(jpgs)
+        """Feed the newest photos on disk into the deck.
+
+        Re-reads the directory every time rather than tracking additions, so
+        deleting a photo promotes the next newest one instead of leaving a
+        stale card behind.
+        """
+        items = []
+        for f in PICTURES.glob("*.jpg"):
+            try:
+                items.append((f.stat().st_mtime, f))
+            except OSError:
+                continue          # deleted between the glob and the stat
+        items.sort(key=lambda t: t[0])
+        self.thumb.update_photos([f for _, f in items])
+
+    def _watch_pictures(self):
+        """Rebuild the deck when the photo folder changes underneath us, so
+        deleting from Files updates the previews without a restart."""
+        try:
+            gfile = Gio.File.new_for_path(str(PICTURES))
+            self._pic_monitor = gfile.monitor_directory(
+                Gio.FileMonitorFlags.NONE, None)
+            self._pic_monitor.connect("changed", self._on_pictures_changed)
+        except Exception as e:
+            print(f"Lens: cannot watch {PICTURES}: {e}", file=sys.stderr)
+
+    def _on_pictures_changed(self, monitor, gfile, other, event):
+        # A single save emits several events, so coalesce into one rebuild.
+        if self._deck_refresh_id:
+            GLib.source_remove(self._deck_refresh_id)
+        self._deck_refresh_id = GLib.timeout_add(300, self._deck_refresh_now)
+
+    def _deck_refresh_now(self):
+        self._deck_refresh_id = None
+        self._refresh_deck()
+        return False
 
 
 class ThumbnailDeck(Gtk.Overlay):
@@ -892,6 +1027,7 @@ class ThumbnailDeck(Gtk.Overlay):
         self.on_click = on_click
         self.on_card_click = on_card_click
         self.card_paths = []
+        self._pending_photos = None
         self.cards = []        # bottom-to-top order
         self.hover_delay_id = None
         self.cycle_id = None
@@ -952,12 +1088,21 @@ class ThumbnailDeck(Gtk.Overlay):
 
     def update_photos(self, paths):
         """Rebuild the deck from these paths (oldest → newest at top)."""
+        latest = list(paths)[-self.DECK_SIZE:]
+        new_paths = [str(p) for p in latest]
+        if new_paths == self.card_paths and self.cards:
+            return                      # nothing actually changed
+        if self.expanded:
+            # Rebuilding now would destroy the cards under the finger. Hold
+            # it until the fan closes.
+            self._pending_photos = list(paths)
+            return
+        self._pending_photos = None
         # Clear existing
         while self.cards:
             self.remove_overlay(self.cards.pop())
         self.set_child(None)
-        latest = list(paths)[-self.DECK_SIZE:]
-        self.card_paths = [str(p) for p in latest]
+        self.card_paths = new_paths
         if not latest:
             self.set_child(self.placeholder); return
         for i, p in enumerate(latest):
@@ -1145,6 +1290,10 @@ class ThumbnailDeck(Gtk.Overlay):
             if c.has_css_class("pulled"): c.remove_css_class("pulled")
         self._focused_card = None
         self._refresh_transforms()
+        # Apply any photo-list change that arrived while the fan was open.
+        if self._pending_photos is not None:
+            pending, self._pending_photos = self._pending_photos, None
+            GLib.idle_add(lambda: (self.update_photos(pending), False)[1])
 
     def _on_enter(self):
         """Hovering for a moment opens the deck a little. Touch has no hover,
