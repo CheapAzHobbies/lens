@@ -335,6 +335,8 @@ class LensWindow(Adw.ApplicationWindow):
                         border: 3px solid white; }
         /* Full-screen photo viewer */
         .viewer-bg { background: rgba(0,0,0,0.95); }
+        /* Blur flair applied briefly during aspect-ratio transition */
+        .aspect-blur { filter: blur(6px); transition: filter 200ms ease-out; }
         .flip:active    { transform: scale(0.9); }
         .pill:active    { transform: scale(0.9); }
         .rec-shutter { background: red; border-radius: 8px;
@@ -392,10 +394,21 @@ class LensWindow(Adw.ApplicationWindow):
         else: self.btn_grid.remove_css_class("pill-active")
 
     def _toggle_aspect(self):
+        old = self.aspect_frame.get_ratio()
         self.aspect_idx = (self.aspect_idx + 1) % len(self.aspects)
         self.btn_aspect.set_label(self.aspects[self.aspect_idx])
-        ratio = {"4:3": 4/3, "16:9": 16/9, "1:1": 1.0}[self.aspects[self.aspect_idx]]
-        self.aspect_frame.set_ratio(ratio)
+        new = {"4:3": 4/3, "16:9": 16/9, "1:1": 1.0}[self.aspects[self.aspect_idx]]
+
+        # Smooth ratio interpolation + brief blur flair
+        self.aspect_frame.add_css_class("aspect-blur")
+        target = Adw.CallbackAnimationTarget.new(
+            lambda v: self.aspect_frame.set_ratio(v))
+        anim = Adw.TimedAnimation.new(self.aspect_frame, old, new, 380, target)
+        anim.set_easing(Adw.Easing.EASE_OUT_CUBIC)
+        def _done(_a, _b):
+            self.aspect_frame.remove_css_class("aspect-blur")
+        anim.connect("done", _done)
+        anim.play()
 
     def _toggle_timer(self):
         seq = [0, 3, 10]
