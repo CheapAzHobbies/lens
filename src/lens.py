@@ -737,10 +737,10 @@ class ThumbnailDeck(Gtk.Overlay):
                 c.remove_css_class("card-focused")
         target.add_css_class("card-focused")
         self._focused_card = target
-        # Raise the focused card to the top of the overlay z-order so it
-        # visibly comes forward over the other cards.
-        self.remove_overlay(target)
-        self.add_overlay(target)
+        # NOTE: don't reparent (remove/add_overlay) — that resets the CSS
+        # transition state and makes the card teleport up instead of
+        # animating. The 190px translate + 1.7x scale already lifts the
+        # card visually above the fan, even without z-order changes.
 
     # ---- new press/hold interaction ----
     HOLD_MS   = 220   # ms to hold before fan-out starts
