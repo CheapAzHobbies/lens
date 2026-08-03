@@ -683,7 +683,20 @@ class LensWindow(Adw.ApplicationWindow):
         # fullscreen right.
         self.btn_grid   = self._pill_button("#",   self._toggle_grid,   width=42, tint=False)
         self.btn_aspect = self._pill_button(self.aspects[0], self._toggle_aspect, width=58, tint=False)
-        self.btn_timer  = self._pill_button("⏱",  self._toggle_timer,  width=58, tint=False)
+        # A real icon, not the "⏱" glyph: that rendered tiny and was barely
+        # visible at any size.
+        self.btn_timer = Gtk.Button()
+        self.timer_icon = Gtk.Image.new_from_icon_name("stopwatch-symbolic")
+        self.timer_icon.set_pixel_size(20)
+        self.timer_label = Gtk.Label(label="")
+        self.timer_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.timer_box.set_halign(Gtk.Align.CENTER)
+        self.timer_box.append(self.timer_icon)
+        self.timer_box.append(self.timer_label)
+        self.btn_timer.set_child(self.timer_box)
+        self.btn_timer.set_size_request(58, 42)
+        self.btn_timer.add_css_class("pill")
+        self.btn_timer.connect("clicked", lambda *_: self._toggle_timer())
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         top.append(self.btn_grid); top.append(self.btn_aspect); top.append(self.btn_timer)
 
@@ -919,7 +932,7 @@ class LensWindow(Adw.ApplicationWindow):
         audio_row.set_valign(Gtk.Align.CENTER)
         self.btn_mic = Gtk.Button()
         self.mic_icon = Gtk.Image.new_from_icon_name("audio-input-microphone-symbolic")
-        self.mic_icon.set_pixel_size(14)
+        self.mic_icon.set_pixel_size(16)
         self.btn_mic.set_child(self.mic_icon)
         self.btn_mic.add_css_class("hud-btn")
         self.btn_mic.set_valign(Gtk.Align.CENTER)
@@ -1172,8 +1185,12 @@ class LensWindow(Adw.ApplicationWindow):
         .hud-btn:hover { background: rgba(255,255,255,0.18);
                          border-radius: 6px; }
         .hud-btn-off { color: rgba(255,255,255,0.35); }
-        .hud-btn-muted { color: #ff3b30; }
-        .hud-btn-muted:hover { background: rgba(255,59,48,0.22); }
+        /* Filled, not outlined. A red line-art glyph over a bright picture
+           was almost invisible, which defeats the point of warning that the
+           take will be silent. */
+        .hud-btn-muted { background: #e01b24; color: #fff;
+                         border-radius: 7px; padding: 3px 6px; }
+        .hud-btn-muted:hover { background: #f0323b; }
         .thumb { background: rgba(255,255,255,0.2); border-radius: 8px;
                  border: 1px solid white; }
         /* Was rgba(0,0,0,0.55), which is invisible on a black control bar:
@@ -1208,6 +1225,10 @@ class LensWindow(Adw.ApplicationWindow):
         .cam-row-active { color: #62a0ea; }
         .pill-active { background: #62a0ea; color: white; }
         .pill-off { color: rgba(255,255,255,0.35); }
+        /* Off, not broken: dim enough to read as inactive but still
+           legible, unlike the old 35% which vanished. */
+        .pill-dim { color: rgba(255,255,255,0.5);
+                    background: rgba(255,255,255,0.06); }
         .countdown { color: white; font-size: 96px; font-weight: bold;
                      background: rgba(0,0,0,0.5); padding: 30px 50px; border-radius: 60px; }
         .flash { background: black; }
@@ -1366,9 +1387,7 @@ class LensWindow(Adw.ApplicationWindow):
 
         self._apply_overlay_mode()
 
-        if self.timer_sec > 0:
-            self.btn_timer.set_label(f"{self.timer_sec}s")
-            self.btn_timer.add_css_class("pill-active")
+        self._refresh_timer_button()
 
         # _set_video_mode does the HUD and shutter work, so route through it
         # rather than duplicating. It early-returns while recording, which
@@ -1444,13 +1463,21 @@ class LensWindow(Adw.ApplicationWindow):
         seq = [0, 3, 10]
         cur = seq.index(self.timer_sec) if self.timer_sec in seq else 0
         self.timer_sec = seq[(cur + 1) % len(seq)]
-        if self.timer_sec > 0:
-            self.btn_timer.set_label(f"{self.timer_sec}s")
-            self.btn_timer.add_css_class("pill-active")
-        else:
-            self.btn_timer.set_label("⏱")
-            self.btn_timer.remove_css_class("pill-active")
+        self._refresh_timer_button()
         self._save_settings()
+
+    def _refresh_timer_button(self):
+        on = self.timer_sec > 0
+        self.timer_label.set_label(f"{self.timer_sec}s" if on else "")
+        self.timer_label.set_visible(on)
+        self.btn_timer.set_tooltip_text(
+            f"Self-timer {self.timer_sec}s" if on else "Self-timer off")
+        if on:
+            self.btn_timer.add_css_class("pill-active")
+            self.btn_timer.remove_css_class("pill-dim")
+        else:
+            self.btn_timer.remove_css_class("pill-active")
+            self.btn_timer.add_css_class("pill-dim")
 
     def _set_video_mode(self, video):
         if self.recording: return
@@ -1668,15 +1695,18 @@ class LensWindow(Adw.ApplicationWindow):
         if not self.mic_available:
             # Nothing to record from: state the fact, quietly.
             self.mic_icon.set_from_icon_name("microphone-disabled-symbolic")
+            self.mic_icon.set_pixel_size(16)
             self.btn_mic.set_tooltip_text("No microphone found")
             self.btn_mic.add_css_class("hud-btn-off")
         elif self.mic_enabled:
             self.mic_icon.set_from_icon_name("audio-input-microphone-symbolic")
+            self.mic_icon.set_pixel_size(16)
             self.btn_mic.set_tooltip_text("Microphone on, click to mute")
         else:
             # Muted is a warning, not a disabled state: you are about to
             # record something silent. Grey made it nearly invisible.
             self.mic_icon.set_from_icon_name("microphone-disabled-symbolic")
+            self.mic_icon.set_pixel_size(19)
             self.btn_mic.set_tooltip_text("Microphone MUTED, click to unmute")
             self.btn_mic.add_css_class("hud-btn-muted")
         self.btn_mic.set_sensitive(self.mic_available)
@@ -2329,6 +2359,7 @@ class ThumbnailDeck(Gtk.Overlay):
         press.set_button(1)   # left mouse
         press.connect("pressed",  self._on_press)
         press.connect("released", self._on_release)
+        press.connect("cancel",   self._abort_hold)
         self.add_controller(press)
 
         # Touch scrubbing goes through a drag gesture, not the motion
@@ -2340,6 +2371,12 @@ class ThumbnailDeck(Gtk.Overlay):
         drag.connect("drag-begin",  self._on_drag_begin)
         drag.connect("drag-update", self._on_drag_update)
         drag.connect("drag-end",    self._on_drag_end)
+        # A drag does not always finish with drag-end. Releasing away from
+        # the cards, or the sequence being taken over, ends it via cancel or
+        # end instead, and without these the fan stayed open until the
+        # pointer wandered back over the deck.
+        drag.connect("cancel", self._abort_hold)
+        drag.connect("end",    self._abort_hold)
         self.add_controller(drag)
         self._drag_start = (0.0, 0.0)
 
@@ -2556,6 +2593,19 @@ class ThumbnailDeck(Gtk.Overlay):
             return
         # Otherwise we were in hold/fan mode — open the focused card
         self._finish_hold()
+
+    def _abort_hold(self, *_):
+        """End a hold without opening anything, and always close the fan."""
+        if self._hold_timer:
+            GLib.source_remove(self._hold_timer)
+            self._hold_timer = None
+        if not self._press_is_hold:
+            # Still collapse if the fan is somehow open with nothing held.
+            if self.expanded:
+                self._collapse()
+            return
+        self._press_is_hold = False
+        self._collapse()
 
     def _finish_hold(self):
         """End a hold-and-scrub: open whatever card is focused, then close
