@@ -63,19 +63,20 @@ def list_v4l2_cameras():
     return devs
 
 
-def best_mode(dev):
-    """Pick a sane capture mode for a device: (fourcc, w, h, fps) or None.
+_MODE_CACHE = {}
 
-    Without a caps filter GStreamer takes whatever v4l2src offers first,
-    which on the Z13 rear camera is YUYV 2592x1944 at *2 fps*. That is the
-    "laggy rear camera". The same sensor does MJPG 1600x1200 at 30.
-    """
+
+def _enumerate_modes(dev):
+    """[(fourcc, w, h, fps)] the device advertises. Cached: shelling out to
+    v4l2-ctl on every shutter press would be silly."""
+    if dev in _MODE_CACHE:
+        return _MODE_CACHE[dev]
     import subprocess, re
     try:
         out = subprocess.run(["v4l2-ctl", "-d", dev, "--list-formats-ext"],
                              capture_output=True, text=True, timeout=3).stdout
     except Exception:
-        return None
+        return []
     fmt = size = None
     modes = []
     for line in out.splitlines():
@@ -88,6 +89,18 @@ def best_mode(dev):
         m = re.search(r"\(([\d.]+) fps\)", line)
         if m and fmt and size:
             modes.append((fmt, size[0], size[1], float(m.group(1))))
+    _MODE_CACHE[dev] = modes
+    return modes
+
+
+def best_mode(dev):
+    """Pick a sane capture mode for a device: (fourcc, w, h, fps) or None.
+
+    Without a caps filter GStreamer takes whatever v4l2src offers first,
+    which on the Z13 rear camera is YUYV 2592x1944 at *2 fps*. That is the
+    "laggy rear camera". The same sensor does MJPG 1600x1200 at 30.
+    """
+    modes = _enumerate_modes(dev)
     if not modes:
         return None
     # Smooth first, then detail. Cap the pixel count so decode stays cheap;
@@ -107,6 +120,24 @@ def best_mode(dev):
     if same:
         pool = same
     return max(pool, key=lambda m: (m[1] * m[2], m[3]))
+
+
+def best_still_mode(dev):
+    """Largest MJPG mode on a device, ignoring framerate.
+
+    Stills come off the preview stream, so they were only ever as large as
+    the preview: 1600x1200 on the rear camera and 640x480 on the front. The
+    rear sensor actually does 3264x2448, so it is worth briefly retuning the
+    camera for the shot.
+    """
+    modes = _enumerate_modes(dev)
+    mjpg = [m for m in modes if m[0] == "MJPG"]
+    if not mjpg:
+        return None
+    biggest = max(modes, key=lambda m: m[1] * m[2])
+    native = biggest[1] / biggest[2]
+    same = [m for m in mjpg if abs(m[1] / m[2] - native) < 0.02]
+    return max(same or mjpg, key=lambda m: m[1] * m[2])
 
 
 def is_video(path):
@@ -272,12 +303,14 @@ class LensWindow(Adw.ApplicationWindow):
         self._start_pipeline()
 
     # ---------- pipeline ----------
-    def _start_pipeline(self):
-        if self.pipeline:
+    def _start_pipeline(self, keep_old=False):
+        old_pipeline = self.pipeline
+        if self.pipeline and not keep_old:
             self.pipeline.set_state(Gst.State.NULL)
             self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
             self.pipeline = None
             self.paintable = None
+            old_pipeline = None
 
         dev = self.cameras[self.cam_idx][0]
         src = self._source_for(dev)
@@ -301,6 +334,12 @@ class LensWindow(Adw.ApplicationWindow):
         bus.add_signal_watch()
         bus.connect("message::error", self._on_bus_err)
         self.pipeline.set_state(Gst.State.PLAYING)
+        if old_pipeline is not None:
+            # Only now that the replacement is running and its paintable is
+            # attached. Tearing the old one down first left the Picture with
+            # no content, which collapsed the layout into the grey band and
+            # black gap seen during a flip.
+            old_pipeline.set_state(Gst.State.NULL)
 
     def _source_for(self, dev):
         """v4l2src plus the caps needed to actually get a usable framerate."""
@@ -702,14 +741,15 @@ class LensWindow(Adw.ApplicationWindow):
                 transition: background 140ms ease-out, transform 120ms ease-out; }
         .flip:hover { background: rgba(0,0,0,0.72); }
         .flip:disabled { opacity: 0.35; }
-        /* Full turn, not a half one: rotate(180deg) left the camera glyph
-           resting upside down. A keyframe animation returns it to 0 on its
-           own, so there is no state to keep track of. */
-        @keyframes flip-spin {
-            from { transform: rotate(0deg); }
-            to   { transform: rotate(360deg); }
+        /* Horizontal flip, matching what the arrows on the glyph mean and
+           matching the viewfinder's own turn. Rotating it read as wrong,
+           because the arrows do not point around a circle. */
+        @keyframes flip-turn {
+            0%   { transform: scaleX(1); }
+            50%  { transform: scaleX(-1); }
+            100% { transform: scaleX(1); }
         }
-        .flip-icon.spun { animation: flip-spin 450ms cubic-bezier(.2,.7,.3,1); }
+        .flip-icon.spun { animation: flip-turn 460ms cubic-bezier(.45,0,.55,1); }
         .pill { background: rgba(0,0,0,0.5); border-radius: 21px; color: white;
                 font-weight: bold; font-size: 14px; padding: 4px 12px; border: none; }
         .pill-active { background: #62a0ea; color: white; }
@@ -915,12 +955,12 @@ class LensWindow(Adw.ApplicationWindow):
         self.cam_idx = (self.cam_idx + 1) % len(self.cameras)
         self._save_settings()
         print(f"Lens: switching to camera {self.cam_idx}: {self.cameras[self.cam_idx]}")
-        # Detach paintable before tearing down pipeline
-        self.picture.set_paintable(None)
-        self._start_pipeline()
-        # Give the new pipeline a moment to push a frame, so the viewfinder
-        # is not turning back onto a black rectangle.
-        GLib.timeout_add(120, self._flip_back)
+        # The two cameras are separate devices, so the replacement can be
+        # brought up while the old one is still feeding the viewfinder. The
+        # picture never goes blank and the layout never jumps, which is what
+        # was interrupting the transition half way through.
+        self._start_pipeline(keep_old=True)
+        GLib.timeout_add(40, self._flip_back)
         return False
 
     def _flip_back(self):
@@ -950,7 +990,64 @@ class LensWindow(Adw.ApplicationWindow):
         self.countdown_label.set_label(str(self.countdown_val))
         return True
 
+    def _grab_full_res(self):
+        """One frame at the sensor's largest mode, by briefly retuning it.
+
+        The preview stream is capped so the viewfinder stays at 30fps, which
+        also capped stills. This frees the device, pulls a single frame at
+        full resolution, and puts the preview back. The source is already
+        MJPG so the bytes are saved as-is, with no decode/re-encode.
+        """
+        dev = self.cameras[self.cam_idx][0]
+        still, prev = best_still_mode(dev), best_mode(dev)
+        if not still or not prev or still[1] * still[2] <= prev[1] * prev[2]:
+            return None                     # nothing to gain on this camera
+        _, w, h, fps = still
+
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
+        data = None
+        try:
+            grab = Gst.parse_launch(
+                f"v4l2src device={dev} num-buffers=6 ! "
+                f"image/jpeg,width={w},height={h},framerate={int(round(fps))}/1 ! "
+                f"appsink name=still emit-signals=false max-buffers=6 "
+                f"drop=false sync=false")
+            sink = grab.get_by_name("still")
+            grab.set_state(Gst.State.PLAYING)
+            # Keep pulling: the first frames come out before auto-exposure has
+            # settled, so the last good one is the one worth keeping.
+            for _ in range(6):
+                sample = sink.emit("try-pull-sample", int(1.5 * Gst.SECOND))
+                if not sample:
+                    break
+                buf = sample.get_buffer()
+                ok, mi = buf.map(Gst.MapFlags.READ)
+                if not ok:
+                    continue
+                try:
+                    blob = bytes(mi.data)
+                finally:
+                    buf.unmap(mi)
+                if len(blob) > 1000 and blob[:2] == b"\xff\xd8":
+                    data = blob
+            grab.set_state(Gst.State.NULL)
+            grab.get_state(Gst.CLOCK_TIME_NONE)
+        except Exception as e:
+            print(f"Lens: full-res grab failed ({e}), using preview frame",
+                  file=sys.stderr)
+        self._start_pipeline()
+        if data:
+            print(f"Lens: captured at {w}x{h}")
+        return data
+
     def _take_photo(self):
+        # Prefer a full-resolution grab; fall back to the preview stream.
+        data = self._grab_full_res()
+        if data:
+            self._save_photo(data)
+            return
         appsink = self.pipeline.get_by_name("photosink")
         if not appsink:
             print("Lens: no photosink in pipeline"); return
@@ -978,7 +1075,9 @@ class LensWindow(Adw.ApplicationWindow):
         if not data:
             print("Lens: capture failed — no valid JPEG from pipeline")
             return
+        self._save_photo(data)
 
+    def _save_photo(self, data):
         ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         path = PICTURES / f"Lens-{ts}.jpg"
         path.write_bytes(data)
