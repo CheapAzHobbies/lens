@@ -370,18 +370,15 @@ class LensWindow(Adw.ApplicationWindow):
         self.set_content(root)
         column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         root.set_child(column)
+        self._column = column
 
         # The viewfinder and the things that genuinely belong over the image.
-        # Wrapped in a WindowHandle because the window has no titlebar, so
-        # without this there is nothing to grab to move it. Buttons inside
-        # still get their own clicks; only empty areas start a drag, and
-        # double-click still maximises.
+        # Deliberately NOT a WindowHandle: the top bar is the only thing that
+        # moves the window, so dragging on the picture cannot shove the window
+        # around by accident.
         overlay = Gtk.Overlay()
         overlay.set_vexpand(True); overlay.set_hexpand(True)
-        view_handle = Gtk.WindowHandle()
-        view_handle.set_child(overlay)
-        view_handle.set_vexpand(True); view_handle.set_hexpand(True)
-        column.append(view_handle)
+        column.append(overlay)
 
         # Black background + viewfinder
         bg = Gtk.Box()
@@ -417,32 +414,40 @@ class LensWindow(Adw.ApplicationWindow):
         self.aspect_frame.set_hexpand(True); self.aspect_frame.set_vexpand(True)
         bg.append(self.aspect_frame)
 
-        # ---- Top control row ----
-        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        top.set_valign(Gtk.Align.START); top.set_halign(Gtk.Align.CENTER)
-        top.set_margin_top(12)
-        overlay.add_overlay(top)
-
+        # ---- Top bar ----
+        # Its own strip above the viewfinder rather than floating over the
+        # picture, so nothing covers the shot. Exit left, mode pills centred,
+        # fullscreen right.
         self.btn_grid   = self._pill_button("#",   self._toggle_grid,   width=42, tint=False)
         self.btn_aspect = self._pill_button(self.aspects[0], self._toggle_aspect, width=58, tint=False)
         self.btn_timer  = self._pill_button("⏱",  self._toggle_timer,  width=58, tint=False)
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         top.append(self.btn_grid); top.append(self.btn_aspect); top.append(self.btn_timer)
 
-        # Fullscreen toggle — top-right corner
-        self.btn_fullscreen = self._pill_button("⛶", self._toggle_fullscreen, width=42, tint=False)
-        self.btn_fullscreen.set_halign(Gtk.Align.END)
-        self.btn_fullscreen.set_valign(Gtk.Align.START)
-        self.btn_fullscreen.set_margin_top(12)
-        self.btn_fullscreen.set_margin_end(12)
-        overlay.add_overlay(self.btn_fullscreen)
-
-        # Exit — top-left corner
         self.btn_exit = self._pill_button("✕", lambda: self.close(), width=42, tint=False)
-        self.btn_exit.set_halign(Gtk.Align.START)
-        self.btn_exit.set_valign(Gtk.Align.START)
-        self.btn_exit.set_margin_top(12)
-        self.btn_exit.set_margin_start(12)
-        overlay.add_overlay(self.btn_exit)
+        self.btn_fullscreen = self._pill_button("⛶", self._toggle_fullscreen, width=42, tint=False)
+
+        # A plain Box with expanding spacers rather than a CenterBox. A
+        # CenterBox inside the WindowHandle swallowed the drag and the window
+        # would not move at all; the same handle around a Box works.
+        gap_l = Gtk.Box(); gap_l.set_hexpand(True)
+        gap_r = Gtk.Box(); gap_r.set_hexpand(True)
+        top_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        top_bar.add_css_class("top-bar")
+        top_bar.append(self.btn_exit)
+        top_bar.append(gap_l)
+        top_bar.append(top)
+        top_bar.append(gap_r)
+        top_bar.append(self.btn_fullscreen)
+        top_bar.set_margin_top(8); top_bar.set_margin_bottom(8)
+        top_bar.set_margin_start(12); top_bar.set_margin_end(12)
+
+        # The bar doubles as the titlebar this window does not have.
+        top_handle = Gtk.WindowHandle()
+        top_handle.set_child(top_bar)
+        # prepend, not append: the viewfinder was added to the column further
+        # up, so appending would put the bar underneath it.
+        column.prepend(top_handle)
 
         # ---- Bottom control area ----
         bottom = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -539,9 +544,7 @@ class LensWindow(Adw.ApplicationWindow):
         # ---- Camcorder HUD (video mode) ----
         # Sits over the viewfinder between the top pills and the bottom bar.
         hud = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        # Clear the pill row, which is centred over the top of the picture.
-        # At 20px the STBY timer ran straight into the grid pill.
-        hud.set_margin_top(58); hud.set_margin_bottom(18)
+        hud.set_margin_top(18); hud.set_margin_bottom(18)
         hud.set_margin_start(16); hud.set_margin_end(16)
         hud.set_can_target(False)
 
@@ -639,6 +642,7 @@ class LensWindow(Adw.ApplicationWindow):
            through: the default widget background was what flashed. */
         window, .viewframe, .viewflip, picture { background: black; }
         .bottom-bar { background: #000; }
+        .top-bar    { background: #000; }
         .mode-pill { background: rgba(255,255,255,0.15); border-radius: 16px; padding: 2px; }
         .mode-btn { background: transparent; color: white; font-weight: bold;
                     font-size: 12px; padding: 4px 24px; border-radius: 14px;
@@ -763,8 +767,11 @@ class LensWindow(Adw.ApplicationWindow):
            camera you are on rather than just animating and resetting. */
         .flip-icon { transition: transform 260ms cubic-bezier(.45,0,.55,1); }
         .flip-icon.mirrored { transform: scaleX(-1); }
-        .pill { background: rgba(0,0,0,0.5); border-radius: 21px; color: white;
-                font-weight: bold; font-size: 14px; padding: 4px 12px; border: none; }
+        .pill { background: rgba(255,255,255,0.12); border-radius: 21px;
+                color: white; font-weight: bold; font-size: 14px;
+                padding: 4px 12px; border: none;
+                transition: background 120ms ease-out; }
+        .pill:hover { background: rgba(255,255,255,0.22); }
         .pill-active { background: #62a0ea; color: white; }
         .countdown { color: white; font-size: 96px; font-weight: bold;
                      background: rgba(0,0,0,0.5); padding: 30px 50px; border-radius: 60px; }
