@@ -1016,10 +1016,11 @@ class LensWindow(Adw.ApplicationWindow):
         audio_row.set_valign(Gtk.Align.CENTER)
         self.btn_mic = Gtk.Button()
         self.mic_icon = Gtk.Image.new_from_icon_name("audio-input-microphone-symbolic")
-        self.mic_icon.set_pixel_size(16)
+        self.mic_icon.set_pixel_size(18)
         self.btn_mic.set_child(self.mic_icon)
         self.btn_mic.add_css_class("hud-btn")
         self.btn_mic.add_css_class("hud-chip")
+        self.btn_mic.add_css_class("hud-mic")
         self.btn_mic.set_valign(Gtk.Align.CENTER)
         self.btn_mic.connect("clicked", lambda *_: self._toggle_mic())
         self.mic_popover = Gtk.Popover()
@@ -1302,13 +1303,18 @@ class LensWindow(Adw.ApplicationWindow):
             min-width: 0; min-height: 0; color: inherit; }
         /* Hover belongs to the chip, so the whole readout lights up. */
         .hud-btn.hud-chip:hover { background-color: rgba(255,255,255,0.20); }
+        /* Give the mic a fixed footprint so muting cannot resize it, and so
+           the icon is a decent target rather than a tiny glyph when live. */
+        .hud-mic > button { min-width: 26px; min-height: 22px; }
         .hud-btn-off { color: rgba(255,255,255,0.35); }
         /* Filled, not outlined. A red line-art glyph over a bright picture
            was almost invisible, which defeats the point of warning that the
            take will be silent. */
-        .hud-btn-muted { background: #e01b24; color: #fff;
-                         border-radius: 7px; padding: 3px 6px; }
-        .hud-btn-muted:hover { background: #f0323b; }
+        /* Colour only. Adding padding or a radius here changed the button's
+           size when muted, so the icon jumped out of line with the meter
+           beside it. The chip already supplies the box, in both states. */
+        .hud-btn-muted { background-color: #e01b24; color: #fff; }
+        .hud-btn-muted:hover { background-color: #f0323b; }
         .thumb { background: rgba(255,255,255,0.2); border-radius: 8px;
                  border: 1px solid white; }
         /* Was rgba(0,0,0,0.55), which is invisible on a black control bar:
@@ -1761,12 +1767,20 @@ class LensWindow(Adw.ApplicationWindow):
         dev = self.cameras[self.cam_idx][0]
         modes = [m for m in _enumerate_modes(dev) if m[0] == "MJPG"]
         modes.sort(key=lambda m: (-m[1] * m[2], -m[3]))
+        # One entry per resolution, keeping its fastest rate. The nominal
+        # rate is deliberately not shown: the HUD reports the rate actually
+        # being delivered, and printing a different number next to the same
+        # camera invites the two to be compared as if both were real.
+        seen = set()
         auto = self.mode_override is None
         box.append(self._menu_row("Automatic", auto, self._set_mode_auto))
         for fourcc, w, h, fps in modes:
-            cur = (not auto and tuple(self.mode_override) == (w, h, fps))
+            if (w, h) in seen:
+                continue
+            seen.add((w, h))
+            cur = (not auto and tuple(self.mode_override)[:2] == (w, h))
             box.append(self._menu_row(
-                f"{w}\u00d7{h}   {fps:g} fps", cur,
+                f"{w}\u00d7{h}", cur,
                 lambda w=w, h=h, f=fps: self._set_mode(w, h, f)))
         self.res_popover.set_child(box)
 
@@ -1878,18 +1892,18 @@ class LensWindow(Adw.ApplicationWindow):
         if not self.mic_available:
             # Nothing to record from: state the fact, quietly.
             self.mic_icon.set_from_icon_name("microphone-disabled-symbolic")
-            self.mic_icon.set_pixel_size(16)
+            self.mic_icon.set_pixel_size(18)
             self.btn_mic.set_tooltip_text("No microphone found")
             self.btn_mic.add_css_class("hud-btn-off")
         elif self.mic_enabled:
             self.mic_icon.set_from_icon_name("audio-input-microphone-symbolic")
-            self.mic_icon.set_pixel_size(16)
+            self.mic_icon.set_pixel_size(18)
             self.btn_mic.set_tooltip_text("Microphone on, click to mute")
         else:
             # Muted is a warning, not a disabled state: you are about to
             # record something silent. Grey made it nearly invisible.
             self.mic_icon.set_from_icon_name("microphone-disabled-symbolic")
-            self.mic_icon.set_pixel_size(19)
+            self.mic_icon.set_pixel_size(18)
             self.btn_mic.set_tooltip_text("Microphone MUTED, click to unmute")
             self.btn_mic.add_css_class("hud-btn-muted")
         self.btn_mic.set_sensitive(self.mic_available)
