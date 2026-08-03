@@ -4,7 +4,7 @@ Lens — a fast, mobile-first camera app for Linux tablets.
 GTK4 + libadwaita + GStreamer.
 """
 
-import gi, os, sys, math, json, datetime, pathlib
+import gi, os, sys, math, json, time, datetime, pathlib
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Gst", "1.0")
@@ -323,6 +323,14 @@ class LensWindow(Adw.ApplicationWindow):
         if not 0 <= self.aspect_idx < len(self.aspects):
             self.aspect_idx = 0
         self.grid_visible = bool(cfg.get("grid_visible", False))
+        # How long each camera takes to deliver its first frame, keyed by
+        # stable id. Measured on use and persisted, so the flip is tuned from
+        # the second run onwards. The Z13 rear camera needs ~690ms and the
+        # front ~200ms, and it is a fixed firmware cost: every resolution the
+        # rear offers takes the same time, so there is nothing to optimise
+        # away. The animation is stretched to cover it instead.
+        self._cam_latency = dict(cfg.get("cam_latency", {}))
+        self._flip_t0 = None
         self.timer_sec = cfg.get("timer_sec", 0)
         if self.timer_sec not in (0, 3, 10):
             self.timer_sec = 0
@@ -893,7 +901,11 @@ class LensWindow(Adw.ApplicationWindow):
         /* Accelerate into the close, decelerate out of the open. One
            symmetric ease for both directions made the hold in the middle
            read as a stall. */
-        .viewflip { transition: transform 170ms cubic-bezier(.4, 0, 1, 1); }
+        .viewflip { transition: transform 190ms cubic-bezier(.4, 0, 1, 1); }
+        .viewflip.flip-fast { transition-duration: 190ms; }
+        .viewflip.flip-med  { transition-duration: 380ms; }
+        .viewflip.flip-slow { transition-duration: 560ms; }
+        .viewflip.flip-vslow { transition-duration: 760ms; }
         .viewflip.opening { transition: transform 300ms cubic-bezier(0, 0, .2, 1); }
         .viewflip.flipped { transform: scaleX(0.02); }
         .viewer-bg { background: rgba(0,0,0,0.95); }
@@ -1008,6 +1020,7 @@ class LensWindow(Adw.ApplicationWindow):
             "timer_sec":    self.timer_sec,
             "video_mode":   self.video_mode,
             "cam_id":       self.cameras[self.cam_idx][2],
+            "cam_latency":  self._cam_latency,
         })
 
     def _toggle_grid(self):
@@ -1196,8 +1209,35 @@ class LensWindow(Adw.ApplicationWindow):
         frozen = self._freeze_frame()
         if frozen is not None:
             self.picture.set_paintable(frozen)
-        self.frame_stack.add_css_class("flipped")
-        GLib.timeout_add(self.FLIP_MS, self._flip_shut_cb)
+
+        # Stretch the close to roughly how long this camera takes to wake up,
+        # so the motion is still going when the frame lands instead of
+        # finishing early and sitting frozen. Continuous and slow reads as
+        # smooth; fast then stalled does not.
+        nxt = (self.cam_idx + 1) % len(self.cameras) if target is None else target
+        wake = self._cam_latency.get(self.cameras[nxt][2], 380)
+        for cls in ("flip-fast", "flip-med", "flip-slow", "flip-vslow"):
+            self.frame_stack.remove_css_class(cls)
+        # Aim the close at ~85% of the wake time: still moving when the frame
+        # lands, without dragging on afterwards.
+        want = wake * 0.85
+        tier, close_ms = min(
+            (("flip-fast", 190), ("flip-med", 380),
+             ("flip-slow", 560), ("flip-vslow", 760)),
+            key=lambda t: abs(t[1] - want))
+        self.frame_stack.add_css_class(tier)
+        self._flip_t0 = time.monotonic()
+
+        # Let the duration change land before the transform changes. Setting
+        # transition-duration and transform in the same style update makes GTK
+        # apply the transform without animating it, which is the snap seen
+        # when flipping toward the faster camera (the tier, and so the
+        # duration, changes in that direction).
+        def _begin_close():
+            self.frame_stack.add_css_class("flipped")
+            GLib.timeout_add(close_ms, self._flip_shut_cb)
+            return False
+        GLib.idle_add(_begin_close)
 
         self.cam_idx = (self.cam_idx + 1) % len(self.cameras) if target is None else target
         self._save_settings()
@@ -1213,6 +1253,14 @@ class LensWindow(Adw.ApplicationWindow):
         return False
 
     def _flip_ready_cb(self, commit):
+        if getattr(self, "_flip_t0", None):
+            ms = int((time.monotonic() - self._flip_t0) * 1000)
+            cam_id = self.cameras[self.cam_idx][2]
+            prev = self._cam_latency.get(cam_id)
+            # Smooth it a little so one slow start does not skew the tier.
+            self._cam_latency[cam_id] = ms if prev is None else int(prev * 0.6 + ms * 0.4)
+            self._flip_t0 = None
+            self._save_settings()
         self._flip_commit = commit
         self._flip_ready = True
         self._flip_open_when_ready()
@@ -1226,8 +1274,12 @@ class LensWindow(Adw.ApplicationWindow):
             self._flip_commit()
             self._flip_commit = None
         self.frame_stack.add_css_class("opening")
-        self.frame_stack.remove_css_class("flipped")
-        GLib.timeout_add(320, self._flip_done)
+
+        def _begin_open():
+            self.frame_stack.remove_css_class("flipped")
+            GLib.timeout_add(320, self._flip_done)
+            return False
+        GLib.idle_add(_begin_open)
 
     def _flip_done(self):
         self.frame_stack.remove_css_class("opening")
