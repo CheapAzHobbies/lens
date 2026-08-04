@@ -735,7 +735,7 @@ class GalleryView(Gtk.Box):
         self.ratio_btn.set_tooltip_text("Crop ratio")
         self.ratio_pop = Gtk.Popover()
         self.ratio_btn.set_popover(self.ratio_pop)
-        self.ratio_btn.set_sensitive(False)
+        self.ratio_btn.set_visible(False)
         self._build_ratio_menu()
         head.append(self.ratio_btn)
 
@@ -825,6 +825,12 @@ class GalleryView(Gtk.Box):
         sc.set_child(self.strip)
         sc.set_size_request(-1, self.THUMB + 26)
         sc.add_css_class("gal-strip")
+        # A vertical wheel over a horizontal strip does nothing by default,
+        # so translate it: the wheel moves the strip under the pointer.
+        strip_scroll = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.BOTH_AXES)
+        strip_scroll.connect("scroll", self._on_strip_scroll)
+        sc.add_controller(strip_scroll)
         self.strip_scroller = sc
         self.append(sc)
 
@@ -909,7 +915,9 @@ class GalleryView(Gtk.Box):
 
     def _arrow(self, icon, align, cb):
         b = Gtk.Button()
-        b.set_child(self._icon(icon))
+        img = Gtk.Image.new_from_icon_name(icon)
+        img.set_pixel_size(30)
+        b.set_child(img)
         b.add_css_class("gal-arrow")
         b.set_halign(align)
         b.set_valign(Gtk.Align.CENTER)
@@ -995,8 +1003,8 @@ class GalleryView(Gtk.Box):
                 print(f"Lens: delete failed: {e}", file=sys.stderr)
                 return
             del self.paths[self.index]
+            self._drop_strip_item(self.index)
             self.index = max(0, min(self.index, len(self.paths) - 1))
-            self._build_strip()
             self._show()
             return
         dest = trash_dir() / src.name
@@ -1011,10 +1019,15 @@ class GalleryView(Gtk.Box):
             print(f"Lens: could not trash {src.name}: {e}", file=sys.stderr)
             return
         print(f"Lens: trashed {src.name}")
+        # Keep the live list in step, or leaving the bin would resurrect
+        # everything trashed since it was last opened.
+        gone = self.paths[self.index]
+        if gone in getattr(self, "_live_paths", []):
+            self._live_paths.remove(gone)
         del self.paths[self.index]
+        self._drop_strip_item(self.index)
         if self.index >= len(self.paths):
             self.index = max(0, len(self.paths) - 1)
-        self._build_strip()
         self._show()
 
     # ---- content ----
@@ -1051,9 +1064,46 @@ class GalleryView(Gtk.Box):
                     else "image-missing-symbolic")
             img.set_pixel_size(self.THUMB)
             b.set_child(img)
-            b.connect("clicked", lambda _b, i=i: self.go(i))
+            # Resolved at click time, so removing a row does not leave
+            # every later thumbnail pointing at the wrong photo.
+            b.connect("clicked", self._on_thumb_clicked)
             self.strip.append(b)
             self._strip_buttons.append(b)
+
+    def _on_thumb_clicked(self, btn):
+        try:
+            self.go(self._strip_buttons.index(btn))
+        except ValueError:
+            pass
+
+    def _drop_strip_item(self, i):
+        """Remove one thumbnail in place.
+
+        A full rebuild re-decodes every JPEG in the folder and momentarily
+        empties the scroller, which left the strip looking blank until the
+        gallery was closed and reopened.
+        """
+        if not (0 <= i < len(self._strip_buttons)):
+            return self._build_strip()
+        self.strip.remove(self._strip_buttons.pop(i))
+
+    def _scroll_strip_to_current(self):
+        """Keep the selected thumbnail on screen."""
+        if not (0 <= self.index < len(self._strip_buttons)):
+            return False
+        btn = self._strip_buttons[self.index]
+        ok, r = btn.compute_bounds(self.strip)
+        if not ok:
+            return False
+        adj = self.strip_scroller.get_hadjustment()
+        page = adj.get_page_size()
+        if page <= 0:
+            return False
+        if r.origin.x < adj.get_value():
+            adj.set_value(r.origin.x)
+        elif r.origin.x + r.size.width > adj.get_value() + page:
+            adj.set_value(r.origin.x + r.size.width - page)
+        return False
 
     def go(self, i):
         if not self.paths:
@@ -1100,6 +1150,7 @@ class GalleryView(Gtk.Box):
                 b.add_css_class("gal-thumb-active")
             else:
                 b.remove_css_class("gal-thumb-active")
+        GLib.idle_add(self._scroll_strip_to_current)
         self._render()
 
     def _edited(self):
@@ -1143,14 +1194,28 @@ class GalleryView(Gtk.Box):
     def _animate(self, cls, then, ms=260):
         """Play a CSS class on the picture, then swap the pixbuf underneath.
 
-        The swap happens at the end so the motion reads as the image turning
-        rather than a new image appearing and then settling.
+        The return leg has to be instant. Dropping the class on its own
+        animates the transform back to identity, so a mirror played the flip
+        twice and a rotate visibly counter-rotated after turning the right
+        way. Suppressing the transition for that one frame -- while the
+        already-transformed pixbuf goes in -- makes it read as a single
+        continuous move.
         """
+        if getattr(self, "_anim_busy", False):
+            return
+        self._anim_busy = True
         self.pic.add_css_class(cls)
 
         def done():
+            self.pic.add_css_class("no-anim")
             self.pic.remove_css_class(cls)
             then()
+
+            def unfreeze():
+                self.pic.remove_css_class("no-anim")
+                self._anim_busy = False
+                return False
+            GLib.timeout_add(30, unfreeze)
             return False
         GLib.timeout_add(ms, done)
 
@@ -1179,7 +1244,9 @@ class GalleryView(Gtk.Box):
 
     def _set_cropping(self, on):
         self.crop.active = on
-        self.ratio_btn.set_sensitive(on)
+        # Shown only while cropping. A ratio control with nothing to apply it
+        # to is just a stray "Free" sitting in the toolbar.
+        self.ratio_btn.set_visible(on)
         if on:
             self._sync_crop_frame()
             self.crop.reset()
@@ -1231,6 +1298,12 @@ class GalleryView(Gtk.Box):
             self.go(self.index - 1)
         elif x > w * 0.72:
             self.go(self.index + 1)
+
+    def _on_strip_scroll(self, ctrl, dx, dy):
+        adj = self.strip_scroller.get_hadjustment()
+        d = dx if abs(dx) > abs(dy) else dy
+        adj.set_value(adj.get_value() + d * 90)
+        return True
 
     def _on_scroll(self, ctrl, dx, dy):
         # Either axis pages. A wheel gives dy, a touchpad swipe gives dx, and
@@ -2205,11 +2278,12 @@ class LensWindow(Adw.ApplicationWindow):
         .spin-ccw { transform: rotate(-90deg) scale(0.82); }
         .flip-h   { transform: scaleX(-1); }
         .flip-v   { transform: scaleY(-1); }
+        .gal picture.no-anim { transition: none; }
         .crop-drop { transform: scale(0.9) translateY(26px); opacity: 0.25; }
         .gal-count { color: rgba(255,255,255,0.55); font-size: 13px;
                      font-family: monospace; }
-        .gal-arrow { background: rgba(0,0,0,0.5); color: white; border: none;
-                     border-radius: 22px; min-width: 44px; min-height: 44px;
+        .gal-arrow { background: rgba(0,0,0,0.55); color: white; border: none;
+                     border-radius: 34px; min-width: 68px; min-height: 68px;
                      opacity: 0.65; transition: opacity 120ms ease-out,
                                                 background 120ms ease-out; }
         .gal-arrow:hover { opacity: 1; background: rgba(0,0,0,0.75); }
@@ -2341,6 +2415,8 @@ class LensWindow(Adw.ApplicationWindow):
         .winctl-close:hover { background: #e01b24; }
         .flash-on { color: #ffc107; background: rgba(255,193,7,0.18); }
         .flash-on:hover { background: rgba(255,193,7,0.30); }
+        .winctl:disabled { color: rgba(255,255,255,0.25);
+                           background: rgba(255,255,255,0.04); }
         .cam-row { background: transparent; border: none; color: white;
                    padding: 6px 10px; border-radius: 8px; font-size: 13px; }
         .cam-row:hover { background: rgba(255,255,255,0.12); }
@@ -2684,6 +2760,10 @@ class LensWindow(Adw.ApplicationWindow):
             self.btn_video.add_css_class("mode-active")
             self.btn_photo.remove_css_class("mode-active")
             self.shutter_core.add_css_class("video")
+            # No flash in video: a single white pulse before a clip would
+            # light one frame and blow out the start of the take.
+            self.btn_flash.set_sensitive(False)
+            self.btn_flash.set_tooltip_text("Screen flash is for photos only")
             self.rec_indicator.set_visible(getattr(self, "overlay_mode", 0) in (0, 1))
             self._start_audio_monitor()
             self._hud_standby()
@@ -2694,6 +2774,8 @@ class LensWindow(Adw.ApplicationWindow):
             self.btn_photo.add_css_class("mode-active")
             self.btn_video.remove_css_class("mode-active")
             self.shutter_core.remove_css_class("video")
+            self.btn_flash.set_sensitive(True)
+            self._refresh_flash_button()
             self.rec_indicator.set_visible(False)
             if self.hud_timer:
                 GLib.source_remove(self.hud_timer); self.hud_timer = None
