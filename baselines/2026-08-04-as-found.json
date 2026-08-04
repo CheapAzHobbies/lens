@@ -1,0 +1,161 @@
+{
+  "date": "2026-08-04T11:05:07-07:00",
+  "excitation": "silence (user confirmed quiet room)",
+  "excitation_valid_for": [
+    "depends on excitation"
+  ],
+  "method": "3 independent captures of 5.0s, raw pulsesrc with no processing elements, S16LE mono 48kHz, median of 4096-sample frame RMS for noise floor",
+  "system": {
+    "source": "alsa_input.pci-0000_00_1f.3.analog-stereo",
+    "backend": "PulseAudio (on PipeWire 1.0.5)",
+    "backend_version": "15.0.0",
+    "alsa_card": "1",
+    "codec": "Realtek ALC285",
+    "alsa_format": "S32_LE",
+    "alsa_rate": "48000",
+    "alsa_channels": "2",
+    "alsa_period_size": "1024",
+    "alsa_buffer_size": "32768",
+    "system_processing": []
+  },
+  "gain_stages": {
+    "microphone_element": {
+      "value": "unknown",
+      "note": "not exposed by ALSA or PipeWire"
+    },
+    "alsa_card1_internal_mic_boost": {
+      "db": 0.0,
+      "percent": 0,
+      "raw": "unknown",
+      "range": [
+        0,
+        3
+      ]
+    },
+    "alsa_card1_capture": {
+      "db": 18.0,
+      "percent": 75,
+      "raw": 47,
+      "range": [
+        0,
+        63
+      ]
+    },
+    "pipewire_source_volume": {
+      "percent": 20,
+      "db_pulse_scale": -41.94,
+      "note": "software attenuation plus hardware control below ~30%; its dB scale is not the ALSA dB scale"
+    },
+    "pipewire_source_muted": "no",
+    "lens_application_gain": {
+      "linear": 3.98,
+      "requested_rate": "automatic",
+      "muted": false
+    },
+    "encoder": {
+      "codec": "aac",
+      "bitrate": 128000,
+      "gain": "none"
+    }
+  },
+  "samples": [
+    {
+      "noise_floor_dbfs": -40.43,
+      "quietest_frame_dbfs": -40.69,
+      "rms_dbfs": -40.38,
+      "peak_dbfs": -26.66,
+      "clipping_percent": 0.0,
+      "dc_offset": -6e-06,
+      "hum_50hz_rel_db": -72.37,
+      "hum_60hz_rel_db": -24.71,
+      "seconds": 4.98
+    },
+    {
+      "noise_floor_dbfs": -40.42,
+      "quietest_frame_dbfs": -40.96,
+      "rms_dbfs": -40.4,
+      "peak_dbfs": -27.48,
+      "clipping_percent": 0.0,
+      "dc_offset": 2e-06,
+      "hum_50hz_rel_db": -72.35,
+      "hum_60hz_rel_db": -25.51,
+      "seconds": 4.99
+    },
+    {
+      "noise_floor_dbfs": -40.41,
+      "quietest_frame_dbfs": -40.88,
+      "rms_dbfs": -40.41,
+      "peak_dbfs": -27.36,
+      "clipping_percent": 0.0,
+      "dc_offset": 7e-06,
+      "hum_50hz_rel_db": -72.34,
+      "hum_60hz_rel_db": -25.8,
+      "seconds": 4.98
+    }
+  ],
+  "statistics": {
+    "noise_floor_dbfs": {
+      "mean": -40.42,
+      "min": -40.43,
+      "max": -40.41,
+      "stdev": 0.008,
+      "spread": 0.02
+    },
+    "quietest_frame_dbfs": {
+      "mean": -40.843,
+      "min": -40.96,
+      "max": -40.69,
+      "stdev": 0.113,
+      "spread": 0.27
+    },
+    "rms_dbfs": {
+      "mean": -40.397,
+      "min": -40.41,
+      "max": -40.38,
+      "stdev": 0.012,
+      "spread": 0.03
+    },
+    "peak_dbfs": {
+      "mean": -27.167,
+      "min": -27.48,
+      "max": -26.66,
+      "stdev": 0.362,
+      "spread": 0.82
+    },
+    "clipping_percent": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "stdev": 0.0,
+      "spread": 0.0
+    },
+    "dc_offset": {
+      "mean": 0.0,
+      "min": -0.0,
+      "max": 0.0,
+      "stdev": 0.0,
+      "spread": 0.0
+    },
+    "hum_50hz_rel_db": {
+      "mean": -72.353,
+      "min": -72.37,
+      "max": -72.34,
+      "stdev": 0.012,
+      "spread": 0.03
+    },
+    "hum_60hz_rel_db": {
+      "mean": -25.34,
+      "min": -25.8,
+      "max": -24.71,
+      "stdev": 0.461,
+      "spread": 1.09
+    },
+    "seconds": {
+      "mean": 4.983,
+      "min": 4.98,
+      "max": 4.99,
+      "stdev": 0.005,
+      "spread": 0.01
+    }
+  }
+}
