@@ -12,7 +12,7 @@ gi.require_version("GstApp", "1.0")
 gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("Graphene", "1.0")
 import cairo
-from gi.repository import Gtk, Adw, Gst, GLib, Gdk, Gio, GObject, GdkPixbuf, Graphene
+from gi.repository import Gtk, Adw, Gst, GLib, Gdk, Gio, GObject, GdkPixbuf, Graphene, Pango
 
 Gst.init(None)
 
@@ -745,6 +745,7 @@ class GalleryView(Gtk.Box):
         self.title.set_halign(Gtk.Align.FILL)
         self.title.set_margin_start(8)
         self.title.connect("notify::editing", self._on_title_edit)
+        self._tame_title()
         head.append(self.title)
 
         self.counter = Gtk.Label(label="")
@@ -800,13 +801,6 @@ class GalleryView(Gtk.Box):
         self.btn_restore.connect("clicked", lambda *_: self._restore_current())
         head.append(self.btn_restore)
 
-        self.btn_play = Gtk.Button(label="Play")
-        self.btn_play.add_css_class("gal-save")
-        self.btn_play.set_visible(False)
-        self.btn_play.connect(
-            "clicked", lambda *_: self.on_open_external(self.paths[self.index]))
-        head.append(self.btn_play)
-
         self.btn_save = Gtk.Button(label="Save a copy")
         self.btn_save.add_css_class("gal-save")
         self.btn_save.set_sensitive(False)
@@ -848,6 +842,22 @@ class GalleryView(Gtk.Box):
                                    lambda: self.go(self.index + 1))
         stack.add_overlay(self.arrow_l)
         stack.add_overlay(self.arrow_r)
+
+        # Play sits on the clip rather than in the toolbar. Up there it only
+        # existed for videos, so it shifted trash sideways every time one came
+        # up and you had to re-aim between deletes.
+        self.btn_play = Gtk.Button()
+        play_icon = Gtk.Image.new_from_icon_name("media-playback-start-symbolic")
+        play_icon.set_pixel_size(46)
+        self.btn_play.set_child(play_icon)
+        self.btn_play.add_css_class("gal-play")
+        self.btn_play.set_halign(Gtk.Align.CENTER)
+        self.btn_play.set_valign(Gtk.Align.CENTER)
+        self.btn_play.set_tooltip_text("Play this clip")
+        self.btn_play.set_visible(False)
+        self.btn_play.connect(
+            "clicked", lambda *_: self.on_open_external(self.paths[self.index]))
+        stack.add_overlay(self.btn_play)
 
         self.empty = Gtk.Label(label="Nothing here yet")
         self.empty.add_css_class("gal-empty")
@@ -982,6 +992,29 @@ class GalleryView(Gtk.Box):
         if keyval == _Gdk.KEY_Delete:
             self._trash_current(); return True
         return False
+
+    def _tame_title(self):
+        """Stop a long filename shoving the toolbar buttons off the end.
+
+        An EditableLabel asks for the full width of its text, so a long name
+        pushed trash and the rest sideways. Its inner label and entry are not
+        exposed as properties, so reach them through the tree and cap what
+        they ask for -- the name then ellipsises under the controls instead
+        of moving them.
+        """
+        def walk(w):
+            c = w.get_first_child()
+            while c is not None:
+                if isinstance(c, Gtk.Label):
+                    c.set_ellipsize(Pango.EllipsizeMode.END)
+                    c.set_max_width_chars(1)
+                    c.set_xalign(0.0)
+                elif isinstance(c, Gtk.Text):
+                    c.set_max_width_chars(1)
+                    c.set_propagate_text_width(False)
+                walk(c)
+                c = c.get_next_sibling()
+        walk(self.title)
 
     def _on_title_edit(self, *_):
         """Rename on commit. Editing stops both when confirmed and when
@@ -2318,6 +2351,12 @@ class LensWindow(Adw.ApplicationWindow):
         .crop-drop { transform: scale(0.9) translateY(26px); opacity: 0.25; }
         .gal-count { color: rgba(255,255,255,0.55); font-size: 13px;
                      font-family: monospace; }
+        .gal-play { background: rgba(0,0,0,0.46); color: white; border: none;
+                    border-radius: 50px; min-width: 92px; min-height: 92px;
+                    padding: 0; transition: background 140ms ease-out,
+                                            transform 140ms ease-out; }
+        .gal-play:hover  { background: rgba(0,0,0,0.68); transform: scale(1.06); }
+        .gal-play:active { background: rgba(0,0,0,0.80); transform: scale(0.96); }
         .gal-arrow { background: rgba(0,0,0,0.55); color: white; border: none;
                      border-radius: 34px; min-width: 68px; min-height: 68px;
                      opacity: 0.65; transition: opacity 120ms ease-out,
