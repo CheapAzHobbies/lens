@@ -184,6 +184,83 @@ def analyse(path):
 
     def db(x):
         return 20 * np.log10(x) if x > 1e-12 else -120.0
+    # Tone detection needs fine resolution over the whole capture, not the
+    # short frames used for level statistics. A 4Hz-wide band ratio, which
+    # is what this reported before, measures broadband noise and calls it
+    # hum: it claimed 60Hz mains that a 0.18Hz analysis showed was simply
+    # absent, while the real content sat at 20-28Hz and was never named.
+    # Welch averaging, not one big window. A single FFT leaves every bin
+    # with full chi-squared variance, so the loudest bin in a quiet band is
+    # wherever chance put it: tone detection built on that reported between
+    # zero and three tones from the same room, at frequencies varying by
+    # 22Hz. Averaging K overlapping windows divides that variance by K and
+    # makes the statistic reproducible, at the cost of resolution.
+    nfft = 1 << 16                      # 0.73Hz bins at 48kHz
+    if len(d) < nfft * 2:
+        nfft = 1 << int(np.floor(np.log2(max(len(d) // 2, 1024))))
+    hop = nfft // 2
+    wins = [d[i:i + nfft] for i in range(0, len(d) - nfft + 1, hop)]
+    w = np.hanning(nfft)
+    fine = np.zeros(nfft // 2 + 1)
+    for seg in wins:
+        fine += np.abs(np.fft.rfft(seg * w)) ** 2
+    fine /= max(len(wins), 1)
+    ffr = np.fft.rfftfreq(nfft, 1.0 / rate)
+    scale = (nfft / 2) ** 2
+    welch_windows = len(wins)
+
+    def tone_db(power):
+        return 10 * np.log10(power / scale + 1e-30)
+
+    def tone_above_neighbourhood(centre, halfwidth=1.0, span=15.0):
+        """How far a tone stands above the noise immediately around it.
+
+        Mean in the band, not the maximum. The maximum of a dozen noise bins
+        sits several dB above their median by chance alone, so a max-based
+        version of this read 7 to 10dB at both 50 and 60Hz on a machine
+        whose spectrum, measured at 0.18Hz, has no line at either. Near zero
+        means no tone. Validated against control frequencies below.
+        """
+        near = (ffr >= centre - halfwidth) & (ffr <= centre + halfwidth)
+        around = (((ffr >= centre - span) & (ffr < centre - halfwidth)) |
+                  ((ffr > centre + halfwidth) & (ffr <= centre + span)))
+        if not near.any() or not around.any():
+            return UNKNOWN
+        return round(float(tone_db(fine[near].mean())
+                           - tone_db(np.median(fine[around]))), 2)
+
+    # Only report a low-frequency peak if it is actually a tone. Taking the
+    # loudest bin unconditionally reported 21.6Hz on one run and 61.7Hz on
+    # the next from the same quiet room, because in broadband noise the
+    # loudest bin is wherever chance put it.
+    # Self-calibrating threshold. A fixed one kept letting chance through:
+    # at 8dB this reported between zero and three "tones" per run, at
+    # frequencies varying by 22Hz. The controls measure what this statistic
+    # reads on the same capture where nothing is, so require a real tone to
+    # clear that by a margin rather than clear a number chosen in advance.
+    controls = [tone_above_neighbourhood(f, halfwidth=0.6, span=12.0)
+                for f in (77.0, 143.0, 91.0, 167.0)]
+    controls = [c for c in controls if c != UNKNOWN]
+    tone_floor = (max(controls) + 6.0) if controls else 12.0
+
+    lf = (ffr >= 18) & (ffr <= 200)
+    order = np.argsort(fine[lf])[::-1]
+    lf_idx = np.where(lf)[0]
+    peaks, seen = [], []
+    for j in order[:40]:
+        f0 = float(ffr[lf_idx[j]])
+        if any(abs(f0 - x) < 3.0 for x in seen):
+            continue
+        prominence = tone_above_neighbourhood(f0, halfwidth=0.6, span=12.0)
+        if prominence == UNKNOWN or prominence < tone_floor:
+            continue
+        seen.append(f0)
+        peaks.append({"hz": round(f0, 2),
+                      "dbfs": round(float(tone_db(fine[lf_idx[j]])), 1),
+                      "prominence_db": prominence})
+        if len(peaks) == 3:
+            break
+
     win = 4096
     frames = [d[i:i + win] for i in range(0, len(d) - win, win)]
     rms = np.array([np.sqrt((f ** 2).mean()) for f in frames])
@@ -205,8 +282,19 @@ def analyse(path):
         "clipping_percent": round(100.0 * float((np.abs(d) >= 0.999).sum())
                                   / len(d), 4),
         "dc_offset": round(float(d.mean()), 6),
-        "hum_50hz_rel_db": round(band(48, 52) - total, 2),
-        "hum_60hz_rel_db": round(band(58, 62) - total, 2),
+        # Tone-above-neighbourhood, not band energy. Near zero means no tone.
+        "mains_50hz_tone_db": tone_above_neighbourhood(50.0),
+        "mains_60hz_tone_db": tone_above_neighbourhood(60.0),
+        # Controls. Nothing should be at these, so they show what this
+        # metric reads when there is genuinely no tone. If a control is not
+        # near zero, the metric is not trustworthy for this capture.
+        "control_77hz_tone_db": tone_above_neighbourhood(77.0),
+        "control_143hz_tone_db": tone_above_neighbourhood(143.0),
+        "welch_windows_averaged": welch_windows,
+        "tone_detection_floor_db": round(float(tone_floor), 2),
+        "lf_tones_found": len(peaks),
+        "lf_tone1_hz": peaks[0]["hz"] if peaks else 0.0,
+        "lf_tone1_prominence_db": peaks[0]["prominence_db"] if peaks else 0.0,
         "seconds": round(len(d) / rate, 2),
     }
 

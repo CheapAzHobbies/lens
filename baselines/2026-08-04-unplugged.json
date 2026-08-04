@@ -1,0 +1,231 @@
+{
+  "date": "2026-08-04T11:12:42-07:00",
+  "excitation": "silence (quiet room, charger unplugged)",
+  "excitation_valid_for": [
+    "depends on excitation"
+  ],
+  "method": "3 independent captures of 8.0s, raw pulsesrc with no processing elements, S16LE mono 48kHz, median of 4096-sample frame RMS for noise floor",
+  "system": {
+    "source": "alsa_input.pci-0000_00_1f.3.analog-stereo",
+    "backend": "PulseAudio (on PipeWire 1.0.5)",
+    "backend_version": "15.0.0",
+    "alsa_card": "1",
+    "codec": "Realtek ALC285",
+    "alsa_format": "S32_LE",
+    "alsa_rate": "48000",
+    "alsa_channels": "2",
+    "alsa_period_size": "1024",
+    "alsa_buffer_size": "32768",
+    "system_processing": []
+  },
+  "gain_stages": {
+    "microphone_element": {
+      "value": "unknown",
+      "note": "not exposed by ALSA or PipeWire"
+    },
+    "alsa_card1_internal_mic_boost": {
+      "db": 0.0,
+      "percent": 0,
+      "raw": "unknown",
+      "range": [
+        0,
+        3
+      ]
+    },
+    "alsa_card1_capture": {
+      "db": 18.0,
+      "percent": 75,
+      "raw": 47,
+      "range": [
+        0,
+        63
+      ]
+    },
+    "pipewire_source_volume": {
+      "percent": 20,
+      "db_pulse_scale": -41.94,
+      "note": "software attenuation plus hardware control below ~30%; its dB scale is not the ALSA dB scale"
+    },
+    "pipewire_source_muted": "no",
+    "lens_application_gain": {
+      "linear": 3.98,
+      "requested_rate": "automatic",
+      "muted": false
+    },
+    "encoder": {
+      "codec": "aac",
+      "bitrate": 128000,
+      "gain": "none"
+    }
+  },
+  "samples": [
+    {
+      "noise_floor_dbfs": -42.05,
+      "quietest_frame_dbfs": -42.57,
+      "rms_dbfs": -42.04,
+      "peak_dbfs": -28.7,
+      "clipping_percent": 0.0,
+      "dc_offset": 1e-06,
+      "mains_50hz_tone_db": 4.18,
+      "mains_60hz_tone_db": 3.46,
+      "control_77hz_tone_db": 0.33,
+      "control_143hz_tone_db": -0.26,
+      "welch_windows_averaged": 10,
+      "tone_detection_floor_db": 7.42,
+      "lf_tones_found": 1,
+      "lf_tone1_hz": 30.03,
+      "lf_tone1_prominence_db": 7.97,
+      "seconds": 8.0
+    },
+    {
+      "noise_floor_dbfs": -41.94,
+      "quietest_frame_dbfs": -42.57,
+      "rms_dbfs": -41.88,
+      "peak_dbfs": -28.67,
+      "clipping_percent": 0.0,
+      "dc_offset": -7e-06,
+      "mains_50hz_tone_db": 1.92,
+      "mains_60hz_tone_db": 2.41,
+      "control_77hz_tone_db": -1.0,
+      "control_143hz_tone_db": 0.04,
+      "welch_windows_averaged": 10,
+      "tone_detection_floor_db": 6.58,
+      "lf_tones_found": 1,
+      "lf_tone1_hz": 19.78,
+      "lf_tone1_prominence_db": 8.96,
+      "seconds": 8.0
+    },
+    {
+      "noise_floor_dbfs": -41.7,
+      "quietest_frame_dbfs": -42.42,
+      "rms_dbfs": -40.44,
+      "peak_dbfs": -22.28,
+      "clipping_percent": 0.0,
+      "dc_offset": -7e-06,
+      "mains_50hz_tone_db": 8.03,
+      "mains_60hz_tone_db": -3.25,
+      "control_77hz_tone_db": -0.11,
+      "control_143hz_tone_db": 0.96,
+      "welch_windows_averaged": 10,
+      "tone_detection_floor_db": 7.59,
+      "lf_tones_found": 1,
+      "lf_tone1_hz": 50.54,
+      "lf_tone1_prominence_db": 8.74,
+      "seconds": 7.99
+    }
+  ],
+  "statistics": {
+    "noise_floor_dbfs": {
+      "mean": -41.897,
+      "min": -42.05,
+      "max": -41.7,
+      "stdev": 0.146,
+      "spread": 0.35
+    },
+    "quietest_frame_dbfs": {
+      "mean": -42.52,
+      "min": -42.57,
+      "max": -42.42,
+      "stdev": 0.071,
+      "spread": 0.15
+    },
+    "rms_dbfs": {
+      "mean": -41.453,
+      "min": -42.04,
+      "max": -40.44,
+      "stdev": 0.72,
+      "spread": 1.6
+    },
+    "peak_dbfs": {
+      "mean": -26.55,
+      "min": -28.7,
+      "max": -22.28,
+      "stdev": 3.019,
+      "spread": 6.42
+    },
+    "clipping_percent": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "stdev": 0.0,
+      "spread": 0.0
+    },
+    "dc_offset": {
+      "mean": -0.0,
+      "min": -0.0,
+      "max": 0.0,
+      "stdev": 0.0,
+      "spread": 0.0
+    },
+    "mains_50hz_tone_db": {
+      "mean": 4.71,
+      "min": 1.92,
+      "max": 8.03,
+      "stdev": 2.522,
+      "spread": 6.11
+    },
+    "mains_60hz_tone_db": {
+      "mean": 0.873,
+      "min": -3.25,
+      "max": 3.46,
+      "stdev": 2.947,
+      "spread": 6.71
+    },
+    "control_77hz_tone_db": {
+      "mean": -0.26,
+      "min": -1.0,
+      "max": 0.33,
+      "stdev": 0.553,
+      "spread": 1.33
+    },
+    "control_143hz_tone_db": {
+      "mean": 0.247,
+      "min": -0.26,
+      "max": 0.96,
+      "stdev": 0.519,
+      "spread": 1.22
+    },
+    "welch_windows_averaged": {
+      "mean": 10.0,
+      "min": 10.0,
+      "max": 10.0,
+      "stdev": 0.0,
+      "spread": 0.0
+    },
+    "tone_detection_floor_db": {
+      "mean": 7.197,
+      "min": 6.58,
+      "max": 7.59,
+      "stdev": 0.442,
+      "spread": 1.01
+    },
+    "lf_tones_found": {
+      "mean": 1.0,
+      "min": 1.0,
+      "max": 1.0,
+      "stdev": 0.0,
+      "spread": 0.0
+    },
+    "lf_tone1_hz": {
+      "mean": 33.45,
+      "min": 19.78,
+      "max": 50.54,
+      "stdev": 12.788,
+      "spread": 30.76
+    },
+    "lf_tone1_prominence_db": {
+      "mean": 8.557,
+      "min": 7.97,
+      "max": 8.96,
+      "stdev": 0.424,
+      "spread": 0.99
+    },
+    "seconds": {
+      "mean": 7.997,
+      "min": 7.99,
+      "max": 8.0,
+      "stdev": 0.005,
+      "spread": 0.01
+    }
+  }
+}
