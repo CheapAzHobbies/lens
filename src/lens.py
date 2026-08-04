@@ -290,19 +290,34 @@ FALLBACK_CLEAN = ("audiowsincband mode=band-pass lower-frequency=110 "
 # none of the three and reshapes each sample where it stands: using that to
 # hold peaks down only trades clipping for distortion. Note enabled defaults
 # to false on LSP elements, so it has to be asked for.
-# Measured on Bao's own recording: 99 percent of the energy sat below 492Hz
-# and the 2-4kHz band that carries consonants had 0.34 percent of it. That is
-# a voice you can hear and cannot read. RNNoise was not the cause, it measures
-# flat to within 0.1dB on speech-like input; the balance is simply that
-# bottom-heavy. High-pass the rumble, take the boom down, lift the
-# consonants, and hold the sibilance back so the lift does not turn into
-# hiss. Measured against the same input: -4.6 rumble, -3.1 boom, +5.3 at
-# 2-4k, +0.7 at 6-9k.
-VOICE_EQ = ("audiocheblimit mode=high-pass cutoff=90 poles=4 ! "
-            "equalizer-nbands num-bands=3 "
-            "band0::freq=230 band0::bandwidth=260 band0::gain=-4.5 "
-            "band1::freq=2500 band1::bandwidth=1900 band1::gain=6.0 "
-            "band2::freq=8500 band2::bandwidth=6000 band2::gain=-3.0")
+# This machine's microphone is the reason speech comes out boomy and hard to
+# read, and it is measurable with nothing else in the chain. Against its own
+# 300-1000Hz level the raw capture runs -3.1dB at 1-2k, -8.9 at 2-4k, -18.6 at
+# 4-8k and -26.0 at 8-16k. Consonants live in 2-8k, so most of what makes a
+# word a word arrives 9 to 19dB down before any software sees it. RNNoise is
+# not the culprit: it measures flat to 0.1dB on clean speech and costs 4.4dB
+# at 4-8k on noisy speech, nowhere near enough to explain it.
+#
+# So this is a correction curve for that specific response rather than a
+# tasteful lift. At full strength it lands the same measurement at +0.8,
+# +0.6, -5.9 and -17.3. The top octave stays down on purpose: it carries
+# almost nothing for intelligibility and lifting it only raises hiss.
+VOICE_BANDS = ((200, 240, -6.0), (1500, 1000, 4.0), (3000, 1800, 10.0),
+               (5000, 2200, 12.0), (7500, 2600, 12.0), (11000, 5000, 8.0))
+
+
+def voice_eq(amount):
+    """The correction curve, scaled. Gains clamp at the element's own +-12dB
+    limit, which it silently ignores values outside rather than reporting."""
+    parts = []
+    for i, (freq, bw, gain) in enumerate(VOICE_BANDS):
+        g = max(-24.0, min(12.0, gain * amount))
+        parts.append(f"band{i}::freq={freq} band{i}::bandwidth={bw} "
+                     f"band{i}::gain={g:.2f}")
+    return ("audiocheblimit mode=high-pass cutoff=100 poles=4 ! "
+            f"equalizer-nbands num-bands={len(VOICE_BANDS)} " + " ".join(parts))
+
+
 LIMITER = ("lsp-plug-in-plugins-lv2-limiter-mono enabled=true th=0.79 lk=5.0 "
            "at=1.0 rt=10.0 knee=0.5")
 
@@ -1928,6 +1943,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.mic_gain = float(cfg.get("mic_gain", 2.0))
         self.mic_rate = int(cfg.get("mic_rate", 0)) or 0   # 0 = let it choose
         self.voice_eq = bool(cfg.get("voice_eq", True))
+        self.voice_amount = float(cfg.get("voice_amount", 1.0))
         self.nr_strength = int(cfg.get("nr_strength", RNNOISE_DEFAULT_VAD))
         self.mirror_view = bool(cfg.get("mirror_view", True))
         self.mirror_saved = bool(cfg.get("mirror_saved", False))
@@ -3521,6 +3537,7 @@ class LensWindow(Adw.ApplicationWindow):
             "mic_gain":     self.mic_gain,
             "mic_rate":     self.mic_rate,
             "voice_eq":     self.voice_eq,
+            "voice_amount": self.voice_amount,
             "nr_strength":  self.nr_strength,
             "trash_auto":   self.trash_auto,
             "trash_path":   self.trash_path,
@@ -3754,7 +3771,7 @@ class LensWindow(Adw.ApplicationWindow):
             else:
                 parts.append(FALLBACK_CLEAN)
         if self.voice_eq and have("equalizer-nbands"):
-            parts.append(VOICE_EQ)
+            parts.append(voice_eq(self.voice_amount))
         # Named so mute can be flipped on a running pipeline. Muting by
         # tearing the branch out would end the file and start another one.
         parts.append(f"volume name=micvol volume={self.mic_gain:.2f} "
@@ -4752,6 +4769,31 @@ class LensWindow(Adw.ApplicationWindow):
         veq.connect("notify::active", veq_done)
         grpa.add(veq)
 
+        amt_row = Adw.ActionRow(title="Voice clarity strength")
+        amt = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 1.3, 0.05)
+        amt.set_size_request(230, -1)
+        amt.set_draw_value(False)
+        amt.set_valign(Gtk.Align.CENTER)
+        amt.add_mark(1.0, Gtk.PositionType.BOTTOM, None)
+        amt.set_value(self.voice_amount)
+
+        def show_amt():
+            amt_row.set_subtitle(
+                f"{self.voice_amount * 100:.0f} percent of the correction for "
+                f"this mic. Less if it sounds harsh, more if still muffled")
+        show_amt()
+
+        def amt_done(sc):
+            self.voice_amount = float(sc.get_value())
+            show_amt()
+            self._save_settings()
+            if self._audio_mon:
+                self._stop_audio_monitor()
+                self._start_audio_monitor()
+        amt.connect("value-changed", amt_done)
+        amt_row.add_suffix(amt)
+        grpa.add(amt_row)
+
         str_row = Adw.ActionRow(title="Noise reduction strength")
         strength = Gtk.Scale.new_with_range(
             Gtk.Orientation.HORIZONTAL, 0, 99, 1)
@@ -4813,7 +4855,9 @@ class LensWindow(Adw.ApplicationWindow):
             self.nr_strength = RNNOISE_DEFAULT_VAD
             self.denoise = True
             self.voice_eq = True
+            self.voice_amount = 1.0
             veq.set_active(True)
+            amt.set_value(1.0)
             scale.set_value(0.0)
             strength.set_value(RNNOISE_DEFAULT_VAD)
             clean.set_active(True)
