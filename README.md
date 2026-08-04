@@ -27,15 +27,15 @@ Full-screen black viewfinder, iPhone-style controls:
 | Self-timer (3s, 10s) | ✅ |
 | Grid overlay (rule of thirds, 2x2) | ✅ |
 | Aspect ratio (4:3, 16:9, 1:1) | ✅ |
-| Digital zoom | ✅ |
+| Digital zoom: pinch, scroll, or the on-screen bar | ✅ |
 | Filters (mono, vivid, warm, cool, sepia, x-ray, cross) | ✅ |
 | Screen flash for low light | ✅ |
 | Tap to meter | ✅ |
 | Mirrored preview, with the file left unmirrored | ✅ |
-| Manual exposure, drag up or down on the picture | ✅ |
+| Manual exposure in EV, drag up or down on the picture | ✅ |
 | Camcorder HUD, interactive | ✅ |
 | Gallery: browse, crop, rotate, mirror, rename | ✅ |
-| Trash with a recycle bin and retention | ✅ |
+| Trash with a recycle bin, its own folder, optional auto-purge | ✅ |
 | Settings: folders, naming, mic gain with a live meter, mirroring, retention | ✅ |
 | Touch gestures (swipe = flip, pinch = zoom) | 🚧 planned |
 | Subtitles from speech | 🚧 planned |

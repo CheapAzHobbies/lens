@@ -273,6 +273,10 @@ def have(element):
 # same room, in order: nothing -29.4, band-pass plus gate plus compressor
 # -29.3, this -700.
 RNNOISE = "ladspa-librnnoise-ladspa-so-noise-suppressor-mono"
+# How readily it calls something noise. Lower keeps more of what it is
+# unsure about, which is the escape hatch if suppression is chewing on the
+# voice itself rather than the room.
+RNNOISE_DEFAULT_VAD = 49
 # Kept only as the fallback for a machine without the plugin. It is much worse
 # and the numbers above say so.
 FALLBACK_CLEAN = ("audiowsincband mode=band-pass lower-frequency=110 "
@@ -591,8 +595,23 @@ def next_name(folder, prefix, kind, ext):
     return folder / f"{prefix}_{kind}_{top + 1:04d}.{ext}"
 
 
+_TRASH_OVERRIDE = None
+
+
 def trash_dir():
-    return CONFIG_DIR / "trash"
+    return _TRASH_OVERRIDE or (CONFIG_DIR / "trash")
+
+
+def set_trash_dir(path):
+    """Point the bin somewhere else. Module level because purge_trash and the
+    gallery both need it and neither has the window to hand."""
+    global _TRASH_OVERRIDE
+    _TRASH_OVERRIDE = pathlib.Path(path).expanduser() if path else None
+    if _TRASH_OVERRIDE:
+        try:
+            _TRASH_OVERRIDE.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            _TRASH_OVERRIDE = None
 
 
 def purge_trash(days):
@@ -1847,12 +1866,17 @@ class LensWindow(Adw.ApplicationWindow):
         self.vid_dir = pathlib.Path(cfg.get("vid_dir", str(DEF_VIDEOS))).expanduser()
         self.name_prefix = cfg.get("name_prefix", "Lens") or "Lens"
         self.trash_days = int(cfg.get("trash_days", 30))
+        # Both of these decide where the bin is and whether to empty it, so
+        # they have to land before the purge below runs.
+        self.trash_auto = bool(cfg.get("trash_auto", True))
+        self.trash_path = cfg.get("trash_path") or ""
+        set_trash_dir(self.trash_path)
         for d in (self.pic_dir, self.vid_dir, trash_dir()):
             try:
                 d.mkdir(parents=True, exist_ok=True)
             except OSError as e:
                 print(f"Lens: cannot create {d}: {e}", file=sys.stderr)
-        purge_trash(self.trash_days)
+        purge_trash(self.trash_days if self.trash_auto else 0)
         self.container = cfg.get("container", "MKV")
         if self.container not in CONTAINERS:
             self.container = "MKV"
@@ -1868,6 +1892,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.mic_available = has_microphone()
         self.mic_enabled = bool(cfg.get("mic_enabled", True))
         self.mic_gain = float(cfg.get("mic_gain", 2.0))
+        self.nr_strength = int(cfg.get("nr_strength", RNNOISE_DEFAULT_VAD))
         self.mirror_view = bool(cfg.get("mirror_view", True))
         self.mirror_saved = bool(cfg.get("mirror_saved", False))
         self.exposure_auto = True
@@ -1876,6 +1901,7 @@ class LensWindow(Adw.ApplicationWindow):
         self._exp_range_for = None
         self._exp_dragging = False
         self._exp_start = None
+        self._exp_ref = None
         self.mic_active = False
         self._audio_mon = None
         self._audio_mon_handler = None
@@ -2089,6 +2115,11 @@ class LensWindow(Adw.ApplicationWindow):
         if not self._exp_dragging:
             self._exp_dragging = True
             self._exp_start = self._current_exposure()
+            if self.exposure_auto:
+                # Whatever the camera had settled on is zero stops. Anchored
+                # once, so a second drag reads relative to the same place
+                # rather than resetting the scale under you.
+                self._exp_ref = self._exp_start
         lo, hi = self._exposure_range()
         # Up is brighter, and the scale is logarithmic because exposure is:
         # a fixed number of microseconds per pixel would crawl at the bottom
@@ -2107,15 +2138,23 @@ class LensWindow(Adw.ApplicationWindow):
         self._v4l2("-c", "auto_exposure=1", "-c", f"exposure_time_absolute={val}")
         self.exposure_auto = False
         self.exposure_val = val
-        # Shutter time reads better than a raw v4l2 unit. The unit is 100us.
-        self.exp_label.set_label(f"1/{max(1, int(10000 / max(val, 1)))}s")
+        # Stops away from what the camera chose, not a shutter fraction. 1/18
+        # is a true reading of the sensor but it answers a question nobody
+        # asked; what you want to know while dragging is how much brighter
+        # than normal you have made it.
+        self.exp_label.set_label(f"{self._exposure_ev():+.1f} EV")
         self.exp_label.set_visible(True)
         self._refresh_exposure_button()
+
+    def _exposure_ev(self):
+        ref = self._exp_ref or self.exposure_val or 1
+        return math.log2(max(self.exposure_val or 1, 1) / max(ref, 1))
 
     def _exposure_to_auto(self, *_):
         self._v4l2("-c", "auto_exposure=3")
         self.exposure_auto = True
         self.exposure_val = None
+        self._exp_ref = None
         self.exp_label.set_visible(False)
         self._refresh_exposure_button()
 
@@ -2131,9 +2170,12 @@ class LensWindow(Adw.ApplicationWindow):
             b.set_tooltip_text("Exposure is automatic. Drag up or down on the "
                                "picture to set it by hand")
         else:
-            b.set_label(f"1/{max(1, int(10000 / max(self.exposure_val or 1, 1)))}")
+            b.set_label(f"{self._exposure_ev():+.1f}")
             b.add_css_class("pill-active")
-            b.set_tooltip_text("Exposure is held. Click for automatic")
+            b.set_tooltip_text(
+                f"Exposure held {self._exposure_ev():+.1f} stops from auto "
+                f"(1/{max(1, int(10000 / max(self.exposure_val or 1, 1)))}s). "
+                f"Click for automatic")
 
     def _meter_at(self, x, y):
         """Re-meter for what was tapped.
@@ -2207,7 +2249,15 @@ class LensWindow(Adw.ApplicationWindow):
         self.zoom = max(1.0, min(4.0, z))
         self._apply_zoom()
         self.zoom_label.set_label(f"{self.zoom:.1f}x")
-        self.zoom_label.set_visible(self.zoom > 1.001)
+        # The floating chip is for the moment you are turning the wheel; the
+        # bar is always there, so it does not need to double up.
+        self.zoom_label.set_visible(False)
+        if getattr(self, "zoom_reset", None) is not None:
+            self.zoom_reset.set_label(f"{self.zoom:.1f}x")
+            if self.zoom > 1.001:
+                self.zoom_reset.add_css_class("pill-active")
+            else:
+                self.zoom_reset.remove_css_class("pill-active")
         self._save_settings()
 
     def _on_frame(self, *_):
@@ -2316,6 +2366,12 @@ class LensWindow(Adw.ApplicationWindow):
         self.meter_box = MeterBox()
         self.frame_stack.add_overlay(self.meter_box)
         # Zoom readout, shown only while zoomed so it is not permanent chrome.
+        self.zoom_reset = Gtk.Button(label="1.0x")
+        self.zoom_reset.add_css_class("zoomstep")
+        self.zoom_reset.add_css_class("zoomval")
+        self.zoom_reset.set_tooltip_text("Tap to go back to 1x")
+        self.zoom_reset.connect("clicked", lambda *_: self.set_zoom(1.0))
+
         self.zoom_label = Gtk.Label(label="1.0x")
         self.zoom_label.add_css_class("hud-mono")
         self.zoom_label.add_css_class("hud-chip")
@@ -2366,6 +2422,31 @@ class LensWindow(Adw.ApplicationWindow):
         zoom_scroll.connect(
             "scroll", lambda c, dx, dy: (self.set_zoom(self.zoom - dy * 0.25), True)[1])
         self.frame_stack.add_controller(zoom_scroll)
+
+        # Pinch, for the touchscreen this whole app is meant for. Scroll only
+        # ever worked with a mouse, and a feature you cannot find is not a
+        # feature.
+        pinch = Gtk.GestureZoom.new()
+        pinch.connect("begin", lambda *_: setattr(self, "_pinch_base", self.zoom))
+        pinch.connect("scale-changed",
+                      lambda g, sc: self.set_zoom(getattr(self, "_pinch_base", 1.0) * sc))
+        self.frame_stack.add_controller(pinch)
+
+        # And a visible one, because a gesture with nothing on screen to hint
+        # at it is invisible.
+        self.zoom_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.zoom_bar.add_css_class("zoombar")
+        self.zoom_bar.set_halign(Gtk.Align.CENTER)
+        self.zoom_bar.set_valign(Gtk.Align.END)
+        self.zoom_bar.set_margin_bottom(10)
+        for txt, step in (("\u2212", -0.25), ("+", 0.25)):
+            btn = Gtk.Button(label=txt)
+            btn.add_css_class("zoomstep")
+            btn.connect("clicked", lambda _b, d=step: self.set_zoom(self.zoom + d))
+            if txt == "+":
+                self.zoom_bar.append(self.zoom_reset)
+            self.zoom_bar.append(btn)
+        self.frame_stack.add_overlay(self.zoom_bar)
 
         view_click = Gtk.GestureClick.new()
         view_click.set_button(3)
@@ -3065,6 +3146,13 @@ class LensWindow(Adw.ApplicationWindow):
         .winctl-close:hover { background: #e01b24; }
         .flash-on { color: #ffc107; background: rgba(255,193,7,0.18); }
         .flash-on:hover { background: rgba(255,193,7,0.30); }
+        .zoombar { background: rgba(0,0,0,0.45); border-radius: 20px;
+                   padding: 3px; }
+        .zoomstep { background: none; background-image: none; border: none;
+                    color: white; min-width: 34px; min-height: 30px;
+                    border-radius: 16px; padding: 0 6px; font-size: 15px; }
+        .zoomstep:hover { background: rgba(255,255,255,0.16); }
+        .zoomval { font-family: monospace; min-width: 52px; }
         .exp-manual { color: #ffc107; background: rgba(255,193,7,0.18); }
         .winctl:disabled { color: rgba(255,255,255,0.25);
                            background: rgba(255,255,255,0.04); }
@@ -3264,6 +3352,9 @@ class LensWindow(Adw.ApplicationWindow):
             "overlay_mode": getattr(self, "overlay_mode", 0),
             "mic_enabled":  self.mic_enabled,
             "mic_gain":     self.mic_gain,
+            "nr_strength":  self.nr_strength,
+            "trash_auto":   self.trash_auto,
+            "trash_path":   self.trash_path,
             "mirror_view":  self.mirror_view,
             "mirror_saved": self.mirror_saved,
             "container":    self.container,
@@ -3479,7 +3570,10 @@ class LensWindow(Adw.ApplicationWindow):
             # Mono throughout: RNNoise and the limiter are both mono elements,
             # and one built-in mic has nothing stereo to say anyway.
             parts.append("audio/x-raw,channels=1")
-            parts.append(RNNOISE if have(RNNOISE) else FALLBACK_CLEAN)
+            if have(RNNOISE):
+                parts.append(f"{RNNOISE} name=nr vad-threshold={self.nr_strength}")
+            else:
+                parts.append(FALLBACK_CLEAN)
         # Named so mute can be flipped on a running pipeline. Muting by
         # tearing the branch out would end the file and start another one.
         parts.append(f"volume name=micvol volume={self.mic_gain:.2f} "
@@ -4438,6 +4532,54 @@ class LensWindow(Adw.ApplicationWindow):
                 self._start_audio_monitor()
         clean.connect("notify::active", clean_done)
         grpa.add(clean)
+
+        str_row = Adw.ActionRow(title="Noise reduction strength")
+        strength = Gtk.Scale.new_with_range(0, 99, 1)
+        strength.set_size_request(230, -1)
+        strength.set_draw_value(False)
+        strength.set_valign(Gtk.Align.CENTER)
+        strength.add_mark(RNNOISE_DEFAULT_VAD, Gtk.PositionType.BOTTOM, None)
+        strength.set_value(self.nr_strength)
+
+        def show_strength():
+            n = self.nr_strength
+            word = ("gentle, keeps more of the room" if n < 35 else
+                    "balanced" if n < 65 else "aggressive, may chew the voice")
+            str_row.set_subtitle(f"{n} percent, {word}")
+        show_strength()
+
+        def strength_moved(sc):
+            self.nr_strength = int(sc.get_value())
+            show_strength()
+            for pipe in (self.pipeline, self._audio_mon):
+                el = pipe.get_by_name("nr") if pipe is not None else None
+                if el is not None:
+                    el.set_property("vad-threshold", self.nr_strength)
+            self._save_settings()
+        strength.connect("value-changed", strength_moved)
+        str_row.add_suffix(strength)
+        str_row.set_visible(have(RNNOISE))
+        grpa.add(str_row)
+
+        # A way back. It is easy to drag three sliders somewhere bad and have
+        # no idea which one did it.
+        reset_row = Adw.ActionRow(title="Start over")
+        reset_row.set_subtitle("Put gain, strength and noise reduction back to default")
+        rbtn = Gtk.Button(label="Reset audio")
+        rbtn.set_valign(Gtk.Align.CENTER)
+
+        def do_reset(*_):
+            self.mic_gain = 1.0
+            self.nr_strength = RNNOISE_DEFAULT_VAD
+            self.denoise = True
+            scale.set_value(0.0)
+            strength.set_value(RNNOISE_DEFAULT_VAD)
+            clean.set_active(True)
+            show_gain(); show_strength()
+            self._save_settings()
+        rbtn.connect("clicked", do_reset)
+        reset_row.add_suffix(rbtn)
+        grpa.add(reset_row)
         page.add(grpa)
 
         grpv = Adw.PreferencesGroup(title="Viewfinder")
@@ -4472,15 +4614,26 @@ class LensWindow(Adw.ApplicationWindow):
         grp3 = Adw.PreferencesGroup(
             title="Recycle bin",
             description="Deleted files wait here before being removed for good")
-        spin = Adw.SpinRow.new_with_range(0, 365, 1)
+        auto = Adw.SwitchRow(title="Delete old files automatically")
+        auto.set_subtitle("Off means nothing leaves the bin unless you empty it")
+        auto.set_active(self.trash_auto)
+
+        spin = Adw.SpinRow.new_with_range(1, 365, 1)
         spin.set_title("Keep for (days)")
-        spin.set_subtitle("0 keeps them until you empty the bin yourself")
-        spin.set_value(self.trash_days)
+        spin.set_value(max(1, self.trash_days))
+        spin.set_sensitive(self.trash_auto)
 
         def days_done(*_):
             self.trash_days = int(spin.get_value())
             self._save_settings()
+
+        def auto_done(row, *_):
+            self.trash_auto = row.get_active()
+            spin.set_sensitive(self.trash_auto)
+            self._save_settings()
         spin.connect("notify::value", days_done)
+        auto.connect("notify::active", auto_done)
+        grp3.add(auto)
         grp3.add(spin)
 
         where = Adw.ActionRow(title="Bin location", subtitle=str(trash_dir()))
@@ -4488,6 +4641,27 @@ class LensWindow(Adw.ApplicationWindow):
         ob.set_valign(Gtk.Align.CENTER)
         ob.connect("clicked", lambda *_: Gio.AppInfo.launch_default_for_uri(
             trash_dir().as_uri(), None))
+        cb = Gtk.Button(label="Change")
+        cb.set_valign(Gtk.Align.CENTER)
+
+        def pick_bin(*_):
+            dlg = Gtk.FileDialog()
+            dlg.set_title("Where should deleted files go?")
+
+            def done(d, res):
+                try:
+                    f = d.select_folder_finish(res)
+                except Exception:
+                    return
+                if f is None:
+                    return
+                self.trash_path = f.get_path()
+                set_trash_dir(self.trash_path)
+                where.set_subtitle(str(trash_dir()))
+                self._save_settings()
+            dlg.select_folder(win, None, done)
+        cb.connect("clicked", pick_bin)
+        where.add_suffix(cb)
         where.add_suffix(ob)
         grp3.add(where)
 
