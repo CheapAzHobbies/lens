@@ -222,7 +222,10 @@ TUX_SHEET  = "tux_saving.png"
 TUX_FRAMES = 32
 TUX_MS     = 80          # ~12fps, which is about where the dance reads right
 SAVING_MIN_VISIBLE = 7.0  # seconds
-SAVING_LABEL_W = 84       # px, wide enough for 'Saving...' at any dot count
+# Measured in the app with the real style applied: 'Saving' is 58px and
+# each dot adds 10, so 'Saving...' needs 88. It was set to 84, four short,
+# and the label quietly ellipsised itself into looking crushed.
+SAVING_LABEL_W = 94
 TUX_W, TUX_H = 117, 155
 # Corner size, keeping the sprite's proportions.
 TUX_SMALL_H = 38
@@ -255,9 +258,16 @@ def tux_frames():
                 sheet = GdkPixbuf.Pixbuf.new_from_file(str(f))
                 w = sheet.get_width() // TUX_FRAMES
                 h = sheet.get_height()
+                # Scaled here rather than by the widget. A Gtk.Picture takes
+                # its natural width from the texture, so full-size frames made
+                # the chip 117px wide per frame while drawing a 29px penguin
+                # centred in it, leaving the bird 99px short of the corner it
+                # was supposed to be sitting in.
                 tux_frames._cache = [
                     Gdk.Texture.new_for_pixbuf(
-                        sheet.new_subpixbuf(i * w, 0, w, h))
+                        sheet.new_subpixbuf(i * w, 0, w, h).scale_simple(
+                            TUX_SMALL_W, TUX_SMALL_H,
+                            GdkPixbuf.InterpType.BILINEAR))
                     for i in range(TUX_FRAMES)]
             except Exception as e:
                 print(f"Lens: cannot load {f}: {e}", file=sys.stderr)
@@ -479,55 +489,6 @@ FILTERS = {
     "Cross":  ({}, "xpro"),
 }
 
-# Sprite sheet for the save indicator: 32 frames laid out in one row.
-TUX_SHEET  = "tux_saving.png"
-TUX_FRAMES = 32
-TUX_MS     = 80          # ~12fps, which is about where the dance reads right
-TUX_W, TUX_H = 117, 155
-
-
-def asset(name):
-    """Find a bundled asset whether running from the tree or installed."""
-    here = pathlib.Path(__file__).resolve().parent
-    for base in (here / "assets", here.parent / "assets",
-                 pathlib.Path("/usr/share/lens/assets")):
-        f = base / name
-        if f.exists():
-            return f
-    return None
-
-
-def tux_frames():
-    """Slice the sheet once and hand back textures, or None if it is missing.
-
-    Cached on the function because the overlay is rebuilt per save and
-    re-decoding 32 frames each time would stall the very moment it exists
-    to cover.
-    """
-    if not hasattr(tux_frames, "_cache"):
-        tux_frames._cache = None
-        f = asset(TUX_SHEET)
-        if f is not None:
-            try:
-                sheet = GdkPixbuf.Pixbuf.new_from_file(str(f))
-                w = sheet.get_width() // TUX_FRAMES
-                h = sheet.get_height()
-                tux_frames._cache = [
-                    Gdk.Texture.new_for_pixbuf(
-                        sheet.new_subpixbuf(i * w, 0, w, h))
-                    for i in range(TUX_FRAMES)]
-            except Exception as e:
-                print(f"Lens: cannot load {f}: {e}", file=sys.stderr)
-    return tux_frames._cache
-
-
-DENOISE_CHAIN = ("audiowsincband mode=band-pass lower-frequency=110 "
-                 "upper-frequency=7500 length=101")
-# The hiss is the mic's own noise floor, not the room: turning the capture
-# gain down moved noise and voice together and changed nothing. A band-pass
-# cannot help either, because the noise sits under the voice. What does help
-# is holding the floor down whenever nobody is talking, then making up the
-# level afterwards, which is roughly what a phone does.
 def audio_facts():
     """Everything about the capture path that can actually be read back.
 
@@ -2020,7 +1981,7 @@ class LensWindow(Adw.ApplicationWindow):
         self._build_ui()
         self._install_breakpoints()
         self._apply_settings()
-        self._start_pipeline()
+        self._start_pipeline(defer_attach=True)
 
     # ---------- pipeline ----------
     def _start_pipeline(self, defer_attach=False, on_ready=None):
@@ -2505,6 +2466,15 @@ class LensWindow(Adw.ApplicationWindow):
         self.picture = Gtk.Picture()
         self.picture.set_can_shrink(True)
         self.picture.set_content_fit(Gtk.ContentFit.COVER)  # fill + crop
+        # A transparent stand-in, so the Picture has an intrinsic size from
+        # the moment the window opens. With no paintable at all it reports
+        # nothing, the aspect frame collapses, and the overlay is squashed
+        # into a band until the camera delivers its first frame about a
+        # second later. Same fault as the record swap, at startup.
+        _ph = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, 64, 48)
+        _ph.fill(0x00000000)
+        self._placeholder = Gdk.Texture.new_for_pixbuf(_ph)
+        self.picture.set_paintable(self._placeholder)
         self.picture.set_hexpand(True); self.picture.set_vexpand(True)
 
         # Grid lives inside the aspect frame, over the picture only. On the
@@ -3061,8 +3031,8 @@ class LensWindow(Adw.ApplicationWindow):
         self.saving.add_css_class("saving-chip")
         self.saving.set_halign(Gtk.Align.END)
         self.saving.set_valign(Gtk.Align.END)
-        self.saving.set_margin_end(12)
-        self.saving.set_margin_bottom(8)
+        self.saving.set_margin_end(6)
+        self.saving.set_margin_bottom(6)
         self.tux = Gtk.Picture()
         self.tux.set_size_request(TUX_SMALL_W, TUX_SMALL_H)
         self.tux.set_content_fit(Gtk.ContentFit.CONTAIN)
@@ -3081,8 +3051,11 @@ class LensWindow(Adw.ApplicationWindow):
         # set above the real text width, so nothing is ever ellipsized.
         self.saving_label.set_ellipsize(Pango.EllipsizeMode.END)
         self.saving_label.set_max_width_chars(1)
-        self.saving.append(self.tux)
+        # Text first, penguin last, so the penguin is the thing in the corner
+        # rather than the word. Right aligned, the box grows leftwards, so
+        # whichever child is appended last is the one against the edge.
         self.saving.append(self.saving_label)
+        self.saving.append(self.tux)
         self.saving.set_visible(False)
         # Never takes a click. It appears over the action area, and swallowing
         # a press meant for the shutter or the flip button would be worse than
@@ -3209,7 +3182,7 @@ class LensWindow(Adw.ApplicationWindow):
         /* ---- gallery ---- */
         /* Saving: a penguin having a nice time while the muxer finishes. */
         .saving-chip { background: rgba(12,12,16,0.82);
-                       border-radius: 14px; padding: 4px 12px 4px 6px; }
+                       border-radius: 14px; padding: 4px 6px 4px 12px; }
         /* The sprite carries its own motion, so nothing to animate in CSS. */
         .saving-text { color: rgba(255,255,255,0.92); font-size: 14px;
                        font-family: monospace; letter-spacing: 2px; }
