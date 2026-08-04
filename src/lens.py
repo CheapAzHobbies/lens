@@ -3610,10 +3610,20 @@ class LensWindow(Adw.ApplicationWindow):
             if getattr(self, "_saving_hide", None):
                 GLib.source_remove(self._saving_hide)
                 self._saving_hide = None
+            if getattr(self, "_saving_timer", None):
+                # Already dancing. Stop here and let it carry on: the clock
+                # above has been reset, so the hold extends. Falling through
+                # would add a second tick timer to the same widget without
+                # removing the first, and two more on the save after that.
+                # Three overlapping saves ran the sprite at 36 frames a
+                # second instead of 11, and leaked a timer each time.
+                self.saving.set_visible(True)
+                return
         self.saving.set_visible(on)
         if on:
             self._saving_frame = 0
             self._saving_dots = 0
+            self.saving_label.set_label("Saving")
             if frames:
                 self.tux.set_paintable(frames[0])
 
