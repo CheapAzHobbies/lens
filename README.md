@@ -130,7 +130,7 @@ never makes the next shot overwrite something.
 ## Assets
 
 `assets/tux_saving.png` is the save indicator: 32 frames of a dancing penguin,
-shown while a clip is being written. Regenerate it from the source sheet with:
+shown in the bottom corner while a clip is being written. Regenerate it from the source sheet with:
 
 ```bash
 python3 tools/extract_tux.py assets/tux_saving_source.jpeg

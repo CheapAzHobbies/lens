@@ -221,7 +221,12 @@ FILTERS = {
 TUX_SHEET  = "tux_saving.png"
 TUX_FRAMES = 32
 TUX_MS     = 80          # ~12fps, which is about where the dance reads right
+SAVING_MIN_VISIBLE = 7.0  # seconds
+SAVING_LABEL_W = 84       # px, wide enough for 'Saving...' at any dot count
 TUX_W, TUX_H = 117, 155
+# Corner size, keeping the sprite's proportions.
+TUX_SMALL_H = 38
+TUX_SMALL_W = round(117 * TUX_SMALL_H / 155)
 
 
 def asset(name):
@@ -3049,23 +3054,44 @@ class LensWindow(Adw.ApplicationWindow):
 
         # Saving indicator. Writing a clip takes a moment while the queues
         # drain, and without this the app just looks frozen.
-        self.saving = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        self.saving.add_css_class("saving-bg")
-        self.saving.set_halign(Gtk.Align.FILL); self.saving.set_valign(Gtk.Align.FILL)
-        self.saving.set_hexpand(True); self.saving.set_vexpand(True)
-        inner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
-        inner.set_halign(Gtk.Align.CENTER); inner.set_valign(Gtk.Align.CENTER)
-        inner.set_vexpand(True)
+        # A corner indicator rather than a full screen. Saving takes about a
+        # tenth of a second now that EOS is actually being listened for, so
+        # covering the whole window for it only produced a flash.
+        self.saving = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.saving.add_css_class("saving-chip")
+        self.saving.set_halign(Gtk.Align.END)
+        self.saving.set_valign(Gtk.Align.END)
+        self.saving.set_margin_end(12)
+        self.saving.set_margin_bottom(8)
         self.tux = Gtk.Picture()
-        self.tux.set_size_request(TUX_W, TUX_H)
+        self.tux.set_size_request(TUX_SMALL_W, TUX_SMALL_H)
         self.tux.set_content_fit(Gtk.ContentFit.CONTAIN)
-        self.tux.set_can_shrink(False)
+        self.tux.set_can_shrink(True)
         self.saving_label = Gtk.Label(label="Saving")
         self.saving_label.add_css_class("saving-text")
-        inner.append(self.tux); inner.append(self.saving_label)
-        self.saving.append(inner)
+        # Fixed pixel width, left aligned. The dots are appended, and letting
+        # the label grow shoved the penguin sideways three times a second.
+        # width_chars is not enough: it reserves an average character width,
+        # which still left the penguin moving over a 12px range.
+        self.saving_label.set_size_request(SAVING_LABEL_W, -1)
+        self.saving_label.set_xalign(0.0)
+        # A size request is a minimum, so the label still grew past it as the
+        # dots were added and carried the penguin along. Ellipsizing caps the
+        # natural width as well, which is what actually pins it. The width is
+        # set above the real text width, so nothing is ever ellipsized.
+        self.saving_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.saving_label.set_max_width_chars(1)
+        self.saving.append(self.tux)
+        self.saving.append(self.saving_label)
         self.saving.set_visible(False)
-        self.saving.set_can_target(True)   # swallow clicks while it is up
+        # Never takes a click. It appears over the action area, and swallowing
+        # a press meant for the shutter or the flip button would be worse than
+        # not showing it at all.
+        self.saving.set_can_target(False)
+        # The window's bottom right corner, in the strip below the flip
+        # button rather than over it. Measured: in a 960x640 window the flip
+        # ends at y=582 and the shutter at x=522, so a short chip along the
+        # bottom edge clears both.
         root.add_overlay(self.saving)
 
         # Gallery (last overlay so it sits on top of everything)
@@ -3182,9 +3208,10 @@ class LensWindow(Adw.ApplicationWindow):
         }
         /* ---- gallery ---- */
         /* Saving: a penguin having a nice time while the muxer finishes. */
-        .saving-bg { background: rgba(10,10,12,0.88); }
+        .saving-chip { background: rgba(12,12,16,0.82);
+                       border-radius: 14px; padding: 4px 12px 4px 6px; }
         /* The sprite carries its own motion, so nothing to animate in CSS. */
-        .saving-text { color: rgba(255,255,255,0.92); font-size: 22px;
+        .saving-text { color: rgba(255,255,255,0.92); font-size: 14px;
                        font-family: monospace; letter-spacing: 2px; }
         .gal { background: #16161a; }
         .gal-bar { background: #16161a; }
@@ -3584,9 +3611,32 @@ class LensWindow(Adw.ApplicationWindow):
         })
 
     def _show_saving(self, on):
-        """Dancing penguin while the file is written."""
+        """Dancing penguin while the file is written.
+
+        Held for a moment even once the file is done. A save is about a
+        tenth of a second, and an indicator that appears and vanishes inside
+        one frame is just a flicker: you cannot tell whether it saved or
+        whether something twitched.
+        """
         frames = tux_frames()
         self.tux.set_visible(frames is not None)
+        if not on:
+            shown = time.monotonic() - getattr(self, "_saving_since", 0.0)
+            left = SAVING_MIN_VISIBLE - shown
+            if left > 0:
+                if getattr(self, "_saving_hide", None):
+                    GLib.source_remove(self._saving_hide)
+                self._saving_hide = GLib.timeout_add(
+                    int(left * 1000), lambda: (self._show_saving(False), False)[1])
+                return
+            if getattr(self, "_saving_hide", None):
+                GLib.source_remove(self._saving_hide)
+                self._saving_hide = None
+        else:
+            self._saving_since = time.monotonic()
+            if getattr(self, "_saving_hide", None):
+                GLib.source_remove(self._saving_hide)
+                self._saving_hide = None
         self.saving.set_visible(on)
         if on:
             self._saving_frame = 0
