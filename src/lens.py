@@ -218,18 +218,24 @@ FILTERS = {
 }
 
 # Sprite sheet for the save indicator: 32 frames laid out in one row.
-TUX_SHEET  = "tux_saving.png"
-TUX_FRAMES = 32
-TUX_MS     = 80          # ~12fps, which is about where the dance reads right
-SAVING_MIN_VISIBLE = 7.0  # seconds
+# The Club Penguin dance, recoloured black by tools/make_penguin_sheet.py.
+# 141 frames at 50ms is the source GIF's own timing, read from its frame
+# delays rather than guessed: 7.05 seconds for one loop, which is why the
+# indicator is held for that long.
+TUX_SHEET  = "penguin_saving.png"
+TUX_FRAMES = 141
+TUX_COLS   = 12          # the sheet is a grid; one row would be 17000px wide
+TUX_MS     = 50          # 20fps, the rate the frames were authored at
+SAVING_MIN_VISIBLE = 7.05
 # Measured in the app with the real style applied: 'Saving' is 58px and
 # each dot adds 10, so 'Saving...' needs 88. It was set to 84, four short,
 # and the label quietly ellipsised itself into looking crushed.
 SAVING_LABEL_W = 94
-TUX_W, TUX_H = 117, 155
-# Corner size, keeping the sprite's proportions.
-TUX_SMALL_H = 38
-TUX_SMALL_W = round(117 * TUX_SMALL_H / 155)
+TUX_W, TUX_H = 124, 120
+# Corner size. The bottom strip between the flip button and the window edge
+# is about 50px, so this is close to the ceiling.
+TUX_SMALL_H = 44
+TUX_SMALL_W = round(TUX_W * TUX_SMALL_H / TUX_H)
 
 
 def asset(name):
@@ -256,8 +262,9 @@ def tux_frames():
         if f is not None:
             try:
                 sheet = GdkPixbuf.Pixbuf.new_from_file(str(f))
-                w = sheet.get_width() // TUX_FRAMES
-                h = sheet.get_height()
+                rows = (TUX_FRAMES + TUX_COLS - 1) // TUX_COLS
+                w = sheet.get_width() // TUX_COLS
+                h = sheet.get_height() // rows
                 # Scaled here rather than by the widget. A Gtk.Picture takes
                 # its natural width from the texture, so full-size frames made
                 # the chip 117px wide per frame while drawing a 29px penguin
@@ -265,9 +272,10 @@ def tux_frames():
                 # was supposed to be sitting in.
                 tux_frames._cache = [
                     Gdk.Texture.new_for_pixbuf(
-                        sheet.new_subpixbuf(i * w, 0, w, h).scale_simple(
-                            TUX_SMALL_W, TUX_SMALL_H,
-                            GdkPixbuf.InterpType.BILINEAR))
+                        sheet.new_subpixbuf((i % TUX_COLS) * w,
+                                            (i // TUX_COLS) * h, w, h)
+                        .scale_simple(TUX_SMALL_W, TUX_SMALL_H,
+                                      GdkPixbuf.InterpType.BILINEAR))
                     for i in range(TUX_FRAMES)]
             except Exception as e:
                 print(f"Lens: cannot load {f}: {e}", file=sys.stderr)
@@ -3032,7 +3040,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.saving.set_halign(Gtk.Align.END)
         self.saving.set_valign(Gtk.Align.END)
         self.saving.set_margin_end(6)
-        self.saving.set_margin_bottom(6)
+        self.saving.set_margin_bottom(3)
         self.tux = Gtk.Picture()
         self.tux.set_size_request(TUX_SMALL_W, TUX_SMALL_H)
         self.tux.set_content_fit(Gtk.ContentFit.CONTAIN)

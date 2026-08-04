@@ -129,12 +129,23 @@ never makes the next shot overwrite something.
 
 ## Assets
 
-`assets/tux_saving.png` is the save indicator: 32 frames of a dancing penguin,
-shown in the bottom corner while a clip is being written. Regenerate it from the source sheet with:
+`assets/penguin_saving.png` is the save indicator: the Club Penguin dance,
+141 frames, recoloured black. It runs at 20fps for one 7.05 second loop,
+which is the source GIF's own timing read from its frame delays.
+
+Rebuild it from the frames with:
 
 ```bash
-python3 tools/extract_tux.py assets/tux_saving_source.jpeg
+python3 tools/make_penguin_sheet.py path/to/frames -o assets/penguin_saving.png
 ```
+
+The recolour is a hue selection rather than a repaint: the body is a flat
+cyan, so it is picked by hue and mapped into a narrow dark range that keeps
+the shading. Selecting on raw channel values instead leaves a blue rim
+wherever the body meets the background, because those pixels are half cyan
+and half white. The background cannot be keyed on colour either, since the
+belly is also near-white, so the fill starts at the border and stops at the
+outline.
 
 ## License
 
