@@ -68,3 +68,31 @@ is none.
 ALSA nor PipeWire exposes; and the frequency response of the capture path,
 which needs a known excitation played through the speakers and has only been
 measured once, roughly.
+
+## Traps found the hard way
+
+**Pin the sample rate in every capture.** Leaving caps unpinned lets
+PipeWire negotiate 44100 and resample from the device's native 48000, which
+low-passes around 22 kHz and discards real noise energy above it. The same
+quiet room measures -41.90 dBFS at 48 kHz and -44.44 at 44.1 kHz. Every
+measurement here pins 48000; several experiments that did not were 2.5 dB
+optimistic before this was found.
+
+**The Capture control is not 0 to +30 dB.** It spans roughly -24 to +30 dB
+across its 0-63 range, about 0.75 dB per step. An early gain-placement test
+assumed the lower half was positive and compared four settings whose totals
+were +18, +5.5, +12.2 and +6.5 dB while calling them matched.
+
+## What the hardware turns out to be
+
+Measured, all at matched total analog gain with the rate pinned:
+
+- **Gain placement makes no difference.** Internal Mic Boost at 0, +20 and
+  +30 dB, with Capture reduced to compensate, all land within 0.27 dB of
+  each other. The noise is the microphone element, not either analog stage,
+  so there is nothing left to win by rearranging them.
+- **There is one working microphone.** The codec exposes two capture
+  sources; `Internal Mic 1` produces digital silence (-120 dBFS).
+- **No mains hum, no tonal content at all.**
+- Noise floor with +18 dB analog gain: **-41.9 dBFS**, reproducible to
+  0.04 dB.
