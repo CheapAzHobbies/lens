@@ -1888,6 +1888,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.zoom = float(cfg.get("zoom", 1.0))
         self.pan_x = 0.0
         self.pan_y = 0.0
+        self._zoom_syncing = False
         self.filter_name = cfg.get("filter", "None")
         if self.filter_name not in FILTERS:
             self.filter_name = "None"
@@ -2305,8 +2306,11 @@ class LensWindow(Adw.ApplicationWindow):
         vh = max(1, self.frame_stack.get_height())
         if mx > 0:
             # Drag right, the picture follows your finger, so the crop window
-            # moves left.
-            self.pan_x -= 2.0 * (dx * (w / z) / vw) / mx
+            # moves left. Mirrored, that reverses: the flip happens after the
+            # crop, so moving the window right makes the image travel right on
+            # screen rather than left.
+            sign = -1.0 if self.mirror_view else 1.0
+            self.pan_x -= sign * 2.0 * (dx * (w / z) / vw) / mx
         if my > 0:
             self.pan_y -= 2.0 * (dy * (h / z) / vh) / my
         self.pan_x = max(-1.0, min(1.0, self.pan_x))
@@ -2324,6 +2328,15 @@ class LensWindow(Adw.ApplicationWindow):
         # The floating chip is for the moment you are turning the wheel; the
         # bar is always there, so it does not need to double up.
         self.zoom_label.set_visible(False)
+        # The slider is one of several ways in (pinch, wheel, the buttons),
+        # so it has to follow the value rather than own it. Guarded, or
+        # setting it here fires value-changed straight back into this method.
+        sl = getattr(self, "zoom_slider", None)
+        if sl is not None and not self._zoom_syncing:
+            if abs(sl.get_value() - self.zoom) > 1e-4:
+                self._zoom_syncing = True
+                sl.set_value(self.zoom)
+                self._zoom_syncing = False
         if getattr(self, "zoom_reset", None) is not None:
             self.zoom_reset.set_label(f"{self.zoom:.1f}x")
             if self.zoom > 1.001:
@@ -2861,6 +2874,7 @@ class LensWindow(Adw.ApplicationWindow):
         hud.append(hud_top)
 
         spacer = Gtk.Box(); spacer.set_vexpand(True)
+        spacer.set_can_target(False)   # nothing here, so do not claim clicks
         hud.append(spacer)
 
         # --- bottom left: sound. Its own corner so the meter survives at
@@ -2940,6 +2954,13 @@ class LensWindow(Adw.ApplicationWindow):
         # On the picture, not the window: the readouts belong over the frame
         # you are shooting, not floating in the letterbox bars.
         self.frame_stack.add_overlay(self.rec_indicator)
+        # The HUD is built last, so it lands on top of the zoom control, which
+        # sits inside its bounds. Gestures still worked because the HUD is a
+        # descendant of the viewfinder and events bubble up to it, but the
+        # zoom bar is a sibling overlay and never saw them: visible, and
+        # completely dead to the touch. Re-adding raises it back to the front.
+        self.frame_stack.remove_overlay(self.zoom_bar)
+        self.frame_stack.add_overlay(self.zoom_bar)
         self.hud_timer = None
         self._power_samples = []
 
