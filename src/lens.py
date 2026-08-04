@@ -17,6 +17,7 @@ from gi.repository import Gtk, Adw, Gst, GLib, Gdk, Gio, GObject, GdkPixbuf, Gra
 Gst.init(None)
 
 APP_ID = "org.cheapaz.Lens"
+VERSION = "0.9"
 CONFIG_DIR = pathlib.Path(
     os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / "lens"
 SETTINGS = CONFIG_DIR / "settings.json"
@@ -196,6 +197,18 @@ def best_still_mode(dev):
 # the app, keeps a capture stream open, and lights the system microphone
 # indicator with nothing recording. This lives and dies with the pipeline, so
 # Lens can be packaged and shipped without touching the machine it runs on.
+# name -> (videobalance props, coloreffects preset)
+FILTERS = {
+    "None":   ({}, "none"),
+    "Mono":   ({"saturation": 0.0}, "none"),
+    "Vivid":  ({"saturation": 1.7, "contrast": 1.15}, "none"),
+    "Warm":   ({"hue": 0.06, "saturation": 1.15}, "none"),
+    "Cool":   ({"hue": -0.08, "saturation": 1.05}, "none"),
+    "Sepia":  ({}, "sepia"),
+    "X-Ray":  ({}, "xray"),
+    "Cross":  ({}, "xpro"),
+}
+
 DENOISE_CHAIN = ("audiowsincband mode=band-pass lower-frequency=110 "
                  "upper-frequency=7500 length=101")
 
@@ -451,6 +464,62 @@ class BatteryGauge(Gtk.DrawingArea):
         if inner > 0.5:
             cr.rectangle(2.5, 2.5, inner, h - 5)
             cr.fill()
+
+
+class MeterBox(Gtk.DrawingArea):
+    """The yellow square a phone camera draws where you tap.
+
+    On this hardware it cannot mean focus: neither camera exposes any focus
+    control at all, they are fixed-focus. It means exposure, which they do
+    support, so the box marks what is being metered rather than pretending
+    to rack a lens that is not there.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.point = None
+        self.scale = 1.0
+        self.alpha = 0.0
+        self.set_can_target(False)
+        self.set_draw_func(self._draw)
+
+    def ping(self, x, y):
+        self.point = (x, y)
+        self.scale, self.alpha = 1.45, 1.0
+        self.queue_draw()
+        if getattr(self, "_tick", None):
+            GLib.source_remove(self._tick)
+        self._tick = GLib.timeout_add(16, self._step)
+
+    def _step(self):
+        # Shrink onto the point, hold, then fade. Reads as "locked here".
+        if self.scale > 1.0:
+            self.scale = max(1.0, self.scale - 0.035)
+        else:
+            self.alpha -= 0.022
+        self.queue_draw()
+        if self.alpha <= 0:
+            self.point = None
+            self._tick = None
+            return False
+        return True
+
+    def _draw(self, area, cr, W, H):
+        if not self.point or self.alpha <= 0:
+            return
+        x, y = self.point
+        half = 42 * self.scale
+        cr.set_source_rgba(1.0, 0.78, 0.13, min(1.0, self.alpha))
+        cr.set_line_width(2)
+        cr.rectangle(x - half, y - half, half * 2, half * 2)
+        cr.stroke()
+        # Corner ticks, so it reads as a reticle and not a selection.
+        t = half * 0.32
+        for cx, cy, sx, sy in ((x - half, y - half, 1, 1), (x + half, y - half, -1, 1),
+                               (x - half, y + half, 1, -1), (x + half, y + half, -1, -1)):
+            cr.move_to(cx, cy + sy * t); cr.line_to(cx, cy); cr.line_to(cx + sx * t, cy)
+        cr.set_line_width(3)
+        cr.stroke()
 
 
 class CropOverlay(Gtk.DrawingArea):
@@ -1178,6 +1247,11 @@ class LensWindow(Adw.ApplicationWindow):
         self.mode_override = cfg.get("mode_override")
         self.mic_source = cfg.get("mic_source")     # None = system default
         self.denoise = bool(cfg.get("denoise", True))
+        self.flash_enabled = bool(cfg.get("flash", False))
+        self.zoom = float(cfg.get("zoom", 1.0))
+        self.filter_name = cfg.get("filter", "None")
+        if self.filter_name not in FILTERS:
+            self.filter_name = "None"
         self.mic_available = has_microphone()
         self.mic_enabled = bool(cfg.get("mic_enabled", True))
         self.mic_active = False
@@ -1255,14 +1329,22 @@ class LensWindow(Adw.ApplicationWindow):
         # and we pull the latest one when the shutter is pressed.
         # Let the camera pick its native resolution — forcing 1280x720 stretched
         # 4:3 sensors (like the Z13 rear camera at 2592x1944) into 16:9.
+        # videocrop trims the edges and the sink scales what is left back up:
+        # digital zoom, adjustable live without rebuilding the pipeline.
         pipe_str = (
-            f"{src} ! tee name=t "
+            f"{src} ! videocrop name=zoom ! videobalance name=vb ! "
+            f"coloreffects name=fx ! tee name=t "
             f"t. ! queue max-size-buffers=2 leaky=downstream ! gtk4paintablesink name=sink "
             f"t. ! queue max-size-buffers=2 leaky=downstream ! jpegenc quality=92 ! "
             f"appsink name=photosink emit-signals=false max-buffers=1 drop=true sync=false"
         )
         self.pipeline = Gst.parse_launch(pipe_str)
         sink = self.pipeline.get_by_name("sink")
+        self.zoom_elem = self.pipeline.get_by_name("zoom")
+        self.vb_elem = self.pipeline.get_by_name("vb")
+        self.fx_elem = self.pipeline.get_by_name("fx")
+        self._apply_zoom()
+        self._apply_filter()
         new_paintable = sink.props.paintable
         self.paintable = new_paintable
 
@@ -1323,6 +1405,74 @@ class LensWindow(Adw.ApplicationWindow):
         if w / h > target:
             return int(h * target), h
         return w, int(w / target)
+
+    def _on_meter_tap(self, gesture, n_press, x, y):
+        """Meter for what was tapped."""
+        self.meter_box.ping(x, y)
+        self._meter_at(x, y)
+
+    def _meter_at(self, x, y):
+        """Re-meter for what was tapped.
+
+        The camera meters the whole frame, so a backlit subject comes out a
+        silhouette. Toggling auto-exposure off and back on makes it re-run
+        its own metering for the scene as it is now, which is what actually
+        fixes that. Honest about the limit: this is a re-meter, not a spot
+        meter, because these cameras expose no region-of-interest control
+        that works.
+        """
+        dev = self.cameras[self.cam_idx][0]
+        import subprocess
+        for val in ("1", "3"):
+            try:
+                subprocess.run(["v4l2-ctl", "-d", dev, "-c", f"auto_exposure={val}"],
+                               capture_output=True, timeout=1)
+            except Exception:
+                return
+
+    def _apply_filter(self):
+        """Set the look. Live properties, so switching costs nothing."""
+        if not getattr(self, "vb_elem", None):
+            return
+        props, preset = FILTERS.get(self.filter_name, FILTERS["None"])
+        # Reset to neutral first: presets set different subsets, and leftovers
+        # from the previous one would compound.
+        for k, v in (("brightness", 0.0), ("contrast", 1.0),
+                     ("saturation", 1.0), ("hue", 0.0)):
+            self.vb_elem.set_property(k, props.get(k, v))
+        if self.fx_elem:
+            self.fx_elem.set_property("preset", preset)
+
+    def set_filter(self, name):
+        self.filter_name = name if name in FILTERS else "None"
+        self._apply_filter()
+        self.btn_fx.set_label(self.filter_name if self.filter_name != "None" else "FX")
+        if self.filter_name == "None":
+            self.btn_fx.remove_css_class("pill-active")
+        else:
+            self.btn_fx.add_css_class("pill-active")
+        self._save_settings()
+
+    def _apply_zoom(self):
+        """Crop symmetrically to the current zoom factor."""
+        if not getattr(self, "zoom_elem", None) or not self.cur_res:
+            return
+        w, h = self.cur_res
+        z = max(1.0, min(4.0, self.zoom))
+        cx = int((w - w / z) / 2)
+        cy = int((h - h / z) / 2)
+        # Keep it even: odd crops upset some colour formats.
+        cx -= cx % 2
+        cy -= cy % 2
+        for prop, val in (("left", cx), ("right", cx), ("top", cy), ("bottom", cy)):
+            self.zoom_elem.set_property(prop, val)
+
+    def set_zoom(self, z):
+        self.zoom = max(1.0, min(4.0, z))
+        self._apply_zoom()
+        self.zoom_label.set_label(f"{self.zoom:.1f}x")
+        self.zoom_label.set_visible(self.zoom > 1.001)
+        self._save_settings()
 
     def _on_frame(self, *_):
         self._fps_count += 1
@@ -1427,6 +1577,18 @@ class LensWindow(Adw.ApplicationWindow):
         # a permanent band. Not worth it.
         self.frame_stack.set_child(self.picture)
         self.frame_stack.add_overlay(self.grid_widget)
+        self.meter_box = MeterBox()
+        self.frame_stack.add_overlay(self.meter_box)
+        # Zoom readout, shown only while zoomed so it is not permanent chrome.
+        self.zoom_label = Gtk.Label(label="1.0x")
+        self.zoom_label.add_css_class("hud-mono")
+        self.zoom_label.add_css_class("hud-chip")
+        self.zoom_label.set_halign(Gtk.Align.CENTER)
+        self.zoom_label.set_valign(Gtk.Align.END)
+        self.zoom_label.set_margin_bottom(16)
+        self.zoom_label.set_visible(False)
+        self.zoom_label.set_can_target(False)
+        self.frame_stack.add_overlay(self.zoom_label)
         self.frame_stack.add_css_class("viewflip")
         # Nothing in the overlay may paint outside the picture, whatever
         # its natural width says.
@@ -1436,6 +1598,17 @@ class LensWindow(Adw.ApplicationWindow):
         # anything that should act on the shot itself.
         self.view_popover = Gtk.Popover()
         self.view_popover.set_parent(self.frame_stack)
+        meter_click = Gtk.GestureClick.new()
+        meter_click.set_button(1)
+        meter_click.connect("released", self._on_meter_tap)
+        self.frame_stack.add_controller(meter_click)
+
+        zoom_scroll = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.VERTICAL)
+        zoom_scroll.connect(
+            "scroll", lambda c, dx, dy: (self.set_zoom(self.zoom - dy * 0.25), True)[1])
+        self.frame_stack.add_controller(zoom_scroll)
+
         view_click = Gtk.GestureClick.new()
         view_click.set_button(3)
         view_click.connect("released", self._on_view_clicked)
@@ -1452,6 +1625,25 @@ class LensWindow(Adw.ApplicationWindow):
         # Its own strip above the viewfinder rather than floating over the
         # picture, so nothing covers the shot. Exit left, mode pills centred,
         # fullscreen right.
+        # The left of the top bar was empty, and settings had only been
+        # reachable from inside the gallery.
+        self.btn_settings = Gtk.Button()
+        self.btn_settings.set_child(Gtk.Image.new_from_icon_name("emblem-system-symbolic"))
+        self.btn_settings.get_child().set_pixel_size(18)
+        self.btn_settings.add_css_class("winctl")
+        self.btn_settings.set_valign(Gtk.Align.CENTER)
+        self.btn_settings.set_tooltip_text("Settings")
+        self.btn_settings.connect("clicked", lambda *_: self._open_settings())
+
+        self.btn_flash = Gtk.ToggleButton()
+        self.btn_flash.set_child(Gtk.Image.new_from_icon_name("display-brightness-symbolic"))
+        self.btn_flash.get_child().set_pixel_size(18)
+        self.btn_flash.add_css_class("winctl")
+        self.btn_flash.set_valign(Gtk.Align.CENTER)
+        self.btn_flash.set_tooltip_text(
+            "Screen flash: light the subject with the display before the shot")
+        self.btn_flash.connect("toggled", self._on_flash_toggled)
+
         self.btn_grid   = self._pill_button("#",   self._toggle_grid,   width=42, tint=False)
         self.btn_aspect = self._pill_button(self.aspects[0], self._toggle_aspect, width=58, tint=False)
         # A real icon, not the "⏱" glyph: that rendered tiny and was barely
@@ -1468,8 +1660,26 @@ class LensWindow(Adw.ApplicationWindow):
         self.btn_timer.set_size_request(58, 42)
         self.btn_timer.add_css_class("pill")
         self.btn_timer.connect("clicked", lambda *_: self._toggle_timer())
+        self.btn_fx = Gtk.MenuButton(label="FX")
+        self.btn_fx.set_size_request(58, 42)
+        self.btn_fx.add_css_class("pill")
+        self.btn_fx.set_tooltip_text("Look")
+        self.fx_popover = Gtk.Popover()
+        self.btn_fx.set_popover(self.fx_popover)
+        fxbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        fxbox.set_margin_top(6); fxbox.set_margin_bottom(6)
+        fxbox.set_margin_start(6); fxbox.set_margin_end(6)
+        for name in FILTERS:
+            b = Gtk.Button(label=name)
+            b.add_css_class("cam-row")
+            b.connect("clicked", lambda _b, n=name: (
+                self.fx_popover.popdown(), self.set_filter(n)))
+            fxbox.append(b)
+        self.fx_popover.set_child(fxbox)
+
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        top.append(self.btn_grid); top.append(self.btn_aspect); top.append(self.btn_timer)
+        top.append(self.btn_grid); top.append(self.btn_aspect)
+        top.append(self.btn_fx); top.append(self.btn_timer)
 
         # Standard window controls, right side, in the usual order:
         # minimize, maximize, close.
@@ -1513,6 +1723,10 @@ class LensWindow(Adw.ApplicationWindow):
         self._ballast = ballast
         self._top_pills = top
         self._winctl = winctl
+        left = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        left.append(self.btn_settings)
+        left.append(self.btn_flash)
+        top_bar.append(left)
         top_bar.append(ballast)
         top_bar.append(gap_l)
         top_bar.append(top)
@@ -2059,6 +2273,7 @@ class LensWindow(Adw.ApplicationWindow):
         .countdown { color: white; font-size: 96px; font-weight: bold;
                      background: rgba(0,0,0,0.5); padding: 30px 50px; border-radius: 60px; }
         .flash { background: black; }
+        .flash-white { background: #ffffff; }
         .rec-dot { background: #ff3b30; border-radius: 7px;
                    box-shadow: 0 0 8px rgba(255,59,48,0.9);
                    transition: opacity 180ms ease-out; }
@@ -2196,8 +2411,11 @@ class LensWindow(Adw.ApplicationWindow):
         # the mode pills sit at true centre. The controls shrink at narrow
         # widths, so a fixed 106px ballast pushed the pills off centre.
         btn = 34 if cls == "roomy" else 28
-        self._ballast.set_size_request(btn * 3 + 4, -1)
+        # The left group already occupies two buttons' worth, so the ballast
+        # only needs to make up the difference against three on the right.
+        self._ballast.set_size_request(max(0, btn - 4), -1)
         self._ballast.set_visible(cls == "roomy")
+        self.btn_flash.set_visible(cls != "tiny")
         self._top_pills.set_visible(cls != "tiny")
         self.btn_flip.set_visible(True)
 
@@ -2237,11 +2455,38 @@ class LensWindow(Adw.ApplicationWindow):
             "mode_override": self.mode_override,
             "mic_source":   self.mic_source,
             "denoise":      self.denoise,
+            "flash":        self.flash_enabled,
+            "zoom":         self.zoom,
+            "filter":       self.filter_name,
             "timer_sec":    self.timer_sec,
             "video_mode":   self.video_mode,
             "cam_id":       self.cameras[self.cam_idx][2],
             "cam_latency":  self._cam_latency,
         })
+
+    def _on_flash_toggled(self, btn):
+        self.flash_enabled = btn.get_active()
+        self._save_settings()
+
+    def _screen_flash_then(self, fn):
+        """Light the subject with the display, then shoot.
+
+        A laptop has no LED, but a white screen at full brightness is a
+        usable fill light at arm's length. The delay lets exposure settle,
+        otherwise the frame is metered for the dark room it just left.
+        """
+        self.flash_overlay.remove_css_class("flash")
+        self.flash_overlay.add_css_class("flash-white")
+        self.flash_overlay.set_opacity(1.0)
+        self.flash_overlay.set_visible(True)
+
+        def _shoot():
+            fn()
+            self.flash_overlay.set_visible(False)
+            self.flash_overlay.remove_css_class("flash-white")
+            self.flash_overlay.add_css_class("flash")
+            return False
+        GLib.timeout_add(650, _shoot)
 
     def _toggle_grid(self):
         """Cycle what is drawn over the picture: HUD, HUD + grid, nothing.
@@ -2897,6 +3142,8 @@ class LensWindow(Adw.ApplicationWindow):
             self.countdown_label.set_visible(True)
             self.countdown_label.set_label(str(self.countdown_val))
             GLib.timeout_add_seconds(1, self._tick_countdown)
+        elif self.flash_enabled:
+            self._screen_flash_then(self._take_photo)
         else:
             self._take_photo()
 
@@ -2904,7 +3151,10 @@ class LensWindow(Adw.ApplicationWindow):
         self.countdown_val -= 1
         if self.countdown_val <= 0:
             self.countdown_label.set_visible(False)
-            self._take_photo()
+            if self.flash_enabled:
+                self._screen_flash_then(self._take_photo)
+            else:
+                self._take_photo()
             return False
         self.countdown_label.set_label(str(self.countdown_val))
         return True
