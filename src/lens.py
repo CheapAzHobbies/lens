@@ -1385,7 +1385,12 @@ class GalleryView(Gtk.Box):
         sw, sh = self.stage.get_width(), self.stage.get_height()
         if min(bw, bh, sw, sh) <= 0:
             return 1.0
-        return min(1.0, sw / bw, sh / bh)
+        # Deliberately uncapped. Turning a portrait back to landscape has to
+        # grow, because the box it lands in is wider than the one it left,
+        # and clamping to 1.0 made the turn stop short and then jump the rest
+        # of the way. At rest this is 1.0 anyway: the photo is already fitted
+        # to the stage, so one of the two terms is exactly 1.
+        return min(sw / bw, sh / bh)
 
     def _drive(self, ms, step, finish):
         """Run step(0..1) once per frame, then finish(), on the frame clock."""
