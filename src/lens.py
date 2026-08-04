@@ -4471,7 +4471,11 @@ class LensWindow(Adw.ApplicationWindow):
         GLib.timeout_add(20, fade)
 
     def _rec_tick(self):
-        if not self.recording: return False
+        # _stopping as well as recording: the flag stays set until the file
+        # is written, so checking recording alone left the clock running all
+        # the way through saving and reporting a longer take than was shot.
+        if not self.recording or self._stopping:
+            return False
         self.rec_seconds += 1
         h, rem = divmod(self.rec_seconds, 3600)
         m, s = divmod(rem, 60)
