@@ -789,9 +789,14 @@ class GalleryView(Gtk.Box):
         page.connect("released", self._on_page_click)
         self.pic.add_controller(page)
         scroll = Gtk.EventControllerScroll.new(
-            Gtk.EventControllerScrollFlags.VERTICAL)
+            Gtk.EventControllerScrollFlags.BOTH_AXES)
         scroll.connect("scroll", self._on_scroll)
         self.add_controller(scroll)
+        # Also on the picture itself, which is where the pointer actually is.
+        pic_scroll = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.BOTH_AXES)
+        pic_scroll.connect("scroll", self._on_scroll)
+        stack.add_controller(pic_scroll)
 
         # Visible paging targets. Clicking the edge of the photo works, but
         # nothing tells you that, so the arrows say it out loud.
@@ -1135,22 +1140,42 @@ class GalleryView(Gtk.Box):
         return False
 
     # ---- actions ----
+    def _animate(self, cls, then, ms=260):
+        """Play a CSS class on the picture, then swap the pixbuf underneath.
+
+        The swap happens at the end so the motion reads as the image turning
+        rather than a new image appearing and then settling.
+        """
+        self.pic.add_css_class(cls)
+
+        def done():
+            self.pic.remove_css_class(cls)
+            then()
+            return False
+        GLib.timeout_add(ms, done)
+
     def _rotate(self, deg):
         if self.src is None:
             return
-        self.rotation = (self.rotation + deg) % 360
         self.btn_save.set_sensitive(True)
-        self._render()
+
+        def apply():
+            self.rotation = (self.rotation + deg) % 360
+            self._render()
+        self._animate("spin-cw" if deg > 0 else "spin-ccw", apply)
 
     def _flip(self, horizontal):
         if self.src is None:
             return
-        if horizontal:
-            self.flip_h = not self.flip_h
-        else:
-            self.flip_v = not self.flip_v
         self.btn_save.set_sensitive(True)
-        self._render()
+
+        def apply():
+            if horizontal:
+                self.flip_h = not self.flip_h
+            else:
+                self.flip_v = not self.flip_v
+            self._render()
+        self._animate("flip-h" if horizontal else "flip-v", apply, ms=240)
 
     def _set_cropping(self, on):
         self.crop.active = on
@@ -1187,10 +1212,17 @@ class GalleryView(Gtk.Box):
             print(f"Lens: could not save: {e}", file=sys.stderr)
             return
         # Show the result. Saving silently and leaving the original on screen
-        # is why this looked like it had done nothing.
+        # is why this looked like it had done nothing. The dim-and-drop plays
+        # first so the crop reads as the offcut falling away.
         self.paths.insert(self.index + 1, str(out))
         self._build_strip()
-        self.go(self.index + 1)
+        if self.crop.active:
+            self.crop.active = False
+            self.crop.queue_draw()
+            self.btn_crop.set_active(False)
+            self._animate("crop-drop", lambda: self.go(self.index + 1), ms=300)
+        else:
+            self.go(self.index + 1)
 
     # ---- navigation ----
     def _on_page_click(self, gesture, n_press, x, y):
@@ -1201,8 +1233,11 @@ class GalleryView(Gtk.Box):
             self.go(self.index + 1)
 
     def _on_scroll(self, ctrl, dx, dy):
-        if dy:
-            self.go(self.index + (1 if dy > 0 else -1))
+        # Either axis pages. A wheel gives dy, a touchpad swipe gives dx, and
+        # both mean the same thing here.
+        d = dx if abs(dx) > abs(dy) else dy
+        if d:
+            self.go(self.index + (1 if d > 0 else -1))
         return True
 
 
@@ -1222,6 +1257,7 @@ class LensWindow(Adw.ApplicationWindow):
         self._stopping = False
         self._eos_handler = None
         self._eos_timeout = None
+        self._saving_timer = None
         self.aspects = ["4:3", "16:9", "1:1"]
 
         # Restore what was set last time. Loaded before the pipeline starts,
@@ -1636,8 +1672,9 @@ class LensWindow(Adw.ApplicationWindow):
         self.btn_settings.connect("clicked", lambda *_: self._open_settings())
 
         self.btn_flash = Gtk.ToggleButton()
-        self.btn_flash.set_child(Gtk.Image.new_from_icon_name("display-brightness-symbolic"))
-        self.btn_flash.get_child().set_pixel_size(18)
+        self.flash_icon = Gtk.Image.new_from_icon_name("thunderbolt-symbolic")
+        self.btn_flash.set_child(self.flash_icon)
+        self.flash_icon.set_pixel_size(18)
         self.btn_flash.add_css_class("winctl")
         self.btn_flash.set_valign(Gtk.Align.CENTER)
         self.btn_flash.set_tooltip_text(
@@ -1996,6 +2033,25 @@ class LensWindow(Adw.ApplicationWindow):
 
         # Grid overlay (rule of thirds)
 
+        # Saving indicator. Writing a clip takes a moment while the queues
+        # drain, and without this the app just looks frozen.
+        self.saving = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.saving.add_css_class("saving-bg")
+        self.saving.set_halign(Gtk.Align.FILL); self.saving.set_valign(Gtk.Align.FILL)
+        self.saving.set_hexpand(True); self.saving.set_vexpand(True)
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        inner.set_halign(Gtk.Align.CENTER); inner.set_valign(Gtk.Align.CENTER)
+        inner.set_vexpand(True)
+        self.tux = Gtk.Label(label="\U0001F427")
+        self.tux.add_css_class("tux")
+        self.saving_label = Gtk.Label(label="Saving")
+        self.saving_label.add_css_class("saving-text")
+        inner.append(self.tux); inner.append(self.saving_label)
+        self.saving.append(inner)
+        self.saving.set_visible(False)
+        self.saving.set_can_target(True)   # swallow clicks while it is up
+        root.add_overlay(self.saving)
+
         # Gallery (last overlay so it sits on top of everything)
         self.viewer = GalleryView(
             on_close=self._close_photo_viewer,
@@ -2109,6 +2165,19 @@ class LensWindow(Adw.ApplicationWindow):
             box-shadow: 0 18px 40px rgba(0,0,0,0.9);
         }
         /* ---- gallery ---- */
+        /* Saving: a penguin having a nice time while the muxer finishes. */
+        .saving-bg { background: rgba(10,10,12,0.88); }
+        @keyframes tux-dance {
+            0%   { transform: translateY(0)     rotate(-14deg) scale(1); }
+            25%  { transform: translateY(-16px) rotate(0deg)   scale(1.08); }
+            50%  { transform: translateY(0)     rotate(14deg)  scale(1); }
+            75%  { transform: translateY(-16px) rotate(0deg)   scale(1.08); }
+            100% { transform: translateY(0)     rotate(-14deg) scale(1); }
+        }
+        .tux { font-size: 76px;
+               animation: tux-dance 900ms ease-in-out infinite; }
+        .saving-text { color: rgba(255,255,255,0.92); font-size: 17px;
+                       font-family: monospace; letter-spacing: 2px; }
         .gal { background: #16161a; }
         .gal-bar { background: #16161a; }
         .gal-title { color: rgba(255,255,255,0.92); font-size: 14px; }
@@ -2127,6 +2196,16 @@ class LensWindow(Adw.ApplicationWindow):
         .gal-thumb:hover { background: rgba(255,255,255,0.12); }
         .gal-thumb-active { background: #62a0ea; }
         .gal-empty { color: rgba(255,255,255,0.45); font-size: 16px; }
+        /* Edit motion. The picture animates, then the pixbuf is swapped at
+           the end, so a rotate looks like the photo turning rather than a
+           different photo appearing. */
+        .gal picture { transition: transform 240ms cubic-bezier(.3,.7,.3,1),
+                                   opacity 200ms ease-out; }
+        .spin-cw  { transform: rotate(90deg)  scale(0.82); }
+        .spin-ccw { transform: rotate(-90deg) scale(0.82); }
+        .flip-h   { transform: scaleX(-1); }
+        .flip-v   { transform: scaleY(-1); }
+        .crop-drop { transform: scale(0.9) translateY(26px); opacity: 0.25; }
         .gal-count { color: rgba(255,255,255,0.55); font-size: 13px;
                      font-family: monospace; }
         .gal-arrow { background: rgba(0,0,0,0.5); color: white; border: none;
@@ -2260,11 +2339,19 @@ class LensWindow(Adw.ApplicationWindow):
         window.size-compact .pill { padding: 3px 8px; font-size: 13px; }
         .winctl:hover { background: rgba(255,255,255,0.22); }
         .winctl-close:hover { background: #e01b24; }
+        .flash-on { color: #ffc107; background: rgba(255,193,7,0.18); }
+        .flash-on:hover { background: rgba(255,193,7,0.30); }
         .cam-row { background: transparent; border: none; color: white;
                    padding: 6px 10px; border-radius: 8px; font-size: 13px; }
         .cam-row:hover { background: rgba(255,255,255,0.12); }
         .cam-row-active { color: #62a0ea; }
         .pill-active { background: #62a0ea; color: white; }
+        /* A GtkMenuButton wraps a real button, and its default frame
+           drew a second box inside the FX pill. */
+        .pill > button { background: none; background-image: none;
+                         background-color: transparent; border: none;
+                         box-shadow: none; outline: none; padding: 0;
+                         min-width: 0; min-height: 0; color: inherit; }
         .pill-off { color: rgba(255,255,255,0.35); }
         /* Off, not broken: dim enough to read as inactive but still
            legible, unlike the old 35% which vanished. */
@@ -2433,6 +2520,8 @@ class LensWindow(Adw.ApplicationWindow):
         self._apply_overlay_mode()
 
         self._refresh_timer_button()
+        self.btn_flash.set_active(self.flash_enabled)
+        self._refresh_flash_button()
 
         # _set_video_mode does the HUD and shutter work, so route through it
         # rather than duplicating. It early-returns while recording, which
@@ -2464,9 +2553,41 @@ class LensWindow(Adw.ApplicationWindow):
             "cam_latency":  self._cam_latency,
         })
 
+    def _show_saving(self, on):
+        """Dancing penguin while the file is written."""
+        self.saving.set_visible(on)
+        if on:
+            self._saving_dots = 0
+
+            def tick():
+                if not self.saving.get_visible():
+                    self._saving_timer = None
+                    return False
+                self._saving_dots = (self._saving_dots + 1) % 4
+                self.saving_label.set_label("Saving" + "." * self._saving_dots)
+                return True
+            self._saving_timer = GLib.timeout_add(380, tick)
+        elif getattr(self, "_saving_timer", None):
+            GLib.source_remove(self._saving_timer)
+            self._saving_timer = None
+
     def _on_flash_toggled(self, btn):
         self.flash_enabled = btn.get_active()
+        self._refresh_flash_button()
         self._save_settings()
+
+    def _refresh_flash_button(self):
+        """Outline when off, filled yellow when armed. The state has to be
+        readable at a glance: firing a white screen unexpectedly is worse
+        than missing the shot."""
+        # One icon, two colours. There is no outline variant of the bolt in
+        # the theme, and colour is the clearer signal anyway.
+        if self.flash_enabled:
+            self.btn_flash.add_css_class("flash-on")
+            self.btn_flash.set_tooltip_text("Screen flash ON")
+        else:
+            self.btn_flash.remove_css_class("flash-on")
+            self.btn_flash.set_tooltip_text("Screen flash off")
 
     def _screen_flash_then(self, fn):
         """Light the subject with the display, then shoot.
@@ -3360,6 +3481,7 @@ class LensWindow(Adw.ApplicationWindow):
             return
         self._stopping = True
         self.rec_state_label.set_label("SAVE")
+        self._show_saving(True)
         bus = self.pipeline.get_bus()
         self._eos_handler = bus.connect("message::eos", lambda *_: self._finish_stop())
         self.pipeline.send_event(Gst.Event.new_eos())
@@ -3392,6 +3514,7 @@ class LensWindow(Adw.ApplicationWindow):
         # Back to standby rather than hiding the HUD: still in video mode.
         self._hud_standby()
         self._start_pipeline()
+        self._show_saving(False)
         print(f"Lens: saved video ({self.rec_seconds}s)")
         return False
 
@@ -3474,6 +3597,14 @@ class LensWindow(Adw.ApplicationWindow):
             self._save_settings()
         spin.connect("notify::value", days_done)
         grp3.add(spin)
+
+        where = Adw.ActionRow(title="Bin location", subtitle=str(trash_dir()))
+        ob = Gtk.Button(label="Open")
+        ob.set_valign(Gtk.Align.CENTER)
+        ob.connect("clicked", lambda *_: Gio.AppInfo.launch_default_for_uri(
+            trash_dir().as_uri(), None))
+        where.add_suffix(ob)
+        grp3.add(where)
 
         empty = Adw.ActionRow(title="Empty the bin now")
         eb = Gtk.Button(label="Empty")
@@ -3636,6 +3767,7 @@ class ThumbnailDeck(Gtk.Overlay):
         self._hold_timer = None
         self._click_timer = None
         self._press_is_hold = False
+        self._pressed = False
         self._debug = bool(os.environ.get("LENS_DEBUG"))
 
         press = Gtk.GestureClick.new()
@@ -3855,14 +3987,18 @@ class ThumbnailDeck(Gtk.Overlay):
         if self._hold_timer:
             GLib.source_remove(self._hold_timer); self._hold_timer = None
         self._press_is_hold = False
+        self._pressed = True
         def _trigger():
             self._hold_timer = None
+            if not self._pressed:
+                return False       # released before the hold threshold
             self._press_is_hold = True
             self._expand()
             return False
         self._hold_timer = GLib.timeout_add(self.HOLD_MS, _trigger)
 
     def _on_release(self, gesture, n_press, x, y):
+        self._pressed = False
         # If we're mid-hold-timer, release before threshold = a click
         if self._hold_timer:
             GLib.source_remove(self._hold_timer); self._hold_timer = None
@@ -3889,16 +4025,19 @@ class ThumbnailDeck(Gtk.Overlay):
     def _abort_hold(self, *_):
         """Close the fan once the gesture is over, whatever ended it.
 
-        Deferred: 'end' can arrive before 'drag-end', so acting immediately
-        would tear the hold down before the release had a chance to open the
-        card under the finger.
+        Deliberately does NOT touch _hold_timer. 'end' fires on a plain tap
+        as well as a drag, and cancelling the timer here meant _on_release
+        found it already None, skipped the click branch, and the tap was
+        swallowed: that is why a single tap on the preview did nothing.
+        The timer belongs to press/release.
+
+        Deferred to idle for the same ordering reason: 'end' can arrive
+        before 'drag-end' and before 'released'.
         """
-        if self._hold_timer:
-            GLib.source_remove(self._hold_timer)
-            self._hold_timer = None
         GLib.idle_add(self._abort_hold_now)
 
     def _abort_hold_now(self):
+        self._pressed = False
         if self._press_is_hold:
             self._press_is_hold = False
             self._collapse()
