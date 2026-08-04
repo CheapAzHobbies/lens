@@ -583,19 +583,23 @@ class GalleryView(Gtk.Box):
         self.title.set_margin_start(8)
         head.append(self.title)
 
+        self._edit_tools = []
         for icon, tip, cb in (
             ("object-rotate-left-symbolic",  "Rotate left",  lambda: self._rotate(-90)),
             ("object-rotate-right-symbolic", "Rotate right", lambda: self._rotate(90)),
             ("object-flip-horizontal-symbolic", "Mirror horizontally", lambda: self._flip(True)),
             ("object-flip-vertical-symbolic",   "Mirror vertically",   lambda: self._flip(False)),
         ):
-            head.append(self._tool(icon, tip, cb))
+            b = self._tool(icon, tip, cb)
+            self._edit_tools.append(b)
+            head.append(b)
 
         self.btn_crop = Gtk.ToggleButton()
         self.btn_crop.set_child(self._icon("edit-cut-symbolic"))
         self.btn_crop.add_css_class("gal-tool")
         self.btn_crop.set_tooltip_text("Crop")
         self.btn_crop.connect("toggled", lambda b: self._set_cropping(b.get_active()))
+        self._edit_tools.append(self.btn_crop)
         head.append(self.btn_crop)
 
         self.ratio_btn = Gtk.MenuButton()
@@ -607,6 +611,13 @@ class GalleryView(Gtk.Box):
         self.ratio_btn.set_sensitive(False)
         self._build_ratio_menu()
         head.append(self.ratio_btn)
+
+        self.btn_play = Gtk.Button(label="Play")
+        self.btn_play.add_css_class("gal-save")
+        self.btn_play.set_visible(False)
+        self.btn_play.connect(
+            "clicked", lambda *_: self.on_open_external(self.paths[self.index]))
+        head.append(self.btn_play)
 
         self.btn_save = Gtk.Button(label="Save a copy")
         self.btn_save.add_css_class("gal-save")
@@ -687,10 +698,13 @@ class GalleryView(Gtk.Box):
 
     # ---- content ----
     def load(self, paths, start=None):
-        """Photos only. Video editing is a different job, and a crop tool
-        that silently did nothing to a clip would be worse than not offering
-        it."""
-        self.paths = [str(p) for p in paths if not is_video(p)]
+        """Everything shot, clips included.
+
+        Clips cannot be edited here, but excluding them meant a tap on the
+        preview went straight to an external player whenever the newest
+        item was a video, and the gallery never opened at all.
+        """
+        self.paths = [str(p) for p in paths]
         self.index = 0
         if start and str(start) in self.paths:
             self.index = self.paths.index(str(start))
@@ -705,12 +719,15 @@ class GalleryView(Gtk.Box):
             b = Gtk.Button()
             b.add_css_class("gal-thumb")
             img = Gtk.Image()
+            thumb_src = video_thumbnail(p) if is_video(p) else p
             try:
                 pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(
-                    p, self.THUMB, self.THUMB, True)
+                    str(thumb_src), self.THUMB, self.THUMB, True)
                 img.set_from_paintable(Gdk.Texture.new_for_pixbuf(pb))
             except Exception:
-                img.set_from_icon_name("image-missing-symbolic")
+                img.set_from_icon_name(
+                    "video-x-generic-symbolic" if is_video(p)
+                    else "image-missing-symbolic")
             img.set_pixel_size(self.THUMB)
             b.set_child(img)
             b.connect("clicked", lambda _b, i=i: self.go(i))
@@ -733,11 +750,19 @@ class GalleryView(Gtk.Box):
             self.pic.set_paintable(None)
             return
         path = self.paths[self.index]
+        video = is_video(path)
+        # A clip shows its poster frame. Editing is disabled rather than
+        # hidden, so the tools stay where they are and simply grey out.
+        load_from = video_thumbnail(path) if video else path
         try:
-            self.src = GdkPixbuf.Pixbuf.new_from_file(path)
+            self.src = (GdkPixbuf.Pixbuf.new_from_file(str(load_from))
+                        if load_from else None)
         except Exception as e:
             print(f"Lens: cannot open {path}: {e}", file=sys.stderr)
             self.src = None
+        self.btn_play.set_visible(video)
+        for b in self._edit_tools:
+            b.set_sensitive(not video)
         self.rotation = 0
         self.flip_h = self.flip_v = False
         self.btn_crop.set_active(False)
@@ -2849,13 +2874,17 @@ class LensWindow(Adw.ApplicationWindow):
         Gio.AppInfo.launch_default_for_uri("file://" + str(folder), None)
 
     def _open_photo_viewer(self, path):
-        """Open the gallery at this photo. Clips go to the system player,
-        since there is no video playback in here."""
-        if is_video(path):
-            Gio.AppInfo.launch_default_for_uri("file://" + str(path), None)
-            return
-        shots = sorted(PICTURES.glob("*.jpg"), key=lambda f: f.stat().st_mtime)
-        self.viewer.load(shots, start=path)
+        """Open the gallery, positioned on whatever was tapped."""
+        items = []
+        for f in list(PICTURES.glob("*.jpg")) + [
+                g for e in VIDEO_EXTS for g in VIDEOS.glob("*" + e)]:
+            try:
+                if f.stat().st_size:
+                    items.append((f.stat().st_mtime, f))
+            except OSError:
+                pass
+        items.sort(key=lambda t: t[0])
+        self.viewer.load([f for _, f in items], start=path)
         self.viewer.set_visible(True)
 
     def _close_photo_viewer(self):
