@@ -209,6 +209,48 @@ FILTERS = {
     "Cross":  ({}, "xpro"),
 }
 
+# Sprite sheet for the save indicator: 32 frames laid out in one row.
+TUX_SHEET  = "tux_saving.png"
+TUX_FRAMES = 32
+TUX_MS     = 80          # ~12fps, which is about where the dance reads right
+TUX_W, TUX_H = 117, 155
+
+
+def asset(name):
+    """Find a bundled asset whether running from the tree or installed."""
+    here = pathlib.Path(__file__).resolve().parent
+    for base in (here / "assets", here.parent / "assets",
+                 pathlib.Path("/usr/share/lens/assets")):
+        f = base / name
+        if f.exists():
+            return f
+    return None
+
+
+def tux_frames():
+    """Slice the sheet once and hand back textures, or None if it is missing.
+
+    Cached on the function because the overlay is rebuilt per save and
+    re-decoding 32 frames each time would stall the very moment it exists
+    to cover.
+    """
+    if not hasattr(tux_frames, "_cache"):
+        tux_frames._cache = None
+        f = asset(TUX_SHEET)
+        if f is not None:
+            try:
+                sheet = GdkPixbuf.Pixbuf.new_from_file(str(f))
+                w = sheet.get_width() // TUX_FRAMES
+                h = sheet.get_height()
+                tux_frames._cache = [
+                    Gdk.Texture.new_for_pixbuf(
+                        sheet.new_subpixbuf(i * w, 0, w, h))
+                    for i in range(TUX_FRAMES)]
+            except Exception as e:
+                print(f"Lens: cannot load {f}: {e}", file=sys.stderr)
+    return tux_frames._cache
+
+
 DENOISE_CHAIN = ("audiowsincband mode=band-pass lower-frequency=110 "
                  "upper-frequency=7500 length=101")
 
@@ -2112,11 +2154,13 @@ class LensWindow(Adw.ApplicationWindow):
         self.saving.add_css_class("saving-bg")
         self.saving.set_halign(Gtk.Align.FILL); self.saving.set_valign(Gtk.Align.FILL)
         self.saving.set_hexpand(True); self.saving.set_vexpand(True)
-        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        inner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
         inner.set_halign(Gtk.Align.CENTER); inner.set_valign(Gtk.Align.CENTER)
         inner.set_vexpand(True)
-        self.tux = Gtk.Label(label="\U0001F427")
-        self.tux.add_css_class("tux")
+        self.tux = Gtk.Picture()
+        self.tux.set_size_request(TUX_W, TUX_H)
+        self.tux.set_content_fit(Gtk.ContentFit.CONTAIN)
+        self.tux.set_can_shrink(False)
         self.saving_label = Gtk.Label(label="Saving")
         self.saving_label.add_css_class("saving-text")
         inner.append(self.tux); inner.append(self.saving_label)
@@ -2240,16 +2284,8 @@ class LensWindow(Adw.ApplicationWindow):
         /* ---- gallery ---- */
         /* Saving: a penguin having a nice time while the muxer finishes. */
         .saving-bg { background: rgba(10,10,12,0.88); }
-        @keyframes tux-dance {
-            0%   { transform: translateY(0)     rotate(-14deg) scale(1); }
-            25%  { transform: translateY(-16px) rotate(0deg)   scale(1.08); }
-            50%  { transform: translateY(0)     rotate(14deg)  scale(1); }
-            75%  { transform: translateY(-16px) rotate(0deg)   scale(1.08); }
-            100% { transform: translateY(0)     rotate(-14deg) scale(1); }
-        }
-        .tux { font-size: 76px;
-               animation: tux-dance 900ms ease-in-out infinite; }
-        .saving-text { color: rgba(255,255,255,0.92); font-size: 17px;
+        /* The sprite carries its own motion, so nothing to animate in CSS. */
+        .saving-text { color: rgba(255,255,255,0.92); font-size: 22px;
                        font-family: monospace; letter-spacing: 2px; }
         .gal { background: #16161a; }
         .gal-bar { background: #16161a; }
@@ -2631,18 +2667,31 @@ class LensWindow(Adw.ApplicationWindow):
 
     def _show_saving(self, on):
         """Dancing penguin while the file is written."""
+        frames = tux_frames()
+        self.tux.set_visible(frames is not None)
         self.saving.set_visible(on)
         if on:
+            self._saving_frame = 0
             self._saving_dots = 0
+            if frames:
+                self.tux.set_paintable(frames[0])
 
             def tick():
                 if not self.saving.get_visible():
                     self._saving_timer = None
                     return False
-                self._saving_dots = (self._saving_dots + 1) % 4
-                self.saving_label.set_label("Saving" + "." * self._saving_dots)
+                self._saving_frame += 1
+                if frames:
+                    self.tux.set_paintable(
+                        frames[self._saving_frame % len(frames)])
+                # The dots run slower than the sprite, so they read as a
+                # count rather than a flicker.
+                dots = (self._saving_frame // 5) % 4
+                if dots != self._saving_dots:
+                    self._saving_dots = dots
+                    self.saving_label.set_label("Saving" + "." * dots)
                 return True
-            self._saving_timer = GLib.timeout_add(380, tick)
+            self._saving_timer = GLib.timeout_add(TUX_MS, tick)
         elif getattr(self, "_saving_timer", None):
             GLib.source_remove(self._saving_timer)
             self._saving_timer = None
