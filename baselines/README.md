@@ -96,3 +96,30 @@ Measured, all at matched total analog gain with the rate pinned:
 - **No mains hum, no tonal content at all.**
 - Noise floor with +18 dB analog gain: **-41.9 dBFS**, reproducible to
   0.04 dB.
+
+## Where the noise actually is, and what that rules out
+
+Measured per band on a real take (`Lens_VID_0029.mkv`), speech against the
+silence in the same file, so both share every gain stage:
+
+| band | share of noise energy | speech-to-noise |
+|---|---|---|
+| 60-300 Hz | 12.1% | 15-17 dB |
+| 300-1200 Hz | **40.7%** | 6-12 dB |
+| 1200-4800 Hz | **31.2%** | 4.5-5.4 dB |
+| 4800-12000 Hz | 1.4% | 6-9 dB |
+| above 12 kHz | 0.7% | 1-2 dB |
+
+Nearly three quarters of the noise is inside the voice. That rules out
+every approach based on frequency: a low-pass, a high-shelf, a band-pass or
+a gate cannot remove it, because there is no region to cut that is not also
+speech. Hours were spent on exactly those before this was measured.
+
+Broadband RMS hides this. It reported 2 dB speech-to-noise on a recording
+whose owner said the voice level was fine, because it lumps a wide quiet
+band in with a narrow loud one. Always measure SNR per band.
+
+RNNoise separates by what the signal is rather than where it sits. On that
+same file: 300-600 Hz went from 11.6 dB SNR to 82.9, 1200-2400 Hz from 4.5
+to 71.0, and the floor during silence fell 61.8 dB. That is why it is back
+in Lens, and why it is the only processing there.
