@@ -4166,7 +4166,12 @@ class LensWindow(Adw.ApplicationWindow):
         self._fps_count = 0
         eff = self.effective_res()
         res = f"{eff[0]}\u00d7{eff[1]}" if eff else ""
-        rate = f"{self._fps_shown:g} FPS" if self._fps_shown else ""
+        # Two digits always. Dropping from 30 to 9 fps loses a character and
+        # the whole readout, resolution included, slides sideways: the number
+        # jitters exactly when the thing it is reporting has gone wrong and
+        # you most want to read it. The font already has tabular figures, so
+        # padding to a fixed width holds it still.
+        rate = f"{self._fps_shown:2.0f} FPS" if self._fps_shown else ""
         self.hud_fps.set_label("  ".join(x for x in (res, rate) if x))
         self._refresh_mic_icon()
 
@@ -4687,6 +4692,13 @@ class LensWindow(Adw.ApplicationWindow):
             GLib.source_remove(self._eos_timeout)
             self._eos_timeout = None
         old = self.pipeline
+        # Same freeze as on the way in. Tearing the recording pipeline down
+        # leaves the Picture holding a paintable with no frames, so without
+        # this the viewfinder collapsed and went black for a moment on stop
+        # exactly as it used to on start.
+        frozen = self._freeze_frame()
+        if frozen is not None:
+            self.picture.set_paintable(frozen)
         if old:
             if self._eos_handler:
                 try:
@@ -4704,7 +4716,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.shutter_core.remove_css_class("recording")
         # Back to standby rather than hiding the HUD: still in video mode.
         self._hud_standby()
-        self._start_pipeline()
+        self._start_pipeline(defer_attach=frozen is not None)
         self._show_saving(False)
         print(f"Lens: saved video ({self.rec_seconds}s)")
         return False
