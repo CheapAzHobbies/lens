@@ -11,7 +11,7 @@ Full-screen black viewfinder, iPhone-style controls:
 - **PHOTO / VIDEO** pill switcher
 - **Camera flip** with a smooth freeze-frame transition
 - **Recent shots** deck, fans out on hover, tap to open the gallery
-- Top bar: settings, grid, aspect ratio, timer, flash, zoom, filters
+- Top bar: settings, exposure slider, grid, aspect ratio, timer, flash, filters
 - Own title bar with minimise / maximise / close
 
 ## Features
@@ -27,12 +27,13 @@ Full-screen black viewfinder, iPhone-style controls:
 | Self-timer (3s, 10s) | ✅ |
 | Grid overlay (rule of thirds, 2x2) | ✅ |
 | Aspect ratio (4:3, 16:9, 1:1) | ✅ |
-| Digital zoom: pinch, scroll, or the on-screen bar | ✅ |
+| Digital zoom: pinch, scroll, or the slider up the right edge | ✅ |
+| Drag to pan a zoomed view | ✅ |
 | Filters (mono, vivid, warm, cool, sepia, x-ray, cross) | ✅ |
 | Screen flash for low light | ✅ |
 | Tap to meter | ✅ |
 | Mirrored preview, with the file left unmirrored | ✅ |
-| Manual exposure in EV, drag up or down on the picture | ✅ |
+| Exposure slider in EV, centre is auto | ✅ |
 | Camcorder HUD, interactive | ✅ |
 | Gallery: browse, crop, rotate, mirror, rename | ✅ |
 | Trash with a recycle bin, its own folder, optional auto-purge | ✅ |

@@ -1886,6 +1886,8 @@ class LensWindow(Adw.ApplicationWindow):
         self.denoise = bool(cfg.get("denoise", True))
         self.flash_enabled = bool(cfg.get("flash", False))
         self.zoom = float(cfg.get("zoom", 1.0))
+        self.pan_x = 0.0
+        self.pan_y = 0.0
         self.filter_name = cfg.get("filter", "None")
         if self.filter_name not in FILTERS:
             self.filter_name = "None"
@@ -1902,6 +1904,8 @@ class LensWindow(Adw.ApplicationWindow):
         self._exp_dragging = False
         self._exp_start = None
         self._exp_ref = None
+        self._pan_last = (0.0, 0.0)
+        self._exp_snapping = False
         self.mic_active = False
         self._audio_mon = None
         self._audio_mon_handler = None
@@ -2105,33 +2109,51 @@ class LensWindow(Adw.ApplicationWindow):
             lo, hi = self._exposure_range()
             return (lo + hi) // 8
 
+    def _on_exp_slider(self, sc):
+        """Centre hands control back, anything else takes it."""
+        ev = sc.get_value()
+        if abs(ev) < 0.05:
+            if not self.exposure_auto:
+                self._exposure_to_auto()
+            return
+        if self._exp_ref is None:
+            # Whatever the camera had settled on is zero stops. Anchored once,
+            # so later moves read against the same place rather than the
+            # scale shifting under you.
+            self._exp_ref = self._current_exposure()
+        lo, hi = self._exposure_range()
+        want = self._exp_ref * (2.0 ** ev)
+        val = int(max(lo, min(hi, want)))
+        self._set_exposure(val)
+        # The sensor runs out before the slider does. When it does, put the
+        # handle where the camera actually ended up rather than leaving it
+        # somewhere that claims two stops it never gave you.
+        got = self._exposure_ev()
+        if abs(got - ev) > 0.05 and not self._exp_snapping:
+            self._exp_snapping = True
+            sc.set_value(got)
+            self._exp_snapping = False
+
     def _on_exp_begin(self, gesture, x, y):
         self._exp_dragging = False
-        self._exp_start = None
+        self._pan_last = (0.0, 0.0)
 
     def _on_exp_update(self, gesture, dx, dy):
-        if abs(dy) < 12 and not self._exp_dragging:
+        """Drag the zoomed view around. Does nothing at 1x, where there is
+        nothing off screen to bring into it."""
+        if self.zoom <= 1.001:
+            return
+        if not self._exp_dragging and abs(dx) < 8 and abs(dy) < 8:
             return                      # still could be a tap
         if not self._exp_dragging:
-            self._exp_dragging = True
-            self._exp_start = self._current_exposure()
-            if self.exposure_auto:
-                # Whatever the camera had settled on is zero stops. Anchored
-                # once, so a second drag reads relative to the same place
-                # rather than resetting the scale under you.
-                self._exp_ref = self._exp_start
-        lo, hi = self._exposure_range()
-        # Up is brighter, and the scale is logarithmic because exposure is:
-        # a fixed number of microseconds per pixel would crawl at the bottom
-        # of the range and leap at the top.
-        span = math.log(hi / max(lo, 1))
-        cur = max(lo, self._exp_start or lo)
-        val = cur * math.exp(-dy / 260.0 * span * 0.5)
-        val = int(max(lo, min(hi, val)))
-        self._set_exposure(val)
+            self._refresh_pan_cursor(grabbing=True)
+        self._exp_dragging = True
+        lx, ly = self._pan_last
+        self._pan_by(dx - lx, dy - ly)
+        self._pan_last = (dx, dy)
 
     def _on_exp_end(self, gesture, dx, dy):
-        self.exp_label.set_visible(False)
+        self._refresh_pan_cursor()
         GLib.timeout_add(60, lambda: (setattr(self, "_exp_dragging", False), False)[1])
 
     def _set_exposure(self, val):
@@ -2143,7 +2165,6 @@ class LensWindow(Adw.ApplicationWindow):
         # asked; what you want to know while dragging is how much brighter
         # than normal you have made it.
         self.exp_label.set_label(f"{self._exposure_ev():+.1f} EV")
-        self.exp_label.set_visible(True)
         self._refresh_exposure_button()
 
     def _exposure_ev(self):
@@ -2167,6 +2188,9 @@ class LensWindow(Adw.ApplicationWindow):
         if self.exposure_auto:
             b.set_label("AE")
             b.remove_css_class("pill-active")
+            if getattr(self, "exp_slider", None) is not None and \
+                    abs(self.exp_slider.get_value()) > 0.05:
+                self.exp_slider.set_value(0.0)
             b.set_tooltip_text("Exposure is automatic. Drag up or down on the "
                                "picture to set it by hand")
         else:
@@ -2232,22 +2256,70 @@ class LensWindow(Adw.ApplicationWindow):
         self._save_settings()
 
     def _apply_zoom(self):
-        """Crop symmetrically to the current zoom factor."""
+        """Crop to the current zoom factor, offset by where you have panned.
+
+        Zooming used to crop dead centre, which is the one place you often do
+        not want when the interesting part is off to one side.
+        """
         if not getattr(self, "zoom_elem", None) or not self.cur_res:
             return
         w, h = self.cur_res
         z = max(1.0, min(4.0, self.zoom))
-        cx = int((w - w / z) / 2)
-        cy = int((h - h / z) / 2)
-        # Keep it even: odd crops upset some colour formats.
-        cx -= cx % 2
-        cy -= cy % 2
-        for prop, val in (("left", cx), ("right", cx), ("top", cy), ("bottom", cy)):
+        mx = int(w - w / z)          # total pixels there are to crop
+        my = int(h - h / z)
+        # pan runs -1..1, so 0 keeps the old centred behaviour and +-1 pushes
+        # the window right up against an edge.
+        left = int(mx * (1.0 + self.pan_x) / 2)
+        top = int(my * (1.0 + self.pan_y) / 2)
+        left = max(0, min(mx, left)); top = max(0, min(my, top))
+        # Keep them even: odd crops upset some colour formats.
+        left -= left % 2
+        top -= top % 2
+        for prop, val in (("left", left), ("right", max(0, mx - left)),
+                          ("top", top), ("bottom", max(0, my - top))):
             self.zoom_elem.set_property(prop, val)
 
-    def set_zoom(self, z):
-        self.zoom = max(1.0, min(4.0, z))
+    def _refresh_pan_cursor(self, grabbing=False):
+        """Open hand when there is something to drag, closed while dragging.
+
+        The pointer is the only thing that says a zoomed picture can be moved
+        at all.
+        """
+        if self.zoom <= 1.001:
+            name = "default"
+        else:
+            name = "grabbing" if grabbing else "grab"
+        try:
+            self.frame_stack.set_cursor(Gdk.Cursor.new_from_name(name, None))
+        except Exception:
+            pass
+
+    def _pan_by(self, dx, dy):
+        """Shift the zoom window by a drag measured in widget pixels."""
+        if self.zoom <= 1.001 or not self.cur_res:
+            return
+        w, h = self.cur_res
+        z = self.zoom
+        mx, my = w - w / z, h - h / z
+        vw = max(1, self.frame_stack.get_width())
+        vh = max(1, self.frame_stack.get_height())
+        if mx > 0:
+            # Drag right, the picture follows your finger, so the crop window
+            # moves left.
+            self.pan_x -= 2.0 * (dx * (w / z) / vw) / mx
+        if my > 0:
+            self.pan_y -= 2.0 * (dy * (h / z) / vh) / my
+        self.pan_x = max(-1.0, min(1.0, self.pan_x))
+        self.pan_y = max(-1.0, min(1.0, self.pan_y))
         self._apply_zoom()
+
+    def set_zoom(self, z):
+        was = self.zoom
+        self.zoom = max(1.0, min(4.0, z))
+        if self.zoom <= 1.001 and was > 1.001:
+            self.pan_x = self.pan_y = 0.0   # nothing off screen left to find
+        self._apply_zoom()
+        self._refresh_pan_cursor()
         self.zoom_label.set_label(f"{self.zoom:.1f}x")
         # The floating chip is for the moment you are turning the wheel; the
         # bar is always there, so it does not need to double up.
@@ -2434,18 +2506,33 @@ class LensWindow(Adw.ApplicationWindow):
 
         # And a visible one, because a gesture with nothing on screen to hint
         # at it is invisible.
-        self.zoom_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        # Up the right edge, centred. The HUD lives in the four corners, so
+        # the bottom middle it used to occupy was between the mic meter and
+        # the resolution readout and collided with both as soon as the window
+        # narrowed. The middle of an edge is the one place nothing else wants.
+        self.zoom_bar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         self.zoom_bar.add_css_class("zoombar")
-        self.zoom_bar.set_halign(Gtk.Align.CENTER)
-        self.zoom_bar.set_valign(Gtk.Align.END)
-        self.zoom_bar.set_margin_bottom(10)
-        for txt, step in (("\u2212", -0.25), ("+", 0.25)):
-            btn = Gtk.Button(label=txt)
-            btn.add_css_class("zoomstep")
-            btn.connect("clicked", lambda _b, d=step: self.set_zoom(self.zoom + d))
-            if txt == "+":
-                self.zoom_bar.append(self.zoom_reset)
-            self.zoom_bar.append(btn)
+        self.zoom_bar.set_halign(Gtk.Align.END)
+        self.zoom_bar.set_valign(Gtk.Align.CENTER)
+        self.zoom_bar.set_margin_end(10)
+        plus = Gtk.Button(label="+")
+        plus.add_css_class("zoomstep")
+        plus.connect("clicked", lambda *_: self.set_zoom(self.zoom + 0.25))
+        minus = Gtk.Button(label="\u2212")
+        minus.add_css_class("zoomstep")
+        minus.connect("clicked", lambda *_: self.set_zoom(self.zoom - 0.25))
+        self.zoom_slider = Gtk.Scale.new_with_range(
+            Gtk.Orientation.VERTICAL, 1.0, 4.0, 0.05)
+        self.zoom_slider.set_inverted(True)      # up is more
+        self.zoom_slider.set_draw_value(False)
+        self.zoom_slider.set_size_request(-1, 130)
+        self.zoom_slider.set_value(self.zoom)
+        self.zoom_slider.connect(
+            "value-changed", lambda sc: self.set_zoom(sc.get_value()))
+        self.zoom_bar.append(plus)
+        self.zoom_bar.append(self.zoom_slider)
+        self.zoom_bar.append(minus)
+        self.zoom_bar.append(self.zoom_reset)
         self.frame_stack.add_overlay(self.zoom_bar)
 
         view_click = Gtk.GestureClick.new()
@@ -2484,10 +2571,27 @@ class LensWindow(Adw.ApplicationWindow):
             "Screen flash: light the subject with the display before the shot")
         self.btn_flash.connect("toggled", self._on_flash_toggled)
 
-        # Reset for the drag above. It doubles as the indicator: there is no
-        # other way to tell a held exposure from the camera's own.
-        self.btn_exp = self._pill_button("AE", self._exposure_to_auto,
-                                         width=58, tint=False)
+        # Exposure as a slider, not a gesture. A drag on the picture was
+        # invisible, and it now belongs to panning a zoomed view anyway.
+        # Centre is auto: leave it alone and the camera decides, move it and
+        # you have taken over, which needs no separate mode switch.
+        self.exp_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.exp_box.add_css_class("expbar")
+        self.exp_box.set_valign(Gtk.Align.CENTER)
+        self.btn_exp = Gtk.Button(label="AE")
+        self.btn_exp.add_css_class("zoomstep")
+        self.btn_exp.add_css_class("zoomval")
+        self.btn_exp.set_tooltip_text("Exposure. Click to hand it back to the camera")
+        self.btn_exp.connect("clicked", lambda *_: self._exposure_to_auto())
+        self.exp_slider = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, -3.0, 3.0, 0.1)
+        self.exp_slider.set_size_request(132, -1)
+        self.exp_slider.set_draw_value(False)
+        self.exp_slider.add_mark(0.0, Gtk.PositionType.BOTTOM, None)
+        self.exp_slider.set_value(0.0)
+        self.exp_slider.connect("value-changed", self._on_exp_slider)
+        self.exp_box.append(self.btn_exp)
+        self.exp_box.append(self.exp_slider)
         self.btn_grid   = self._pill_button("#",   self._toggle_grid,   width=42, tint=False)
         self.btn_aspect = self._pill_button(self.aspects[0], self._toggle_aspect, width=58, tint=False)
         # A real icon, not the "⏱" glyph: that rendered tiny and was barely
@@ -2522,7 +2626,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.fx_popover.set_child(fxbox)
 
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        top.append(self.btn_exp)
+        top.append(self.exp_box)
         top.append(self.btn_grid); top.append(self.btn_aspect)
         top.append(self.btn_fx); top.append(self.btn_timer)
 
@@ -3147,7 +3251,9 @@ class LensWindow(Adw.ApplicationWindow):
         .flash-on { color: #ffc107; background: rgba(255,193,7,0.18); }
         .flash-on:hover { background: rgba(255,193,7,0.30); }
         .zoombar { background: rgba(0,0,0,0.45); border-radius: 20px;
-                   padding: 3px; }
+                   padding: 4px 3px; }
+        .expbar { background: rgba(255,255,255,0.06);
+                  border-radius: 21px; padding: 0 6px 0 0; }
         .zoomstep { background: none; background-image: none; border: none;
                     color: white; min-width: 34px; min-height: 30px;
                     border-radius: 16px; padding: 0 6px; font-size: 15px; }
