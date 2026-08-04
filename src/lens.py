@@ -264,204 +264,9 @@ def have(element):
     return Gst.ElementFactory.find(element) is not None
 
 
-# Neural voice isolation, the same thing Discord uses, and the reason Discord
-# sounded clean on this machine while Lens did not. Everything before it was
-# spectral guesswork: a band-pass cannot help when the noise sits under the
-# voice, and a gate only helps between words. Worse, once capture was set to a
-# sensible level the room floor measured -29.4 dBFS while the gate triggered at
-# -40, so the gate was passing the noise through untouched. Measured on the
-# same room, in order: nothing -29.4, band-pass plus gate plus compressor
-# -29.3, this -700.
-RNNOISE = "ladspa-librnnoise-ladspa-so-noise-suppressor-mono"
-# How readily it calls something noise. Lower keeps more of what it is
-# unsure about, which is the escape hatch if suppression is chewing on the
-# voice itself rather than the room.
-RNNOISE_DEFAULT_VAD = 49
-# Kept only as the fallback for a machine without the plugin. It is much worse
-# and the numbers above say so.
-FALLBACK_CLEAN = ("audiowsincband mode=band-pass lower-frequency=110 "
-                  "upper-frequency=7500 length=101 ! audioconvert ! "
-                  "audiodynamic mode=expander characteristics=soft-knee "
-                  "ratio=2.5 threshold=0.010")
-# Catches the peaks the makeup gain pushes past full scale. Without it a take
-# measured a dead-flat 0.0 dBFS peak with 130 hard-clipped samples, which is
-# exactly what "loud but not clear" sounds like. LSP rather than audiodynamic
-# because it has real attack, release and lookahead, where audiodynamic has
-# none of the three and reshapes each sample where it stands: using that to
-# hold peaks down only trades clipping for distortion. Note enabled defaults
-# to false on LSP elements, so it has to be asked for.
-# The EQ is measured, not chosen. Earlier attempts here were guesswork
-# dressed up as measurement: the first "mic response" was taken with ambient
-# room noise as the excitation, and room noise is not flat, so what looked
-# like an 18dB treble rolloff was mostly just a quiet room. A swept sine
-# through the speakers put that right, and this microphone is within about a
-# decibel across 2-8kHz.
-#
-# What is actually wrong is the bottom. Against the long-term average speech
-# spectrum (Byrne et al. 1994), real takes on this machine run 11 to 20dB hot
-# at 125 and 250Hz. Too much bass masks the mids, which is why the same voice
-# reads as bassy and muffled at the same time, and why boosting treble to
-# fight it never worked.
-#
-# So: LTASS is the target, calibration measures the gap on your own voice,
-# and these are only the starting values until it has.
-LTASS = {125: -1.5, 250: 1.0, 500: 0.0, 1000: -5.5,
-         2000: -12.0, 4000: -19.0, 8000: -28.0}
-# (centre Hz, bandwidth Hz, gain dB). Conservative defaults: pull the low end
-# down, leave everything above 1k alone until there is a measurement to say
-# otherwise.
-DEFAULT_VOICE_BANDS = ((125, 110, -9.0), (250, 200, -6.0), (500, 300, -1.0),
-                       (1000, 700, 1.0), (2000, 1400, 1.0),
-                       (4000, 2800, 0.0), (8000, 5000, -2.0))
-# Chosen by sweeping the parameters against a real recording and keeping what
-# actually converged: 180Hz at 6 poles took the total error from 47.5dB to
-# 16.7, where 110Hz at 4 poles stalled at 23.
-VOICE_HP = 180
-VOICE_POLES = 6
-VOICE_BW_FACTOR = 1.4
-
-
-def stack_bands(gains, bwf=VOICE_BW_FACTOR):
-    """One band per 12dB of correction needed.
-
-    equalizer-nbands clamps each band at +-12dB and ignores anything larger
-    without saying so, which quietly capped the low-end cut where most of the
-    correction was needed. Splitting across repeated bands lifts that ceiling.
-    """
-    out = []
-    for c in sorted(gains):
-        g = gains[c]
-        bw = max(30, int(c * bwf))
-        while abs(g) > 0.05 and len(out) < 16:
-            step = max(-12.0, min(12.0, g))
-            out.append((c, bw, round(step, 2)))
-            g -= step
-    return tuple(out) or ((500, 300, 0.0),)
-
-
-def voice_eq(bands, amount=1.0, hp=VOICE_HP):
-    """Build the EQ fragment from a band list, scaled by amount."""
-    scaled = {}
-    for freq, _bw, gain in bands:
-        scaled[freq] = scaled.get(freq, 0.0) + gain * amount
-    use = stack_bands(scaled)
-    parts = [f"band{i}::freq={f} band{i}::bandwidth={bw} band{i}::gain={g:.2f}"
-             for i, (f, bw, g) in enumerate(use)]
-    return (f"audiocheblimit mode=high-pass cutoff={hp} poles={VOICE_POLES} ! "
-            f"equalizer-nbands num-bands={len(use)} " + " ".join(parts))
-
-
-def speech_profile(samples, rate=48000):
-    """Deviation from LTASS per band, in dB, or None if there is no speech.
-
-    Frames are chosen relative to the loudest one rather than by percentile.
-    A percentile picks quiet frames whenever most of a take is silence, and
-    then the "speech" being measured is really room rumble.
-    """
-    try:
-        import numpy as np
-    except ImportError:
-        return None
-    d = np.asarray(samples, dtype=float)
-    win = 2048
-    if len(d) < win * 8:
-        return None
-    hop = win // 2
-    frames = [d[i:i + win] for i in range(0, len(d) - win, hop)]
-    en = np.array([np.sqrt((f ** 2).mean()) + 1e-12 for f in frames])
-    sel = [f for f, e in zip(frames, en) if e > en.max() * 10 ** (-15 / 20)]
-    if len(sel) < 8:
-        return None
-    sp = np.zeros(win // 2 + 1)
-    for f in sel:
-        sp += np.abs(np.fft.rfft(f * np.hanning(win))) ** 2
-    sp /= len(sel)
-    fr = np.fft.rfftfreq(win, 1.0 / rate)
-
-    def band(c):
-        m = (fr >= c / 2 ** (1 / 6)) & (fr < c * 2 ** (1 / 6))
-        return 10 * np.log10(sp[m].mean() + 1e-20)
-    ref = band(500)
-    return {c: (band(c) - ref) - LTASS[c] for c in LTASS}
-
-
-def fit_voice_bands(samples, rate=48000, passes=7, log=None):
-    """Fit the correction by measuring, applying, and measuring again.
-
-    A single inversion of the measured error does not land, because the bands
-    overlap and the high-pass moves the bottom two on its own. So each pass
-    applies the candidate curve to the actual recording and re-measures what
-    came out, and the best-scoring pass wins. Guessing a curve and shipping it
-    unverified is what went wrong here twice.
-
-    Returns (bands, before_dB, after_dB) or None.
-    """
-    try:
-        import numpy as np
-    except ImportError:
-        return None
-    base = speech_profile(samples, rate)
-    if base is None:
-        return None
-    tmp = pathlib.Path(tempfile.gettempdir()) / f"lens-cal-{os.getpid()}"
-    src, dst = f"{tmp}-in.wav", f"{tmp}-out.wav"
-
-    def write(path, d):
-        import wave
-        with wave.open(path, "w") as w:
-            w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
-            w.writeframes((np.clip(d, -1, 1) * 32767).astype(np.int16).tobytes())
-
-    def read(path):
-        import wave
-        with wave.open(path) as w:
-            return (np.frombuffer(w.readframes(w.getnframes()),
-                                  dtype=np.int16).astype(float) / 32768)
-
-    write(src, np.asarray(samples, dtype=float))
-    gains = {c: 0.0 for c in LTASS}
-    best = (sum(abs(v) for v in base.values()), (), base)
-    try:
-        for _ in range(passes):
-            for c in base:
-                gains[c] = max(-24.0, min(9.0, gains[c]))
-            bands = stack_bands(gains)
-            eq = voice_eq(bands)
-            pipe = Gst.parse_launch(
-                f"filesrc location={src} ! wavparse ! audioconvert ! "
-                f"audioresample ! audio/x-raw,rate={rate},channels=1 ! {eq} ! "
-                f"audioconvert ! audio/x-raw,format=S16LE,channels=1 ! "
-                f"wavenc ! filesink location={dst}")
-            pipe.set_state(Gst.State.PLAYING)
-            pipe.get_bus().timed_pop_filtered(
-                30 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
-            pipe.set_state(Gst.State.NULL)
-            dev = speech_profile(read(dst), rate)
-            if dev is None:
-                break
-            err = sum(abs(v) for v in dev.values())
-            if log:
-                log(err, dev)
-            if err < best[0]:
-                best = (err, bands, dev)
-            for c in dev:
-                # 0.8 oscillated: a pass would overshoot, the next would
-                # correct back past it, and the error bounced between
-                # 27 and 45dB. Half-steps converge instead.
-                gains[c] = max(-24.0, min(9.0, gains[c] - dev[c] * 0.5))
-    finally:
-        for f in (src, dst):
-            try:
-                os.unlink(f)
-            except OSError:
-                pass
-    if not best[1]:
-        return None
-    return best[1], sum(abs(v) for v in base.values()), best[0]
-
-
-LIMITER = ("lsp-plug-in-plugins-lv2-limiter-mono enabled=true th=0.79 lk=5.0 "
-           "at=1.0 rt=10.0 knee=0.5")
+def have(element):
+    """Is this GStreamer element installed?"""
+    return Gst.ElementFactory.find(element) is not None
 
 
 CONTAINERS = {
@@ -692,27 +497,6 @@ DENOISE_CHAIN = ("audiowsincband mode=band-pass lower-frequency=110 "
 # cannot help either, because the noise sits under the voice. What does help
 # is holding the floor down whenever nobody is talking, then making up the
 # level afterwards, which is roughly what a phone does.
-# ratio ABOVE 1 attenuates below the threshold, which is the opposite of
-# what the name suggests: 0.14 made the floor 10dB louder. Measured in a
-# quiet room, the band-passed floor sits at -48.8 dBFS, and threshold 0.010
-# (-40 dBFS) with ratio 2.5 puts it at -63.1 dBFS even after the makeup gain
-# below. 3.5 reaches true digital silence, which chops the tails off words.
-NOISE_GATE = ("audiodynamic mode=expander characteristics=soft-knee "
-              "ratio=2.5 threshold=0.010")
-# Evens out how close you are to the mic, so the makeup gain below does not
-# have to be set for the quietest moment.
-LEVELLER = ("audiodynamic mode=compressor characteristics=soft-knee "
-            "ratio=0.55 threshold=0.26")
-# Catches the peaks the makeup gain pushes past full scale. Without it a take
-# measured a dead-flat 0.0 dBFS peak with 130 hard-clipped samples, which is
-# what "loud but not clear" sounds like. LSP rather than audiodynamic because
-# it has real attack, release and lookahead: audiodynamic has none of the
-# three and simply reshapes each sample where it stands, so using it to hold
-# peaks down trades clipping for distortion.
-LIMITER = ("lsp-plug-in-plugins-lv2-limiter-mono enabled=true th=0.79 lk=5.0 "
-           "at=1.0 rt=10.0 knee=0.5")
-
-
 def list_audio_sources():
     """[(name, description)] of real capture sources."""
     import subprocess
@@ -2071,7 +1855,6 @@ class LensWindow(Adw.ApplicationWindow):
         # (w, h, fps) the user pinned, or None to auto-pick
         self.mode_override = cfg.get("mode_override")
         self.mic_source = cfg.get("mic_source")     # None = system default
-        self.denoise = bool(cfg.get("denoise", True))
         self.flash_enabled = bool(cfg.get("flash", False))
         self.zoom = float(cfg.get("zoom", 1.0))
         self.pan_x = 0.0
@@ -2082,14 +1865,8 @@ class LensWindow(Adw.ApplicationWindow):
             self.filter_name = "None"
         self.mic_available = has_microphone()
         self.mic_enabled = bool(cfg.get("mic_enabled", True))
-        self.mic_gain = float(cfg.get("mic_gain", 2.0))
+        self.mic_gain = float(cfg.get("mic_gain", 1.0))
         self.mic_rate = int(cfg.get("mic_rate", 0)) or 0   # 0 = let it choose
-        self.voice_eq = bool(cfg.get("voice_eq", True))
-        self.voice_amount = float(cfg.get("voice_amount", 1.0))
-        vb = cfg.get("voice_bands")
-        self.voice_bands = (tuple(tuple(b) for b in vb) if vb
-                            else DEFAULT_VOICE_BANDS)
-        self.nr_strength = int(cfg.get("nr_strength", RNNOISE_DEFAULT_VAD))
         self.mirror_view = bool(cfg.get("mirror_view", True))
         self.mirror_saved = bool(cfg.get("mirror_saved", False))
         self.exposure_auto = True
@@ -3681,10 +3458,6 @@ class LensWindow(Adw.ApplicationWindow):
             "mic_enabled":  self.mic_enabled,
             "mic_gain":     self.mic_gain,
             "mic_rate":     self.mic_rate,
-            "voice_eq":     self.voice_eq,
-            "voice_amount": self.voice_amount,
-            "voice_bands":  [list(b) for b in self.voice_bands],
-            "nr_strength":  self.nr_strength,
             "trash_auto":   self.trash_auto,
             "trash_path":   self.trash_path,
             "mirror_view":  self.mirror_view,
@@ -3696,7 +3469,6 @@ class LensWindow(Adw.ApplicationWindow):
             "trash_days":   self.trash_days,
             "mode_override": self.mode_override,
             "mic_source":   self.mic_source,
-            "denoise":      self.denoise,
             "flash":        self.flash_enabled,
             "zoom":         self.zoom,
             "filter":       self.filter_name,
@@ -3889,42 +3661,26 @@ class LensWindow(Adw.ApplicationWindow):
         return False
 
     def _audio_src(self):
-        """pulsesrc plus the denoise filter, as a pipeline fragment.
+        """The microphone, as it is.
 
-        The trailing audioconvert is required, not tidiness: audiowsincband
-        emits float, the encoders want integer, and without it negotiation
-        fails outright. The pipeline then sticks in PAUSED, the recording
-        never starts, and the file is left at zero bytes.
+        Everything that used to sit here has gone: suppression, gate,
+        compressor, EQ, limiter and a calibration routine to drive them. Each
+        one measured well on its own and the result still sounded worse than
+        the bare mic, so the honest thing is to record what the microphone
+        hears and leave the shaping to whoever edits it.
+
+        What is left is the volume element, and that is not processing: it is
+        how mute works without cutting the file in two, and how the level
+        control works at all.
         """
         src = f"pulsesrc device={self.mic_source}" if self.mic_source else "pulsesrc"
         parts = [f"{src} provide-clock=false", "audioconvert"]
-        # Ask the device for a particular rate. Cheap capture hardware often
-        # has one rate it is actually happy at and produces screeching or
-        # silence at the others, and there is no way to find it but to try.
+        # Some cheap capture hardware only behaves at one rate.
         if self.mic_rate:
             parts.append("audioresample quality=8")
             parts.append(f"audio/x-raw,rate={self.mic_rate}")
-        if self.denoise:
-            # Mono at 48k, and the rate is not a detail. RNNoise analyses
-            # fixed 480-sample frames on the assumption they are 10ms, so at
-            # 44100 every band it reasons about is in the wrong place and it
-            # takes the consonants out with the noise: audible, but the words
-            # stop being words. PulseAudio was handing it 44100 by default.
-            parts.append("audioresample quality=8")
-            parts.append("audio/x-raw,rate=48000,channels=1")
-            if have(RNNOISE):
-                parts.append(f"{RNNOISE} name=nr vad-threshold={self.nr_strength}")
-            else:
-                parts.append(FALLBACK_CLEAN)
-        if self.voice_eq and have("equalizer-nbands"):
-            parts.append(voice_eq(self.voice_bands, self.voice_amount))
-        # Named so mute can be flipped on a running pipeline. Muting by
-        # tearing the branch out would end the file and start another one.
         parts.append(f"volume name=micvol volume={self.mic_gain:.2f} "
                      f"mute={'true' if not self.mic_enabled else 'false'}")
-        # Limiting last, after the gain that creates the peaks.
-        if self.denoise and have("lsp-plug-in-plugins-lv2-limiter-mono"):
-            parts += ["audioconvert", "audio/x-raw,channels=1", LIMITER]
         parts.append("audioconvert")
         return " ! ".join(parts)
 
@@ -4086,9 +3842,6 @@ class LensWindow(Adw.ApplicationWindow):
 
     def _build_mic_menu(self):
         box = self._menu_box()
-        box.append(self._menu_row("Noise suppression", self.denoise,
-                                  self._toggle_denoise))
-        box.append(Gtk.Separator())
         box.append(self._menu_head("AUDIO INPUT"))
         box.append(self._menu_row("System default", self.mic_source is None,
                                   lambda: self._set_mic_source(None)))
@@ -4097,15 +3850,6 @@ class LensWindow(Adw.ApplicationWindow):
                                       lambda n=name: self._set_mic_source(n)))
         self.mic_popover.set_child(box)
         self.mic_popover.popup()
-
-    def _toggle_denoise(self):
-        self.mic_popover.popdown()
-        self.denoise = not self.denoise
-        self._save_settings()
-        # Rebuild the monitor so the change is audible on the meter at once.
-        self._stop_audio_monitor()
-        if self.video_mode:
-            self._start_audio_monitor()
 
     def _set_mic_source(self, name):
         self.mic_popover.popdown()
@@ -4776,76 +4520,6 @@ class LensWindow(Adw.ApplicationWindow):
         folder = self.vid_dir if self.video_mode else self.pic_dir
         Gio.AppInfo.launch_default_for_uri("file://" + str(folder), None)
 
-    def _calibrate_voice(self, parent, status_row):
-        """Record a few seconds of speech and fit the EQ to it.
-
-        Deliberately captures BEFORE the EQ, and with noise reduction in
-        place so the measurement is of a voice rather than of the room.
-        """
-        try:
-            import numpy as np           # noqa: F401
-        except ImportError:
-            status_row.set_subtitle("Needs python3-numpy installed")
-            return
-        src = f"pulsesrc device={self.mic_source}" if self.mic_source else "pulsesrc"
-        clean = f" ! {RNNOISE} vad-threshold={self.nr_strength}" if have(RNNOISE) else ""
-        try:
-            pipe = Gst.parse_launch(
-                f"{src} ! audioconvert ! audioresample quality=8 ! "
-                f"audio/x-raw,rate=48000,channels=1{clean} ! audioconvert ! "
-                f"audio/x-raw,format=F32LE,rate=48000,channels=1 ! "
-                f"appsink name=cal emit-signals=true max-buffers=600 drop=false sync=false")
-        except Exception as e:
-            status_row.set_subtitle(f"Could not start: {e}")
-            return
-        sink = pipe.get_by_name("cal")
-        chunks = []
-
-        def on_sample(s_):
-            smp = s_.emit("pull-sample")
-            if smp:
-                buf = smp.get_buffer()
-                ok, mp = buf.map(Gst.MapFlags.READ)
-                if ok:
-                    import numpy as np
-                    chunks.append(np.frombuffer(bytes(mp.data), dtype=np.float32).copy())
-                    buf.unmap(mp)
-            return Gst.FlowReturn.OK
-        sink.connect("new-sample", on_sample)
-        pipe.set_state(Gst.State.PLAYING)
-        secs = 8
-        status_row.set_subtitle(f"Listening. Talk normally for {secs} seconds...")
-
-        def tick(left):
-            if left > 0:
-                status_row.set_subtitle(f"Listening. Keep talking, {left}s left")
-                GLib.timeout_add_seconds(1, tick, left - 1)
-                return False
-            pipe.set_state(Gst.State.NULL)
-            import numpy as np
-            if not chunks:
-                status_row.set_subtitle("Heard nothing at all. Is the mic muted?")
-                return False
-            status_row.set_subtitle("Working out the correction...")
-            fit = fit_voice_bands(np.concatenate(chunks))
-            if fit is None:
-                status_row.set_subtitle(
-                    "Not enough speech to measure. Try again, closer and louder")
-                return False
-            bands, before, after = fit
-            self.voice_bands = bands
-            self.voice_eq = True
-            self.voice_amount = 1.0
-            self._save_settings()
-            if self._audio_mon:
-                self._stop_audio_monitor()
-                self._start_audio_monitor()
-            status_row.set_subtitle(
-                f"Done. Your voice was {before:.0f} dB away from average "
-                f"speech across the band; this curve measures {after:.0f} dB.")
-            return False
-        GLib.timeout_add_seconds(1, tick, secs)
-
     def _open_settings(self):
         """Where files go, what they are called, how long the bin keeps them."""
         win = Adw.PreferencesWindow()
@@ -4957,98 +4631,6 @@ class LensWindow(Adw.ApplicationWindow):
         gain_row.add_suffix(scale)
         grpa.add(gain_row)
 
-        clean = Adw.SwitchRow(title="Noise reduction")
-        clean.set_subtitle("RNNoise, the same voice isolation Discord uses, "
-                           "plus a limiter to stop the gain clipping")
-        clean.set_active(self.denoise)
-
-        def clean_done(row, *_):
-            self.denoise = row.get_active()
-            self._save_settings()
-            if self._audio_mon:        # rebuild the meter with the new chain
-                self._stop_audio_monitor()
-                self._start_audio_monitor()
-        clean.connect("notify::active", clean_done)
-        grpa.add(clean)
-
-        veq = Adw.SwitchRow(title="Voice clarity")
-        veq.set_subtitle("Cuts rumble and boom, lifts the consonants. Turn it "
-                         "off if you want the mic exactly as it is")
-        veq.set_active(self.voice_eq)
-
-        def veq_done(row, *_):
-            self.voice_eq = row.get_active()
-            self._save_settings()
-            if self._audio_mon:
-                self._stop_audio_monitor()
-                self._start_audio_monitor()
-        veq.connect("notify::active", veq_done)
-        grpa.add(veq)
-
-        amt_row = Adw.ActionRow(title="Voice clarity strength")
-        amt = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 1.3, 0.05)
-        amt.set_size_request(230, -1)
-        amt.set_draw_value(False)
-        amt.set_valign(Gtk.Align.CENTER)
-        amt.add_mark(1.0, Gtk.PositionType.BOTTOM, None)
-        amt.set_value(self.voice_amount)
-
-        def show_amt():
-            amt_row.set_subtitle(
-                f"{self.voice_amount * 100:.0f} percent of the correction for "
-                f"this mic. Less if it sounds harsh, more if still muffled")
-        show_amt()
-
-        def amt_done(sc):
-            self.voice_amount = float(sc.get_value())
-            show_amt()
-            self._save_settings()
-            if self._audio_mon:
-                self._stop_audio_monitor()
-                self._start_audio_monitor()
-        amt.connect("value-changed", amt_done)
-        amt_row.add_suffix(amt)
-        grpa.add(amt_row)
-
-        cal_row = Adw.ActionRow(title="Calibrate for my voice")
-        cal_row.set_subtitle("Measures your voice against the average speech "
-                             "spectrum and sets the curve from that")
-        cal_btn = Gtk.Button(label="Calibrate")
-        cal_btn.set_valign(Gtk.Align.CENTER)
-        cal_btn.connect("clicked",
-                        lambda *_: self._calibrate_voice(win, cal_row))
-        cal_row.add_suffix(cal_btn)
-        grpa.add(cal_row)
-
-        str_row = Adw.ActionRow(title="Noise reduction strength")
-        strength = Gtk.Scale.new_with_range(
-            Gtk.Orientation.HORIZONTAL, 0, 99, 1)
-        strength.set_size_request(230, -1)
-        strength.set_draw_value(False)
-        strength.set_valign(Gtk.Align.CENTER)
-        strength.add_mark(RNNOISE_DEFAULT_VAD, Gtk.PositionType.BOTTOM, None)
-        strength.set_value(self.nr_strength)
-
-        def show_strength():
-            n = self.nr_strength
-            word = ("gentle, keeps more of the room" if n < 35 else
-                    "balanced" if n < 65 else "aggressive, may chew the voice")
-            str_row.set_subtitle(f"{n} percent, {word}")
-        show_strength()
-
-        def strength_moved(sc):
-            self.nr_strength = int(sc.get_value())
-            show_strength()
-            for pipe in (self.pipeline, self._audio_mon):
-                el = pipe.get_by_name("nr") if pipe is not None else None
-                if el is not None:
-                    el.set_property("vad-threshold", self.nr_strength)
-            self._save_settings()
-        strength.connect("value-changed", strength_moved)
-        str_row.add_suffix(strength)
-        str_row.set_visible(have(RNNOISE))
-        grpa.add(str_row)
-
         RATES = [0, 16000, 22050, 32000, 44100, 48000]
         rate_row = Adw.ComboRow(title="Capture rate")
         rate_row.set_subtitle("Leave on automatic unless the mic sounds wrong. "
@@ -5061,38 +4643,28 @@ class LensWindow(Adw.ApplicationWindow):
         def rate_done(row, *_):
             self.mic_rate = RATES[row.get_selected()]
             self._save_settings()
-            if self._audio_mon:      # rebuild so the new rate is asked for
+            if self._audio_mon:
                 self._stop_audio_monitor()
                 self._start_audio_monitor()
         rate_row.connect("notify::selected", rate_done)
         grpa.add(rate_row)
 
-        # A way back. It is easy to drag three sliders somewhere bad and have
-        # no idea which one did it.
         reset_row = Adw.ActionRow(title="Start over")
-        reset_row.set_subtitle("Put gain, strength and noise reduction back to default")
-        rbtn = Gtk.Button(label="Reset audio")
+        reset_row.set_subtitle("Unity gain, automatic rate")
+        rbtn = Gtk.Button(label="Reset")
         rbtn.set_valign(Gtk.Align.CENTER)
 
         def do_reset(*_):
             self.mic_gain = 1.0
             self.mic_rate = 0
-            rate_row.set_selected(0)
-            self.nr_strength = RNNOISE_DEFAULT_VAD
-            self.denoise = True
-            self.voice_eq = True
-            self.voice_amount = 1.0
-            self.voice_bands = DEFAULT_VOICE_BANDS
-            veq.set_active(True)
-            amt.set_value(1.0)
             scale.set_value(0.0)
-            strength.set_value(RNNOISE_DEFAULT_VAD)
-            clean.set_active(True)
-            show_gain(); show_strength()
+            rate_row.set_selected(0)
+            show_gain()
             self._save_settings()
         rbtn.connect("clicked", do_reset)
         reset_row.add_suffix(rbtn)
         grpa.add(reset_row)
+
         page.add(grpa)
 
         grpv = Adw.PreferencesGroup(title="Viewfinder")

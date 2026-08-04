@@ -21,8 +21,7 @@ Full-screen black viewfinder, iPhone-style controls:
 | Live viewfinder | ✅ |
 | Photo capture (JPEG, up to 8MP) | ✅ |
 | Video capture (MKV / MP4 / WebM) | ✅ |
-| Audio recording (AAC / Opus) | ✅ |
-| Neural noise suppression (RNNoise) and peak limiting | ✅ |
+| Audio recording (AAC / Opus), unprocessed | ✅ |
 | Camera flip (front / rear / any V4L2 device) | ✅ |
 | Self-timer (3s, 10s) | ✅ |
 | Grid overlay (rule of thirds, 2x2) | ✅ |
@@ -37,7 +36,7 @@ Full-screen black viewfinder, iPhone-style controls:
 | Camcorder HUD, interactive | ✅ |
 | Gallery: browse, crop, rotate, mirror, rename | ✅ |
 | Trash with a recycle bin, its own folder, optional auto-purge | ✅ |
-| Settings: folders, naming, mic gain with a live meter, mirroring, retention | ✅ |
+| Settings: folders, naming, mic level and rate, mirroring, retention | ✅ |
 | Touch gestures (swipe = flip, pinch = zoom) | 🚧 planned |
 | Subtitles from speech | 🚧 planned |
 | Manual focus | ❌ not possible, no focus motor on either camera |
@@ -76,9 +75,6 @@ Tap the preview deck to open it.
 - GTK 4.10+, libadwaita 1.0+
 - GStreamer 1.20+ with `gtk4paintablesink` plugin (from `gst-plugins-rs`)
 - A V4L2-compatible camera
-- Optional, for clean audio: `lsp-plugins-lv2` and the RNNoise LADSPA plugin.
-  Lens falls back to a band-pass and gate without them, which is audibly
-  worse. See below.
 
 ## Install
 
@@ -103,19 +99,6 @@ cp ~/Applications/lens/data/org.cheapaz.Lens.desktop ~/.local/share/applications
 sed -i "s|/home/bao|$HOME|" ~/.local/share/applications/org.cheapaz.Lens.desktop
 sed -i "s|/home/bao|$HOME|; s|Documents/lens|Applications/lens|" ~/.local/share/applications/org.cheapaz.Lens.desktop
 ```
-
-```bash
-# 4. Clean audio (optional but worth it)
-sudo apt install -y lsp-plugins-lv2 cmake build-essential
-git clone --depth 1 https://github.com/werman/noise-suppression-for-voice /tmp/nsv
-cmake -S /tmp/nsv -B /tmp/nsv/build -DCMAKE_BUILD_TYPE=Release \
-    -DBUILD_VST_PLUGIN=OFF -DBUILD_VST3_PLUGIN=OFF -DBUILD_LADSPA_PLUGIN=ON
-cmake --build /tmp/nsv/build -j4 --target rnnoise_ladspa
-sudo install -m 644 /tmp/nsv/build/bin/ladspa/librnnoise_ladspa.so /usr/lib/ladspa/
-```
-
-The VST targets in that project fail to configure without `webkit2gtk-4.0`.
-That does not matter, the LADSPA target is the only one Lens uses.
 
 Then search **Lens** in your app menu.
 
