@@ -2619,6 +2619,22 @@ class LensWindow(Adw.ApplicationWindow):
         self.frame_stack.add_controller(view_click)
         frame_stack = self.frame_stack
 
+        # Refit the HUD whenever the viewfinder changes size. It was only
+        # recomputed on a handful of explicit events, so any resize they did
+        # not cover left the readouts laid out for the previous width and the
+        # right-hand corner sitting out over the black border until something
+        # else happened to trigger a refit. A tick callback catches every
+        # cause at once: startup, aspect change, window resize, fullscreen.
+        self._last_stack_w = -1
+
+        def _watch_size(widget, clock):
+            w = widget.get_width()
+            if w != self._last_stack_w and w > 1:
+                self._last_stack_w = w
+                self._fit_hud()
+            return GLib.SOURCE_CONTINUE
+        self.frame_stack.add_tick_callback(_watch_size)
+
         self.aspect_frame = Gtk.AspectFrame.new(0.5, 0.5, 4/3, False)
         self.aspect_frame.add_css_class("viewframe")
         self.aspect_frame.set_child(frame_stack)
@@ -4096,22 +4112,33 @@ class LensWindow(Adw.ApplicationWindow):
         # centred clock starts and they overlap even when the total fits.
         # What matters is whether each side clears its half.
         inner = stack_w - 32
-        gap = 20
-        clock_w = self.hud_clock.get_preferred_size()[1].width
-        rec_w = w_of(self._rec_row)
-        bat_w = self._bat_row.get_preferred_size()[1].width
-        half = (inner - clock_w) / 2 - gap
-        if rec_w > half or bat_w > half:
-            self.hud_clock.set_visible(False)          # centre corner goes
-            if rec_w + bat_w + gap > inner:
-                self._bat_row.set_visible(False)       # then the right one
-                if rec_w > inner:
+
+        def too_wide(row):
+            """Ask the row how wide it needs to be, rather than adding up
+            its parts.
+
+            The parts summed to less than the space available while the row
+            still overflowed by 31px, because a CenterBox centring its middle
+            child around a wide start child needs more width than start plus
+            centre plus end. Modelling that arithmetic is how the right-hand
+            readout ended up sitting over the black border, and the row was
+            never asked what it actually wanted.
+            """
+            return row.get_preferred_size()[1].width > inner
+
+        # Top row: shed the centre first, then the right corner, then all of
+        # it, re-measuring after each so the next decision sees the truth.
+        if too_wide(self._hud_top):
+            self.hud_clock.set_visible(False)
+            if too_wide(self._hud_top):
+                self._bat_row.set_visible(False)
+                if too_wide(self._hud_top):
                     self._hud_top.set_visible(False)
 
         # Bottom row: sound on the left, format on the right.
-        if w_of(self._audio_row, self._info_row) > avail:
+        if too_wide(self._hud_bot):
             self._info_row.set_visible(False)
-            if w_of(self._audio_row) > avail:
+            if too_wide(self._hud_bot):
                 self._hud_bot.set_visible(False)
         return False
 
@@ -4527,6 +4554,11 @@ class LensWindow(Adw.ApplicationWindow):
     def _start_recording(self):
         ext, muxer, venc, aenc = CONTAINERS[self.container]
         path = next_name(self.vid_dir, self.name_prefix, "VID", ext)
+        # Freeze what is on screen before the preview pipeline goes away, so
+        # the Picture keeps a paintable with a real size across the swap.
+        frozen = self._freeze_frame()
+        if frozen is not None:
+            self.picture.set_paintable(frozen)
         # Rebuild pipeline for recording
         self.pipeline.set_state(Gst.State.NULL)
         dev = self.cameras[self.cam_idx][0]
@@ -4582,8 +4614,31 @@ class LensWindow(Adw.ApplicationWindow):
         self.fx_elem = self.pipeline.get_by_name("fx")
         self._apply_zoom()
         self._apply_filter()
-        self.paintable = sink.props.paintable
-        self.picture.set_paintable(self.paintable)
+        new_paintable = sink.props.paintable
+        self.paintable = new_paintable
+        # Hold the frozen frame until the new pipeline is actually producing.
+        # Attaching a gtk4paintablesink paintable before its first frame gives
+        # the Picture a zero intrinsic size, which collapsed the viewfinder to
+        # half height for about 200ms every time recording started. The
+        # preview path already deferred for this reason; this one did not.
+        if frozen is not None:
+            state = {"done": False}
+
+            def swap(*_):
+                if state["done"]:
+                    return False
+                state["done"] = True
+                if state.get("h"):
+                    try:
+                        new_paintable.disconnect(state["h"])
+                    except Exception:
+                        pass
+                self.picture.set_paintable(new_paintable)
+                return False
+            state["h"] = new_paintable.connect("invalidate-contents", swap)
+            GLib.timeout_add(1200, swap)    # fallback if no frame ever comes
+        else:
+            self.picture.set_paintable(new_paintable)
         # Fresh pipeline, so the flips are back at their defaults.
         self._apply_mirror()
         self._align_nr(self.pipeline)
