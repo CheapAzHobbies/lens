@@ -276,6 +276,18 @@ def have(element):
 # assumption they are 10ms, and at 44100 every band it reasons about lands
 # in the wrong place: audible, but the words stop being words.
 RNNOISE = "ladspa-librnnoise-ladspa-so-noise-suppressor-mono"
+# Suppression that hard leaves the voice wobbling, because at 4.5dB input SNR
+# RNNoise's per-band gain estimate swings about: measured 17.6dB of standard
+# deviation in the gain it applies across sustained speech. Blending a little
+# untouched signal back steadies it. On a real take, 5 percent dry took that
+# to 4.8dB while still suppressing 25.8dB, which is far more than needed.
+#
+# The dry path must be delayed to match, and the mixer will not do it: the
+# LADSPA plugin does not report its latency, so a naive blend put every sound
+# in twice, 145ms apart. Measured with tone bursts, 145ms lines them up
+# exactly. This number belongs to the default grace settings; changing those
+# changes the latency, which is why they are not exposed.
+NR_LATENCY_MS = 145
 
 
 def have(element):
@@ -1941,6 +1953,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.mic_gain = float(cfg.get("mic_gain", 1.0))
         self.mic_rate = int(cfg.get("mic_rate", 0)) or 0   # 0 = let it choose
         self.denoise = bool(cfg.get("denoise", True))
+        self.nr_mix = float(cfg.get("nr_mix", 0.05))
         self.mirror_view = bool(cfg.get("mirror_view", True))
         self.mirror_saved = bool(cfg.get("mirror_saved", False))
         self.exposure_auto = True
@@ -3533,6 +3546,7 @@ class LensWindow(Adw.ApplicationWindow):
             "mic_gain":     self.mic_gain,
             "mic_rate":     self.mic_rate,
             "denoise":      self.denoise,
+            "nr_mix":       self.nr_mix,
             "trash_auto":   self.trash_auto,
             "trash_path":   self.trash_path,
             "mirror_view":  self.mirror_view,
@@ -3749,19 +3763,43 @@ class LensWindow(Adw.ApplicationWindow):
         control works at all.
         """
         src = f"pulsesrc device={self.mic_source}" if self.mic_source else "pulsesrc"
-        parts = [f"{src} provide-clock=false", "audioconvert"]
+        vol = (f"volume name=micvol volume={self.mic_gain:.2f} "
+               f"mute={'true' if not self.mic_enabled else 'false'}")
         if self.denoise and have(RNNOISE):
-            parts.append("audioresample quality=8")
-            parts.append("audio/x-raw,rate=48000,channels=1")
-            parts.append(RNNOISE)
+            head = (f"{src} provide-clock=false ! audioconvert ! "
+                    f"audioresample quality=8 ! audio/x-raw,rate=48000,channels=1")
+            if self.nr_mix > 0.001:
+                dry = self.nr_mix
+                return (f"{head} ! tee name=nrt "
+                        f"nrt. ! queue ! {RNNOISE} ! "
+                        f"volume name=nrwet volume={1.0 - dry:.3f} ! nrmix. "
+                        f"nrt. ! queue name=nrdry ! "
+                        f"volume name=nrdryvol volume={dry:.3f} ! nrmix. "
+                        f"audiomixer name=nrmix ! {vol} ! audioconvert")
+            return f"{head} ! {RNNOISE} ! {vol} ! audioconvert"
+        parts = [f"{src} provide-clock=false", "audioconvert"]
         # Some cheap capture hardware only behaves at one rate.
         if self.mic_rate:
             parts.append("audioresample quality=8")
             parts.append(f"audio/x-raw,rate={self.mic_rate}")
-        parts.append(f"volume name=micvol volume={self.mic_gain:.2f} "
-                     f"mute={'true' if not self.mic_enabled else 'false'}")
+        parts.append(vol)
         parts.append("audioconvert")
         return " ! ".join(parts)
+
+    def _align_nr(self, pipeline):
+        """Delay the dry path so the blend does not arrive twice.
+
+        Has to be done on the pad after the pipeline is built, because it is
+        a timestamp offset rather than anything expressible in the launch
+        string.
+        """
+        if pipeline is None:
+            return
+        q = pipeline.get_by_name("nrdry")
+        if q is not None:
+            pad = q.get_static_pad("src")
+            if pad is not None:
+                pad.set_offset(NR_LATENCY_MS * Gst.MSECOND)
 
     # ---- live audio level ----
     def _feed_settings_meter(self, st):
@@ -3803,6 +3841,7 @@ class LensWindow(Adw.ApplicationWindow):
             self._audio_mon = Gst.parse_launch(
                 f"{self._audio_src()} ! level interval=100000000 ! "
                 f"fakesink sync=false")
+            self._align_nr(self._audio_mon)
             bus = self._audio_mon.get_bus()
             bus.add_signal_watch()
             self._audio_mon_handler = bus.connect("message::element", self._on_level)
@@ -4547,6 +4586,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.picture.set_paintable(self.paintable)
         # Fresh pipeline, so the flips are back at their defaults.
         self._apply_mirror()
+        self._align_nr(self.pipeline)
         self.pipeline.set_state(Gst.State.PLAYING)
         self.recording = True
         self.shutter_core.add_css_class("recording")
@@ -4775,6 +4815,40 @@ class LensWindow(Adw.ApplicationWindow):
                 self._start_audio_monitor()
         nr.connect("notify::active", nr_done)
         grpa.add(nr)
+
+        mix_row = Adw.ActionRow(title="Suppression strength")
+        mix = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 25.0, 1.0)
+        mix.set_size_request(230, -1)
+        mix.set_draw_value(False)
+        mix.set_valign(Gtk.Align.CENTER)
+        mix.add_mark(5.0, Gtk.PositionType.BOTTOM, None)
+        mix.set_value(self.nr_mix * 100.0)
+        mix.set_inverted(True)      # right is stronger, which is what people expect
+
+        def show_mix():
+            d = self.nr_mix * 100.0
+            if d < 0.5:
+                word = "maximum, and the voice may wobble"
+            elif d <= 7:
+                word = "strong, steady"
+            elif d <= 15:
+                word = "moderate"
+            else:
+                word = "light, some room noise stays"
+            mix_row.set_subtitle(f"{100 - d:.0f} percent, {word}")
+        show_mix()
+
+        def mix_done(sc):
+            self.nr_mix = float(sc.get_value()) / 100.0
+            show_mix()
+            self._save_settings()
+            if self._audio_mon:
+                self._stop_audio_monitor()
+                self._start_audio_monitor()
+        mix.connect("value-changed", mix_done)
+        mix_row.add_suffix(mix)
+        mix_row.set_sensitive(have(RNNOISE))
+        grpa.add(mix_row)
         page.add(grpa)
 
         # Diagnostics. Not decoration: the hiss on this machine was a +30dB
