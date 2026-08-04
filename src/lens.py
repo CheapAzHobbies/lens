@@ -698,6 +698,59 @@ class CropOverlay(Gtk.DrawingArea):
         cr.stroke()
 
 
+class TransformBox(Gtk.Widget):
+    """Holds one child and draws it turned, scaled or mirrored about its centre.
+
+    CSS cannot do this job. A transform there is a fixed string, but the
+    scale a rotation needs depends on the image's aspect and the space it has
+    to turn in, and it changes on every frame of the turn: a landscape photo
+    sweeps through its own diagonal at 45 degrees and needs to be smaller
+    then than at either end. A fixed scale either overflows mid-turn or
+    shrinks the photo more than it ever needed.
+    """
+
+    __gtype_name__ = "LensTransformBox"
+
+    def __init__(self, child):
+        super().__init__()
+        self._child = child
+        child.set_parent(self)
+        self.angle = 0.0
+        self.scale = 1.0
+        self.flip_x = 1.0
+        self.flip_y = 1.0
+
+    def do_measure(self, orientation, for_size):
+        return self._child.measure(orientation, for_size)
+
+    def do_size_allocate(self, width, height, baseline):
+        self._child.allocate(width, height, baseline, None)
+
+    def do_snapshot(self, snapshot):
+        if (self.angle, self.scale, self.flip_x, self.flip_y) == (0.0, 1.0, 1.0, 1.0):
+            self.snapshot_child(self._child, snapshot)
+            return
+        w, h = self.get_width(), self.get_height()
+        mid = Graphene.Point()
+        mid.init(w / 2, h / 2)
+        back = Graphene.Point()
+        back.init(-w / 2, -h / 2)
+        snapshot.save()
+        snapshot.translate(mid)
+        if self.angle:
+            snapshot.rotate(self.angle)
+        snapshot.scale(self.scale * self.flip_x, self.scale * self.flip_y)
+        snapshot.translate(back)
+        self.snapshot_child(self._child, snapshot)
+        snapshot.restore()
+
+    def do_dispose(self):
+        if self._child is not None:
+            self._child.unparent()
+            self._child = None
+        Gtk.Widget.do_dispose(self)
+
+
 class GalleryView(Gtk.Box):
     """Browse and edit what has been shot: rotate, mirror, crop, save.
 
@@ -822,8 +875,14 @@ class GalleryView(Gtk.Box):
         self.pic_frame = Gtk.AspectFrame(ratio=4 / 3, obey_child=False)
         self.pic_frame.set_xalign(0.5); self.pic_frame.set_yalign(0.5)
         self.pic_frame.set_hexpand(True); self.pic_frame.set_vexpand(True)
-        self.pic_frame.set_child(self.pic)
+        self.tbox = TransformBox(self.pic)
+        self.pic_frame.set_child(self.tbox)
         stack.set_child(self.pic_frame)
+        # Belt and braces: the fit maths keeps a turning photo inside the
+        # stage, but if it ever did reach the edge it must be cut off there
+        # rather than drawn over the toolbar.
+        stack.set_overflow(Gtk.Overflow.HIDDEN)
+        self.stage = stack
         self.crop = CropOverlay(on_change=lambda: None)
         stack.add_overlay(self.crop)
 
@@ -1312,28 +1371,91 @@ class GalleryView(Gtk.Box):
             return False
         GLib.timeout_add(ms, done)
 
+    def _fit_scale(self, w, h, deg):
+        """Largest scale at which a w x h box, turned by deg, still fits.
+
+        At 0 and 90 this is the scale that makes the turning photo land
+        exactly on the box the AspectFrame is about to give it, so the swap
+        at the end of the turn moves nothing. In between it follows the
+        photo's own diagonal.
+        """
+        a = math.radians(deg)
+        c, sn = abs(math.cos(a)), abs(math.sin(a))
+        bw, bh = w * c + h * sn, w * sn + h * c
+        sw, sh = self.stage.get_width(), self.stage.get_height()
+        if min(bw, bh, sw, sh) <= 0:
+            return 1.0
+        return min(1.0, sw / bw, sh / bh)
+
+    def _drive(self, ms, step, finish):
+        """Run step(0..1) once per frame, then finish(), on the frame clock."""
+        if getattr(self, "_anim_busy", False):
+            return
+        self._anim_busy = True
+        state = {"t0": None}
+
+        def tick(widget, clock):
+            if state["t0"] is None:
+                state["t0"] = clock.get_frame_time()
+            t = min(1.0, (clock.get_frame_time() - state["t0"]) / (ms * 1000.0))
+            step(t * t * (3.0 - 2.0 * t))       # smoothstep
+            if t >= 1.0:
+                finish()
+                self._anim_busy = False
+                return GLib.SOURCE_REMOVE
+            return GLib.SOURCE_CONTINUE
+        self.tbox.add_tick_callback(tick)
+
     def _rotate(self, deg):
         if self.src is None:
             return
         self.btn_save.set_sensitive(True)
+        a = self.pic.get_allocation()
+        w, h = a.width or 1, a.height or 1
+        tb = self.tbox
 
-        def apply():
+        def step(e):
+            tb.angle = deg * e
+            tb.scale = self._fit_scale(w, h, tb.angle)
+            tb.queue_draw()
+
+        def finish():
+            # Texture, frame ratio and transform all change in the same tick,
+            # before layout and snapshot run, so there is no frame where a
+            # turned photo is drawn in an unturned box.
             self.rotation = (self.rotation + deg) % 360
             self._render()
-        self._animate("spin-cw" if deg > 0 else "spin-ccw", apply)
+            tb.angle, tb.scale = 0.0, 1.0
+            tb.queue_draw()
+        self._drive(420, step, finish)
 
     def _flip(self, horizontal):
         if self.src is None:
             return
         self.btn_save.set_sensitive(True)
+        tb = self.tbox
+        done = {"swapped": False}
 
-        def apply():
+        def step(e):
+            # Squash to nothing, turn the picture over at the edge, come back.
+            v = abs(1.0 - 2.0 * e)
             if horizontal:
-                self.flip_h = not self.flip_h
+                tb.flip_x = v
             else:
-                self.flip_v = not self.flip_v
-            self._render()
-        self._animate("flip-h" if horizontal else "flip-v", apply, ms=240)
+                tb.flip_y = v
+            if not done["swapped"] and e >= 0.5:
+                done["swapped"] = True
+                if horizontal:
+                    self.flip_h = not self.flip_h
+                else:
+                    self.flip_v = not self.flip_v
+                self._render()
+            tb.queue_draw()
+
+        def finish():
+            tb.flip_x = tb.flip_y = 1.0
+            tb.queue_draw()
+        self._drive(340, step, finish)
 
     def _set_cropping(self, on):
         self.crop.active = on
@@ -2361,11 +2483,6 @@ class LensWindow(Adw.ApplicationWindow):
            different photo appearing. */
         .gal picture { transition: transform 240ms cubic-bezier(.3,.7,.3,1),
                                    opacity 200ms ease-out; }
-        .spin-cw  { transform: rotate(90deg)  scale(0.82); }
-        .spin-ccw { transform: rotate(-90deg) scale(0.82); }
-        .flip-h   { transform: scaleX(-1) scale(0.82); }
-        .flip-v   { transform: scaleY(-1) scale(0.82); }
-        .settle   { transform: scale(0.82); }
         .gal picture.no-anim { transition: none; }
         .crop-drop { transform: scale(0.9) translateY(26px); opacity: 0.25; }
         .gal-count { color: rgba(255,255,255,0.55); font-size: 13px;
