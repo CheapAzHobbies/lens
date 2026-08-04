@@ -4613,6 +4613,11 @@ class LensWindow(Adw.ApplicationWindow):
         self.rec_state_label.set_label("SAVE")
         self._show_saving(True)
         bus = self.pipeline.get_bus()
+        # add_signal_watch, without which message::eos is never dispatched as
+        # a signal and this handler cannot fire. It was missing, so every save
+        # ran to the backstop below: 8 seconds, every time, no matter how
+        # short the clip or how quickly the pipeline had actually finished.
+        bus.add_signal_watch()
         self._eos_handler = bus.connect("message::eos", lambda *_: self._finish_stop())
         self.pipeline.send_event(Gst.Event.new_eos())
         # Generous backstop. Reaching it means something went wrong, and a
@@ -4631,6 +4636,7 @@ class LensWindow(Adw.ApplicationWindow):
             if self._eos_handler:
                 try:
                     old.get_bus().disconnect(self._eos_handler)
+                    old.get_bus().remove_signal_watch()
                 except Exception:
                     pass
                 self._eos_handler = None
