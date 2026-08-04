@@ -20,8 +20,12 @@ APP_ID = "org.cheapaz.Lens"
 CONFIG_DIR = pathlib.Path(
     os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config")) / "lens"
 SETTINGS = CONFIG_DIR / "settings.json"
-PICTURES = pathlib.Path.home() / "Pictures" / "Lens"
-VIDEOS   = pathlib.Path.home() / "Videos"  / "Lens"
+# Defaults only. The live values come from settings.json and are held on
+# the window, so they can be changed without restarting.
+DEF_PICTURES = pathlib.Path.home() / "Pictures" / "Lens"
+DEF_VIDEOS   = pathlib.Path.home() / "Videos"  / "Lens"
+PICTURES = DEF_PICTURES
+VIDEOS   = DEF_VIDEOS
 THUMBS = pathlib.Path(
     os.environ.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache")) / "lens" / "thumbs"
 VIDEO_EXTS = (".mkv", ".mp4", ".webm", ".mov")
@@ -32,8 +36,6 @@ CONTAINERS = {
     "MP4":  ("mp4",  "mp4mux",      "x264enc tune=zerolatency bitrate=4000", "voaacenc"),
     "WebM": ("webm", "webmmux",     "vp8enc deadline=1",                     "opusenc"),
 }
-PICTURES.mkdir(parents=True, exist_ok=True)
-VIDEOS.mkdir(parents=True, exist_ok=True)
 
 
 def _stable_camera_ids():
@@ -227,6 +229,49 @@ def has_microphone():
         return False
     return any(l.strip() and "monitor" not in l.split("\t")[1]
                for l in out.splitlines() if "\t" in l)
+
+
+def next_name(folder, prefix, kind, ext):
+    """Next free {prefix}_{IMG|VID}_{NNNN}.{ext} in folder.
+
+    Sequential rather than timestamped: it sorts naturally, reads at a
+    glance, and matches what cameras actually do. The scan is over existing
+    names rather than a stored counter, so deleting the newest file and
+    shooting again cannot silently overwrite something.
+    """
+    import re
+    pat = re.compile(rf"^{re.escape(prefix)}_{kind}_(\d+)\.", re.I)
+    top = 0
+    try:
+        for f in folder.iterdir():
+            m = pat.match(f.name)
+            if m:
+                top = max(top, int(m.group(1)))
+    except OSError:
+        pass
+    return folder / f"{prefix}_{kind}_{top + 1:04d}.{ext}"
+
+
+def trash_dir():
+    return CONFIG_DIR / "trash"
+
+
+def purge_trash(days):
+    """Delete trashed files older than `days`. 0 disables purging."""
+    if not days:
+        return
+    import time
+    d = trash_dir()
+    if not d.is_dir():
+        return
+    cutoff = time.time() - days * 86400
+    for f in d.iterdir():
+        try:
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink()
+                print(f"Lens: purged {f.name} from trash")
+        except OSError:
+            pass
 
 
 def is_video(path):
@@ -552,14 +597,19 @@ class GalleryView(Gtk.Box):
 
     THUMB = 74
 
-    def __init__(self, on_close, on_open_external):
+    def __init__(self, on_close, on_open_external, on_settings=lambda: None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add_css_class("gal")
         self.on_close = on_close
         self.on_open_external = on_open_external
+        self.on_settings = on_settings
+        self.in_bin = False
+        self._live_paths = []
         self.paths = []
         self.index = 0
-        self.src = None            # untouched pixbuf
+        self.src = None
+        self.pic_dir = DEF_PICTURES
+        self.vid_dir = DEF_VIDEOS            # untouched pixbuf
         self.rotation = 0
         self.flip_h = False
         self.flip_v = False
@@ -575,13 +625,21 @@ class GalleryView(Gtk.Box):
                           lambda: self.on_close())
         head.append(back)
 
-        self.title = Gtk.Label(label="")
+        # EditableLabel: reads as text, turns into an entry on click, and
+        # commits on Enter. Renaming is a normal thing to want and hiding it
+        # behind a dialog would be worse than showing it in place.
+        self.title = Gtk.EditableLabel(text="")
         self.title.add_css_class("gal-title")
-        self.title.set_ellipsize(3)
         self.title.set_hexpand(True)
-        self.title.set_halign(Gtk.Align.START)
+        self.title.set_halign(Gtk.Align.FILL)
         self.title.set_margin_start(8)
+        self.title.connect("notify::editing", self._on_title_edit)
         head.append(self.title)
+
+        self.counter = Gtk.Label(label="")
+        self.counter.add_css_class("gal-count")
+        self.counter.set_margin_end(8)
+        head.append(self.counter)
 
         self._edit_tools = []
         for icon, tip, cb in (
@@ -611,6 +669,25 @@ class GalleryView(Gtk.Box):
         self.ratio_btn.set_sensitive(False)
         self._build_ratio_menu()
         head.append(self.ratio_btn)
+
+        self.btn_bin = Gtk.ToggleButton()
+        self.btn_bin.set_child(self._icon("user-trash-full-symbolic"))
+        self.btn_bin.add_css_class("gal-tool")
+        self.btn_bin.set_tooltip_text("Recycle bin")
+        self.btn_bin.connect("toggled", lambda b: self._show_bin(b.get_active()))
+        head.append(self.btn_bin)
+        head.append(self._tool("emblem-system-symbolic", "Settings",
+                               lambda: self.on_settings()))
+        head.append(self._tool("folder-symbolic", "Show in Files",
+                               self._show_in_files))
+        head.append(self._tool("user-trash-symbolic", "Move to trash",
+                               self._trash_current))
+
+        self.btn_restore = Gtk.Button(label="Restore")
+        self.btn_restore.add_css_class("gal-save")
+        self.btn_restore.set_visible(False)
+        self.btn_restore.connect("clicked", lambda *_: self._restore_current())
+        head.append(self.btn_restore)
 
         self.btn_play = Gtk.Button(label="Play")
         self.btn_play.add_css_class("gal-save")
@@ -647,6 +724,15 @@ class GalleryView(Gtk.Box):
         scroll.connect("scroll", self._on_scroll)
         self.add_controller(scroll)
 
+        # Visible paging targets. Clicking the edge of the photo works, but
+        # nothing tells you that, so the arrows say it out loud.
+        self.arrow_l = self._arrow("go-previous-symbolic", Gtk.Align.START,
+                                   lambda: self.go(self.index - 1))
+        self.arrow_r = self._arrow("go-next-symbolic", Gtk.Align.END,
+                                   lambda: self.go(self.index + 1))
+        stack.add_overlay(self.arrow_l)
+        stack.add_overlay(self.arrow_r)
+
         self.empty = Gtk.Label(label="Nothing here yet")
         self.empty.add_css_class("gal-empty")
         stack.add_overlay(self.empty)
@@ -654,6 +740,10 @@ class GalleryView(Gtk.Box):
         self.append(stack)
 
         # ---- filmstrip
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self._on_key)
+        self.add_controller(keys)
+
         self.strip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.strip.set_margin_start(10); self.strip.set_margin_end(10)
         sc = Gtk.ScrolledWindow()
@@ -695,6 +785,163 @@ class GalleryView(Gtk.Box):
         self.ratio_pop.popdown()
         self.ratio_btn.set_child(Gtk.Label(label=label))
         self.crop.set_ratio(ratio)
+
+    def _show_bin(self, on):
+        """Swap the list between what is live and what is in the bin.
+
+        Same view rather than a separate screen: the actions that make sense
+        differ, but browsing does not, and a second gallery to maintain would
+        drift from this one.
+        """
+        self.in_bin = on
+        if on:
+            self._live_paths = list(self.paths)
+            items = []
+            for f in sorted(trash_dir().glob("*")):
+                try:
+                    if f.is_file() and f.stat().st_size:
+                        items.append((f.stat().st_mtime, f))
+                except OSError:
+                    pass
+            items.sort()
+            self.paths = [str(f) for _, f in items]
+        else:
+            self.paths = self._live_paths
+        self.index = 0
+        self.btn_restore.set_visible(on)
+        self._build_strip()
+        self._show()
+
+    def _restore_current(self):
+        if not (self.in_bin and self.paths):
+            return
+        src = pathlib.Path(self.paths[self.index])
+        home = self.vid_dir if is_video(src) else self.pic_dir
+        dest = home / src.name
+        n = 2
+        while dest.exists():
+            dest = home / f"{src.stem}-{n}{src.suffix}"
+            n += 1
+        try:
+            src.rename(dest)
+        except OSError as e:
+            print(f"Lens: restore failed: {e}", file=sys.stderr)
+            return
+        print(f"Lens: restored {dest.name}")
+        del self.paths[self.index]
+        self.index = max(0, min(self.index, len(self.paths) - 1))
+        self._build_strip()
+        self._show()
+
+    def _arrow(self, icon, align, cb):
+        b = Gtk.Button()
+        b.set_child(self._icon(icon))
+        b.add_css_class("gal-arrow")
+        b.set_halign(align)
+        b.set_valign(Gtk.Align.CENTER)
+        b.set_margin_start(14); b.set_margin_end(14)
+        b.connect("clicked", lambda *_: cb())
+        return b
+
+    def _on_key(self, ctrl, keyval, keycode, state):
+        from gi.repository import Gdk as _Gdk
+        if self.title.get_property("editing"):
+            return False               # typing a filename, not navigating
+        if keyval in (_Gdk.KEY_Left, _Gdk.KEY_Up, _Gdk.KEY_Page_Up):
+            self.go(self.index - 1); return True
+        if keyval in (_Gdk.KEY_Right, _Gdk.KEY_Down, _Gdk.KEY_Page_Down):
+            self.go(self.index + 1); return True
+        if keyval == _Gdk.KEY_Home:
+            self.go(0); return True
+        if keyval == _Gdk.KEY_End:
+            self.go(len(self.paths) - 1); return True
+        if keyval == _Gdk.KEY_Delete:
+            self._trash_current(); return True
+        return False
+
+    def _on_title_edit(self, *_):
+        """Rename on commit. Editing stops both when confirmed and when
+        cancelled, so the text is compared rather than assumed changed."""
+        if self.title.get_property("editing") or not self.paths:
+            return
+        new = (self.title.get_text() or "").strip()
+        cur = pathlib.Path(self.paths[self.index])
+        if not new or new == cur.name:
+            return
+        if "/" in new:
+            self.title.set_text(cur.name)
+            return
+        if not pathlib.Path(new).suffix:
+            new += cur.suffix          # keep it openable
+        dest = cur.with_name(new)
+        if dest.exists():
+            print(f"Lens: {new} already exists", file=sys.stderr)
+            self.title.set_text(cur.name)
+            return
+        try:
+            cur.rename(dest)
+        except OSError as e:
+            print(f"Lens: rename failed: {e}", file=sys.stderr)
+            self.title.set_text(cur.name)
+            return
+        self.paths[self.index] = str(dest)
+        print(f"Lens: renamed to {dest.name}")
+
+    def _show_in_files(self):
+        if not self.paths:
+            return
+        f = pathlib.Path(self.paths[self.index])
+        try:
+            # Ask the file manager to reveal and select the file. Falls back
+            # to opening the folder if nothing implements the interface.
+            Gio.DBusConnection.call_sync(
+                Gio.bus_get_sync(Gio.BusType.SESSION, None),
+                "org.freedesktop.FileManager1", "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1", "ShowItems",
+                GLib.Variant("(ass)", ([f.as_uri()], "")),
+                None, Gio.DBusCallFlags.NONE, 3000, None)
+        except Exception:
+            Gio.AppInfo.launch_default_for_uri(f.parent.as_uri(), None)
+
+    def _trash_current(self):
+        """Move to Lens's own trash rather than deleting.
+
+        Its own, not the desktop's, because the retention rule is ours: the
+        purge on startup has to know when things arrived.
+        """
+        if not self.paths:
+            return
+        src = pathlib.Path(self.paths[self.index])
+        if self.in_bin:
+            # Already in the bin: this is the permanent one.
+            try:
+                src.unlink()
+                print(f"Lens: deleted {src.name}")
+            except OSError as e:
+                print(f"Lens: delete failed: {e}", file=sys.stderr)
+                return
+            del self.paths[self.index]
+            self.index = max(0, min(self.index, len(self.paths) - 1))
+            self._build_strip()
+            self._show()
+            return
+        dest = trash_dir() / src.name
+        n = 2
+        while dest.exists():
+            dest = trash_dir() / f"{src.stem}-{n}{src.suffix}"
+            n += 1
+        try:
+            trash_dir().mkdir(parents=True, exist_ok=True)
+            src.rename(dest)
+        except OSError as e:
+            print(f"Lens: could not trash {src.name}: {e}", file=sys.stderr)
+            return
+        print(f"Lens: trashed {src.name}")
+        del self.paths[self.index]
+        if self.index >= len(self.paths):
+            self.index = max(0, len(self.paths) - 1)
+        self._build_strip()
+        self._show()
 
     # ---- content ----
     def load(self, paths, start=None):
@@ -746,7 +993,10 @@ class GalleryView(Gtk.Box):
         self.btn_crop.set_sensitive(have)
         self.pic.set_visible(have)
         if not have:
-            self.title.set_label("")
+            self.title.set_text("")
+            self.counter.set_label("")
+            self.arrow_l.set_visible(False)
+            self.arrow_r.set_visible(False)
             self.pic.set_paintable(None)
             return
         path = self.paths[self.index]
@@ -767,8 +1017,10 @@ class GalleryView(Gtk.Box):
         self.flip_h = self.flip_v = False
         self.btn_crop.set_active(False)
         self.btn_save.set_sensitive(False)
-        self.title.set_label(
-            f"{pathlib.Path(path).name}    {self.index + 1} of {len(self.paths)}")
+        self.title.set_text(pathlib.Path(path).name)
+        self.counter.set_label(f"{self.index + 1} / {len(self.paths)}")
+        self.arrow_l.set_visible(self.index > 0)
+        self.arrow_r.set_visible(self.index < len(self.paths) - 1)
         for i, b in enumerate(self._strip_buttons):
             if i == self.index:
                 b.add_css_class("gal-thumb-active")
@@ -865,7 +1117,11 @@ class GalleryView(Gtk.Box):
         except Exception as e:
             print(f"Lens: could not save: {e}", file=sys.stderr)
             return
-        self.btn_save.set_sensitive(False)
+        # Show the result. Saving silently and leaving the original on screen
+        # is why this looked like it had done nothing.
+        self.paths.insert(self.index + 1, str(out))
+        self._build_strip()
+        self.go(self.index + 1)
 
     # ---- navigation ----
     def _on_page_click(self, gesture, n_press, x, y):
@@ -905,6 +1161,16 @@ class LensWindow(Adw.ApplicationWindow):
         self.aspect_idx = cfg.get("aspect_idx", 0)
         if not 0 <= self.aspect_idx < len(self.aspects):
             self.aspect_idx = 0
+        self.pic_dir = pathlib.Path(cfg.get("pic_dir", str(DEF_PICTURES))).expanduser()
+        self.vid_dir = pathlib.Path(cfg.get("vid_dir", str(DEF_VIDEOS))).expanduser()
+        self.name_prefix = cfg.get("name_prefix", "Lens") or "Lens"
+        self.trash_days = int(cfg.get("trash_days", 30))
+        for d in (self.pic_dir, self.vid_dir, trash_dir()):
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                print(f"Lens: cannot create {d}: {e}", file=sys.stderr)
+        purge_trash(self.trash_days)
         self.container = cfg.get("container", "MKV")
         if self.container not in CONTAINERS:
             self.container = "MKV"
@@ -1520,7 +1786,8 @@ class LensWindow(Adw.ApplicationWindow):
         self.viewer = GalleryView(
             on_close=self._close_photo_viewer,
             on_open_external=lambda p: Gio.AppInfo.launch_default_for_uri(
-                "file://" + str(p), None))
+                "file://" + str(p), None),
+            on_settings=self._open_settings)
         # Overlay children get their natural size unless told to expand, so
         # without these the gallery opened at zero size and a tap on the
         # preview looked like it did nothing at all.
@@ -1646,6 +1913,13 @@ class LensWindow(Adw.ApplicationWindow):
         .gal-thumb:hover { background: rgba(255,255,255,0.12); }
         .gal-thumb-active { background: #62a0ea; }
         .gal-empty { color: rgba(255,255,255,0.45); font-size: 16px; }
+        .gal-count { color: rgba(255,255,255,0.55); font-size: 13px;
+                     font-family: monospace; }
+        .gal-arrow { background: rgba(0,0,0,0.5); color: white; border: none;
+                     border-radius: 22px; min-width: 44px; min-height: 44px;
+                     opacity: 0.65; transition: opacity 120ms ease-out,
+                                                background 120ms ease-out; }
+        .gal-arrow:hover { opacity: 1; background: rgba(0,0,0,0.75); }
         /* Full-screen photo viewer */
         /* Camera flip: the viewfinder squeezes left-to-right to a vertical
            sliver, the pipeline is swapped while it is invisible, then it
@@ -1956,6 +2230,10 @@ class LensWindow(Adw.ApplicationWindow):
             "overlay_mode": getattr(self, "overlay_mode", 0),
             "mic_enabled":  self.mic_enabled,
             "container":    self.container,
+            "pic_dir":      str(self.pic_dir),
+            "vid_dir":      str(self.vid_dir),
+            "name_prefix":  self.name_prefix,
+            "trash_days":   self.trash_days,
             "mode_override": self.mode_override,
             "mic_source":   self.mic_source,
             "denoise":      self.denoise,
@@ -2722,8 +3000,7 @@ class LensWindow(Adw.ApplicationWindow):
         self._save_photo(data)
 
     def _save_photo(self, data):
-        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        path = PICTURES / f"Lens-{ts}.jpg"
+        path = next_name(self.pic_dir, self.name_prefix, "IMG", "jpg")
         path.write_bytes(data)
         # Center-crop to the current aspect ratio so the saved image matches
         # what the viewfinder showed.
@@ -2776,9 +3053,8 @@ class LensWindow(Adw.ApplicationWindow):
         return True
 
     def _start_recording(self):
-        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         ext, muxer, venc, aenc = CONTAINERS[self.container]
-        path = VIDEOS / f"Lens-{ts}.{ext}"
+        path = next_name(self.vid_dir, self.name_prefix, "VID", ext)
         # Rebuild pipeline for recording
         self.pipeline.set_state(Gst.State.NULL)
         dev = self.cameras[self.cam_idx][0]
@@ -2870,20 +3146,120 @@ class LensWindow(Adw.ApplicationWindow):
         return False
 
     def _open_gallery(self, *_):
-        folder = VIDEOS if self.video_mode else PICTURES
+        folder = self.vid_dir if self.video_mode else self.pic_dir
         Gio.AppInfo.launch_default_for_uri("file://" + str(folder), None)
+
+    def _open_settings(self):
+        """Where files go, what they are called, how long the bin keeps them."""
+        win = Adw.PreferencesWindow()
+        win.set_transient_for(self)
+        win.set_modal(True)
+        win.set_default_size(520, 420)
+        win.set_title("Lens Settings")
+
+        page = Adw.PreferencesPage()
+        grp = Adw.PreferencesGroup(title="Where things are saved")
+
+        def folder_row(title, getter, setter):
+            row = Adw.ActionRow(title=title, subtitle=str(getter()))
+            btn = Gtk.Button(label="Choose")
+            btn.set_valign(Gtk.Align.CENTER)
+
+            def pick(*_):
+                dlg = Gtk.FileDialog()
+                dlg.set_title(title)
+                dlg.set_initial_folder(Gio.File.new_for_path(str(getter())))
+
+                def done(d, res):
+                    try:
+                        f = d.select_folder_finish(res)
+                    except Exception:
+                        return
+                    if f:
+                        setter(pathlib.Path(f.get_path()))
+                        row.set_subtitle(str(getter()))
+                        self._save_settings()
+                        self._refresh_deck()
+                dlg.select_folder(win, None, done)
+            btn.connect("clicked", pick)
+            row.add_suffix(btn)
+            return row
+
+        def set_pic(v):
+            self.pic_dir = v; v.mkdir(parents=True, exist_ok=True)
+
+        def set_vid(v):
+            self.vid_dir = v; v.mkdir(parents=True, exist_ok=True)
+
+        grp.add(folder_row("Photos", lambda: self.pic_dir, set_pic))
+        grp.add(folder_row("Videos", lambda: self.vid_dir, set_vid))
+        page.add(grp)
+
+        grp2 = Adw.PreferencesGroup(
+            title="File names",
+            description="Files are named PREFIX_IMG_0001.jpg and PREFIX_VID_0001")
+        pref = Adw.EntryRow(title="Prefix")
+        pref.set_text(self.name_prefix)
+
+        def prefix_done(*_):
+            v = (pref.get_text() or "").strip().replace("/", "")
+            if v:
+                self.name_prefix = v
+                self._save_settings()
+        pref.connect("apply", prefix_done)
+        pref.connect("notify::text", prefix_done)
+        grp2.add(pref)
+        page.add(grp2)
+
+        grp3 = Adw.PreferencesGroup(
+            title="Recycle bin",
+            description="Deleted files wait here before being removed for good")
+        spin = Adw.SpinRow.new_with_range(0, 365, 1)
+        spin.set_title("Keep for (days)")
+        spin.set_subtitle("0 keeps them until you empty the bin yourself")
+        spin.set_value(self.trash_days)
+
+        def days_done(*_):
+            self.trash_days = int(spin.get_value())
+            self._save_settings()
+        spin.connect("notify::value", days_done)
+        grp3.add(spin)
+
+        empty = Adw.ActionRow(title="Empty the bin now")
+        eb = Gtk.Button(label="Empty")
+        eb.add_css_class("destructive-action")
+        eb.set_valign(Gtk.Align.CENTER)
+
+        def do_empty(*_):
+            n = 0
+            for f in trash_dir().glob("*"):
+                try:
+                    if f.is_file():
+                        f.unlink(); n += 1
+                except OSError:
+                    pass
+            empty.set_subtitle(f"Removed {n} file(s)")
+        eb.connect("clicked", do_empty)
+        empty.add_suffix(eb)
+        grp3.add(empty)
+        page.add(grp3)
+
+        win.add(page)
+        win.present()
 
     def _open_photo_viewer(self, path):
         """Open the gallery, positioned on whatever was tapped."""
         items = []
-        for f in list(PICTURES.glob("*.jpg")) + [
-                g for e in VIDEO_EXTS for g in VIDEOS.glob("*" + e)]:
+        for f in list(self.pic_dir.glob("*.jpg")) + [
+                g for e in VIDEO_EXTS for g in self.vid_dir.glob("*" + e)]:
             try:
                 if f.stat().st_size:
                     items.append((f.stat().st_mtime, f))
             except OSError:
                 pass
         items.sort(key=lambda t: t[0])
+        self.viewer.pic_dir = self.pic_dir
+        self.viewer.vid_dir = self.vid_dir
         self.viewer.load([f for _, f in items], start=path)
         self.viewer.set_visible(True)
 
@@ -2898,9 +3274,9 @@ class LensWindow(Adw.ApplicationWindow):
         stale card behind.
         """
         items = []
-        candidates = list(PICTURES.glob("*.jpg"))
+        candidates = list(self.pic_dir.glob("*.jpg"))
         for ext in VIDEO_EXTS:
-            candidates += list(VIDEOS.glob("*" + ext))
+            candidates += list(self.vid_dir.glob("*" + ext))
         for f in candidates:
             try:
                 st = f.stat()
@@ -2916,7 +3292,7 @@ class LensWindow(Adw.ApplicationWindow):
         """Rebuild the deck when the photo folder changes underneath us, so
         deleting from Files updates the previews without a restart."""
         self._pic_monitors = []
-        for d in (PICTURES, VIDEOS):
+        for d in (self.pic_dir, self.vid_dir):
             try:
                 mon = Gio.File.new_for_path(str(d)).monitor_directory(
                     Gio.FileMonitorFlags.NONE, None)
