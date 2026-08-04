@@ -677,6 +677,24 @@ def save_settings(data):
         print(f"Lens: could not save settings: {e}", file=sys.stderr)
 
 
+def mains_online():
+    """True/False if a mains supply says so, None if there is none to ask."""
+    base = pathlib.Path("/sys/class/power_supply")
+    if not base.is_dir():
+        return None
+    seen = False
+    for d in sorted(base.iterdir()):
+        try:
+            if (d / "type").read_text().strip() != "Mains":
+                continue
+            seen = True
+            if (d / "online").read_text().strip() == "1":
+                return True
+        except Exception:
+            continue
+    return False if seen else None
+
+
 def read_battery():
     """(percent, status, energy_uWh, power_uW) from sysfs.
 
@@ -1895,6 +1913,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.mic_available = has_microphone()
         self.mic_enabled = bool(cfg.get("mic_enabled", True))
         self.mic_gain = float(cfg.get("mic_gain", 2.0))
+        self.mic_rate = int(cfg.get("mic_rate", 0)) or 0   # 0 = let it choose
         self.nr_strength = int(cfg.get("nr_strength", RNNOISE_DEFAULT_VAD))
         self.mirror_view = bool(cfg.get("mirror_view", True))
         self.mirror_saved = bool(cfg.get("mirror_saved", False))
@@ -3479,6 +3498,7 @@ class LensWindow(Adw.ApplicationWindow):
             "overlay_mode": getattr(self, "overlay_mode", 0),
             "mic_enabled":  self.mic_enabled,
             "mic_gain":     self.mic_gain,
+            "mic_rate":     self.mic_rate,
             "nr_strength":  self.nr_strength,
             "trash_auto":   self.trash_auto,
             "trash_path":   self.trash_path,
@@ -3693,10 +3713,20 @@ class LensWindow(Adw.ApplicationWindow):
         """
         src = f"pulsesrc device={self.mic_source}" if self.mic_source else "pulsesrc"
         parts = [f"{src} provide-clock=false", "audioconvert"]
+        # Ask the device for a particular rate. Cheap capture hardware often
+        # has one rate it is actually happy at and produces screeching or
+        # silence at the others, and there is no way to find it but to try.
+        if self.mic_rate:
+            parts.append("audioresample quality=8")
+            parts.append(f"audio/x-raw,rate={self.mic_rate}")
         if self.denoise:
-            # Mono throughout: RNNoise and the limiter are both mono elements,
-            # and one built-in mic has nothing stereo to say anyway.
-            parts.append("audio/x-raw,channels=1")
+            # Mono at 48k, and the rate is not a detail. RNNoise analyses
+            # fixed 480-sample frames on the assumption they are 10ms, so at
+            # 44100 every band it reasons about is in the wrong place and it
+            # takes the consonants out with the noise: audible, but the words
+            # stop being words. PulseAudio was handing it 44100 by default.
+            parts.append("audioresample quality=8")
+            parts.append("audio/x-raw,rate=48000,channels=1")
             if have(RNNOISE):
                 parts.append(f"{RNNOISE} name=nr vad-threshold={self.nr_strength}")
             else:
@@ -4062,7 +4092,10 @@ class LensWindow(Adw.ApplicationWindow):
         self.hud_format.set_label(f"{self.container.upper()}  {vcodec}  {acodec}")
 
         pct, status, energy, watts = read_battery()
-        charging = status.lower().startswith("charg")
+        # The battery's own status goes stale: BAT0 can still read Charging
+        # after the charger is out. Mains is the ground truth, so if nothing
+        # is plugged in then nothing is charging, whatever BAT0 claims.
+        charging = status.lower().startswith("charg") and mains_online() is not False
 
         # power_now is instantaneous and jumps around, which made the estimate
         # swing between 2:35 and 0:37 between ticks. Average the last 30
@@ -4455,17 +4488,38 @@ class LensWindow(Adw.ApplicationWindow):
               "max-size-bytes=0")
         audio = (f" {src} ! {aq} ! audioresample ! audiorate ! "
                  f"{aenc} ! queue ! mux. ") if self.mic_active else ""
+        # Zooming crops, so without a scale back up the encoded size would
+        # change the moment you touched the zoom mid-take, renegotiating caps
+        # under a running encoder. Lock it to what the frame is now.
+        rw, rh = self.cur_res or (1280, 720)
+        rw -= rw % 2
+        rh -= rh % 2
+        # Crop, balance and effects ahead of the tee, exactly as the standby
+        # pipeline has them. They were missing here entirely, so hitting
+        # record silently threw away the zoom and the filter: the viewfinder
+        # kept showing them because it was still the old pipeline until this
+        # one took over, and then everything quietly snapped back to 1x and
+        # no look at all. Ahead of the tee so the file matches the preview.
         self.pipeline = Gst.parse_launch(
-            f"{self._source_for(dev)} ! tee name=t "
+            f"{self._source_for(dev)} ! videocrop name=zoom ! "
+            f"videobalance name=vb ! coloreffects name=fx ! tee name=t "
             f"t. ! queue ! videoflip name=mirror ! videoconvert ! "
             f"gtk4paintablesink name=sink "
             f"t. ! queue max-size-buffers=8 ! videoflip name=recmirror ! "
+            f"videoscale ! video/x-raw,width={rw},height={rh} ! "
             f"videoconvert ! {venc} ! "
             f"queue ! mux. "
             f"{audio}"
             f"{muxer} name=mux ! filesink location={path}"
         )
         sink = self.pipeline.get_by_name("sink")
+        # Re-point at the new elements, or zoom and filters go on addressing
+        # the pipeline that has just been torn down.
+        self.zoom_elem = self.pipeline.get_by_name("zoom")
+        self.vb_elem = self.pipeline.get_by_name("vb")
+        self.fx_elem = self.pipeline.get_by_name("fx")
+        self._apply_zoom()
+        self._apply_filter()
         self.paintable = sink.props.paintable
         self.picture.set_paintable(self.paintable)
         # Fresh pipeline, so the flips are back at their defaults.
@@ -4688,6 +4742,24 @@ class LensWindow(Adw.ApplicationWindow):
         str_row.set_visible(have(RNNOISE))
         grpa.add(str_row)
 
+        RATES = [0, 16000, 22050, 32000, 44100, 48000]
+        rate_row = Adw.ComboRow(title="Capture rate")
+        rate_row.set_subtitle("Leave on automatic unless the mic sounds wrong. "
+                              "Some cheap ones only behave at one rate")
+        rate_row.set_model(Gtk.StringList.new(
+            ["Automatic"] + [f"{r // 1000} kHz" if r % 1000 == 0 else f"{r} Hz"
+                             for r in RATES[1:]]))
+        rate_row.set_selected(RATES.index(self.mic_rate) if self.mic_rate in RATES else 0)
+
+        def rate_done(row, *_):
+            self.mic_rate = RATES[row.get_selected()]
+            self._save_settings()
+            if self._audio_mon:      # rebuild so the new rate is asked for
+                self._stop_audio_monitor()
+                self._start_audio_monitor()
+        rate_row.connect("notify::selected", rate_done)
+        grpa.add(rate_row)
+
         # A way back. It is easy to drag three sliders somewhere bad and have
         # no idea which one did it.
         reset_row = Adw.ActionRow(title="Start over")
@@ -4697,6 +4769,8 @@ class LensWindow(Adw.ApplicationWindow):
 
         def do_reset(*_):
             self.mic_gain = 1.0
+            self.mic_rate = 0
+            rate_row.set_selected(0)
             self.nr_strength = RNNOISE_DEFAULT_VAD
             self.denoise = True
             scale.set_value(0.0)
