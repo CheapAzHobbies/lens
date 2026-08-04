@@ -815,7 +815,15 @@ class GalleryView(Gtk.Box):
         self.pic.set_can_shrink(True)
         self.pic.set_content_fit(Gtk.ContentFit.CONTAIN)
         self.pic.set_hexpand(True); self.pic.set_vexpand(True)
-        stack.set_child(self.pic)
+        # An AspectFrame so the picture's box IS the image. Transforming the
+        # picture while it spanned the whole stage turned the empty letterbox
+        # region along with it, so a rotate visibly swung the black bars
+        # around instead of just the photo.
+        self.pic_frame = Gtk.AspectFrame(ratio=4 / 3, obey_child=False)
+        self.pic_frame.set_xalign(0.5); self.pic_frame.set_yalign(0.5)
+        self.pic_frame.set_hexpand(True); self.pic_frame.set_vexpand(True)
+        self.pic_frame.set_child(self.pic)
+        stack.set_child(self.pic_frame)
         self.crop = CropOverlay(on_change=lambda: None)
         stack.add_overlay(self.crop)
 
@@ -1249,6 +1257,9 @@ class GalleryView(Gtk.Box):
         if pb is None:
             return
         self.pic.set_paintable(Gdk.Texture.new_for_pixbuf(pb))
+        h = pb.get_height()
+        if h:
+            self.pic_frame.set_ratio(pb.get_width() / h)
         GLib.idle_add(self._sync_crop_frame)
 
     def _sync_crop_frame(self):
@@ -1282,12 +1293,19 @@ class GalleryView(Gtk.Box):
         self.pic.add_css_class(cls)
 
         def done():
+            # Swap under a frozen transition, holding the shrink. The picture
+            # is already at 0.82 and rotated; putting the turned pixbuf in at
+            # the same instant means nothing appears to move.
             self.pic.add_css_class("no-anim")
             self.pic.remove_css_class(cls)
+            self.pic.add_css_class("settle")
             then()
 
             def unfreeze():
                 self.pic.remove_css_class("no-anim")
+                # Releasing the shrink with the transition live lets it grow
+                # into its new shape, which is what sells a 4:3 becoming 3:4.
+                self.pic.remove_css_class("settle")
                 self._anim_busy = False
                 return False
             GLib.timeout_add(30, unfreeze)
@@ -2345,8 +2363,9 @@ class LensWindow(Adw.ApplicationWindow):
                                    opacity 200ms ease-out; }
         .spin-cw  { transform: rotate(90deg)  scale(0.82); }
         .spin-ccw { transform: rotate(-90deg) scale(0.82); }
-        .flip-h   { transform: scaleX(-1); }
-        .flip-v   { transform: scaleY(-1); }
+        .flip-h   { transform: scaleX(-1) scale(0.82); }
+        .flip-v   { transform: scaleY(-1) scale(0.82); }
+        .settle   { transform: scale(0.82); }
         .gal picture.no-anim { transition: none; }
         .crop-drop { transform: scale(0.9) translateY(26px); opacity: 0.25; }
         .gal-count { color: rgba(255,255,255,0.55); font-size: 13px;
