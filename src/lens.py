@@ -4,7 +4,7 @@ Lens — a fast, mobile-first camera app for Linux tablets.
 GTK4 + libadwaita + GStreamer.
 """
 
-import gi, os, sys, math, json, time, datetime, pathlib, tempfile
+import gi, os, re, sys, math, json, time, datetime, pathlib, tempfile
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Gst", "1.0")
@@ -497,6 +497,65 @@ DENOISE_CHAIN = ("audiowsincband mode=band-pass lower-frequency=110 "
 # cannot help either, because the noise sits under the voice. What does help
 # is holding the floor down whenever nobody is talking, then making up the
 # level afterwards, which is roughly what a phone does.
+def audio_facts():
+    """Everything about the capture path that can actually be read back.
+
+    Written because this took a very long time to diagnose by ear. The
+    microphone hiss on this machine turned out to be a +30dB analog preamp
+    that PipeWire only starts lowering below about 30 percent volume: above
+    that it attenuates in software, so turning the level down moves signal
+    and hiss together and appears to do nothing. That is invisible unless
+    something shows you the hardware gain separately from the software one.
+    """
+    import subprocess
+    f = {}
+
+    def run(*a):
+        try:
+            return subprocess.run(a, capture_output=True, text=True,
+                                  timeout=2).stdout
+        except Exception:
+            return ""
+    info = run("pactl", "info")
+    for line in info.splitlines():
+        if line.startswith("Server Name:"):
+            f["backend"] = line.split(":", 1)[1].strip()
+        elif line.startswith("Default Source:"):
+            f["device"] = line.split(":", 1)[1].strip()
+    src = f.get("device", "")
+    block, seen = [], False
+    for line in run("pactl", "list", "sources").splitlines():
+        if line.strip() == f"Name: {src}":
+            seen = True
+        elif seen and line.startswith("Source #"):
+            break
+        elif seen:
+            block.append(line.strip())
+    for line in block:
+        if line.startswith("Sample Specification:"):
+            f["format"] = line.split(":", 1)[1].strip()
+        elif line.startswith("Volume:") and "front-left" in line:
+            part = [x for x in line.split(",") if "%" in x]
+            if part:
+                f["sw_volume"] = part[0].split("/")[-2].strip() if "/" in part[0] else ""
+        elif line.startswith("Mute:"):
+            f["muted"] = line.split(":", 1)[1].strip()
+    # the analog stage, which is the one that matters and the one nothing shows
+    for card in ("1", "0", "2"):
+        out = run("amixer", "-c", card, "sget", "Capture")
+        m = re.search(r"Front Left:.*?\[(-?[\d.]+)dB\]", out)
+        if m:
+            f["analog_gain"] = f"{float(m.group(1)):+.2f} dB"
+            pct = re.search(r"Front Left:.*?\[(\d+)%\]", out)
+            if pct:
+                f["analog_pct"] = int(pct.group(1))
+            break
+    mods = [l for l in run("pactl", "list", "short", "modules").splitlines()
+            if any(k in l.lower() for k in ("echo", "noise", "agc", "filter-chain"))]
+    f["processing"] = ", ".join(l.split()[1] for l in mods) if mods else "none loaded"
+    return f
+
+
 def list_audio_sources():
     """[(name, description)] of real capture sources."""
     import subprocess
@@ -3700,6 +3759,15 @@ class LensWindow(Adw.ApplicationWindow):
         m.set_db(rv)
         self.set_meter_label.set_label(
             "clipping" if pv > -0.5 else f"{pv:5.1f} dB")
+        rows = getattr(self, "_diag_rows", None)
+        if rows and "levels" in rows:
+            # A rolling minimum is the noise floor: the quietest the room has
+            # been since the panel opened.
+            self._diag_floor = min(getattr(self, "_diag_floor", 0.0) or 0.0, rv)
+            rows["levels"].set_subtitle(
+                f"peak {pv:.1f} dB   rms {rv:.1f} dB   "
+                f"quietest {self._diag_floor:.1f} dB"
+                + ("   CLIPPING" if pv > -0.5 else ""))
 
     def _start_audio_monitor(self):
         """Small audio-only pipeline that reports levels.
@@ -4664,8 +4732,58 @@ class LensWindow(Adw.ApplicationWindow):
         rbtn.connect("clicked", do_reset)
         reset_row.add_suffix(rbtn)
         grpa.add(reset_row)
-
         page.add(grpa)
+
+        # Diagnostics. Not decoration: the hiss on this machine was a +30dB
+        # analog preamp, and nothing anywhere showed the analog gain apart
+        # from the software one, so every level change looked like it did
+        # nothing. This is the panel that would have found it in a minute.
+        grpd = Adw.PreferencesGroup(
+            title="Audio diagnostics",
+            description="What the capture path is actually doing")
+        rows = {}
+        for key, title in (("backend", "Audio server"),
+                           ("device", "Input device"),
+                           ("format", "Format"),
+                           ("analog_gain", "Analog gain (hardware preamp)"),
+                           ("sw_volume", "Software volume"),
+                           ("processing", "System processing"),
+                           ("levels", "Level now"),
+                           ("verdict", "Assessment")):
+            r = Adw.ActionRow(title=title)
+            r.set_subtitle("...")
+            rows[key] = r
+            grpd.add(r)
+        self._diag_rows = rows
+
+        def refresh(*_):
+            f = audio_facts()
+            for k in ("backend", "device", "format", "analog_gain",
+                      "sw_volume", "processing"):
+                rows[k].set_subtitle(str(f.get(k, "unknown")))
+            pct = f.get("analog_pct")
+            notes = []
+            if pct is not None and pct >= 90:
+                notes.append(
+                    "The hardware preamp is at maximum, which is where hiss "
+                    "comes from. Turning the system input level down below "
+                    "about 30 percent is what actually lowers it; above that "
+                    "the level is only being changed in software and the "
+                    "noise comes down with the voice.")
+            if f.get("processing", "") != "none loaded":
+                notes.append("The system is applying its own processing.")
+            if f.get("muted") == "yes":
+                notes.append("The system has this input muted.")
+            rows["verdict"].set_subtitle(
+                "  ".join(notes) if notes else
+                "Nothing obviously wrong with the capture path.")
+        refresh()
+        rows["levels"].set_subtitle("open with the meter above running")
+        btn = Gtk.Button(label="Refresh")
+        btn.set_valign(Gtk.Align.CENTER)
+        btn.connect("clicked", refresh)
+        rows["backend"].add_suffix(btn)
+        page.add(grpd)
 
         grpv = Adw.PreferencesGroup(title="Viewfinder")
         mir = Adw.SwitchRow(title="Mirror the preview")
