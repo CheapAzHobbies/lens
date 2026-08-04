@@ -32,9 +32,17 @@ THUMBS = pathlib.Path(
 VIDEO_EXTS = (".mkv", ".mp4", ".webm", ".mov")
 
 # label -> (extension, muxer, video encoder, audio encoder)
+# AAC rather than Opus for MKV. The hiss between words was the encoder, not
+# the room: feeding all three digital silence, every Opus setting tried came
+# back at about -67 dBFS of coding noise (64k, 96k, 128k, voice mode,
+# complexity 10 and DTX were all within 2dB of each other), while AAC came
+# back at -369, which is silence. WebM has to stay on Opus, the format does
+# not allow AAC.
 CONTAINERS = {
-    "MKV":  ("mkv",  "matroskamux", "x264enc tune=zerolatency bitrate=4000", "opusenc"),
-    "MP4":  ("mp4",  "mp4mux",      "x264enc tune=zerolatency bitrate=4000", "voaacenc"),
+    "MKV":  ("mkv",  "matroskamux", "x264enc tune=zerolatency bitrate=4000",
+             "voaacenc bitrate=128000"),
+    "MP4":  ("mp4",  "mp4mux",      "x264enc tune=zerolatency bitrate=4000",
+             "voaacenc bitrate=128000"),
     "WebM": ("webm", "webmmux",     "vp8enc deadline=1",                     "opusenc"),
 }
 
@@ -253,6 +261,22 @@ def tux_frames():
 
 DENOISE_CHAIN = ("audiowsincband mode=band-pass lower-frequency=110 "
                  "upper-frequency=7500 length=101")
+# The hiss is the mic's own noise floor, not the room: turning the capture
+# gain down moved noise and voice together and changed nothing. A band-pass
+# cannot help either, because the noise sits under the voice. What does help
+# is holding the floor down whenever nobody is talking, then making up the
+# level afterwards, which is roughly what a phone does.
+# ratio ABOVE 1 attenuates below the threshold, which is the opposite of
+# what the name suggests: 0.14 made the floor 10dB louder. Measured in a
+# quiet room, the band-passed floor sits at -48.8 dBFS, and threshold 0.010
+# (-40 dBFS) with ratio 2.5 puts it at -63.1 dBFS even after the makeup gain
+# below. 3.5 reaches true digital silence, which chops the tails off words.
+NOISE_GATE = ("audiodynamic mode=expander characteristics=soft-knee "
+              "ratio=2.5 threshold=0.010")
+# Evens out how close you are to the mic, so the makeup gain below does not
+# have to be set for the quietest moment.
+LEVELLER = ("audiodynamic mode=compressor characteristics=soft-knee "
+            "ratio=0.55 threshold=0.26")
 
 
 def list_audio_sources():
@@ -1583,6 +1607,13 @@ class LensWindow(Adw.ApplicationWindow):
             self.filter_name = "None"
         self.mic_available = has_microphone()
         self.mic_enabled = bool(cfg.get("mic_enabled", True))
+        self.mic_gain = float(cfg.get("mic_gain", 2.0))
+        self.exposure_auto = True
+        self.exposure_val = None
+        self._exp_range = None
+        self._exp_range_for = None
+        self._exp_dragging = False
+        self._exp_start = None
         self.mic_active = False
         self._audio_mon = None
         self._audio_mon_handler = None
@@ -1736,9 +1767,101 @@ class LensWindow(Adw.ApplicationWindow):
         return w, int(w / target)
 
     def _on_meter_tap(self, gesture, n_press, x, y):
-        """Meter for what was tapped."""
+        """Meter for what was tapped, unless the finger moved."""
+        if getattr(self, "_exp_dragging", False):
+            return          # that was an exposure drag, not a tap
         self.meter_box.ping(x, y)
         self._meter_at(x, y)
+
+    # ---- manual exposure ----
+    def _v4l2(self, *args):
+        import subprocess
+        dev = self.cameras[self.cam_idx][0]
+        try:
+            r = subprocess.run(["v4l2-ctl", "-d", dev] + list(args),
+                               capture_output=True, text=True, timeout=1.5)
+            return r.stdout
+        except Exception:
+            return ""
+
+    def _exposure_range(self):
+        """min/max for this camera, since the two differ (1-5000 vs 50-10000)."""
+        dev = self.cameras[self.cam_idx][0]
+        if self._exp_range_for == dev and self._exp_range:
+            return self._exp_range
+        out = self._v4l2("--list-ctrls")
+        lo, hi = 1, 5000
+        for line in out.splitlines():
+            if "exposure_time_absolute" in line:
+                for tok in line.split():
+                    if tok.startswith("min="):
+                        lo = int(tok[4:])
+                    elif tok.startswith("max="):
+                        hi = int(tok[4:])
+        self._exp_range, self._exp_range_for = (lo, hi), dev
+        return self._exp_range
+
+    def _current_exposure(self):
+        out = self._v4l2("-C", "exposure_time_absolute")
+        try:
+            return int(out.split(":")[1])
+        except Exception:
+            lo, hi = self._exposure_range()
+            return (lo + hi) // 8
+
+    def _on_exp_begin(self, gesture, x, y):
+        self._exp_dragging = False
+        self._exp_start = None
+
+    def _on_exp_update(self, gesture, dx, dy):
+        if abs(dy) < 12 and not self._exp_dragging:
+            return                      # still could be a tap
+        if not self._exp_dragging:
+            self._exp_dragging = True
+            self._exp_start = self._current_exposure()
+        lo, hi = self._exposure_range()
+        # Up is brighter, and the scale is logarithmic because exposure is:
+        # a fixed number of microseconds per pixel would crawl at the bottom
+        # of the range and leap at the top.
+        span = math.log(hi / max(lo, 1))
+        cur = max(lo, self._exp_start or lo)
+        val = cur * math.exp(-dy / 260.0 * span * 0.5)
+        val = int(max(lo, min(hi, val)))
+        self._set_exposure(val)
+
+    def _on_exp_end(self, gesture, dx, dy):
+        self.exp_label.set_visible(False)
+        GLib.timeout_add(60, lambda: (setattr(self, "_exp_dragging", False), False)[1])
+
+    def _set_exposure(self, val):
+        self._v4l2("-c", "auto_exposure=1", "-c", f"exposure_time_absolute={val}")
+        self.exposure_auto = False
+        self.exposure_val = val
+        # Shutter time reads better than a raw v4l2 unit. The unit is 100us.
+        self.exp_label.set_label(f"1/{max(1, int(10000 / max(val, 1)))}s")
+        self.exp_label.set_visible(True)
+        self._refresh_exposure_button()
+
+    def _exposure_to_auto(self, *_):
+        self._v4l2("-c", "auto_exposure=3")
+        self.exposure_auto = True
+        self.exposure_val = None
+        self.exp_label.set_visible(False)
+        self._refresh_exposure_button()
+
+    def _refresh_exposure_button(self):
+        b = getattr(self, "btn_exp", None)
+        if b is None:
+            return
+        if self.exposure_auto:
+            b.set_label("AE")
+            b.remove_css_class("exp-manual")
+            b.set_tooltip_text("Exposure is automatic. Drag up or down on the "
+                               "picture to set it by hand")
+        else:
+            b.set_label("MAN")
+            b.add_css_class("exp-manual")
+            b.set_tooltip_text("Exposure is manual. Click to go back to auto")
 
     def _meter_at(self, x, y):
         """Re-meter for what was tapped.
@@ -1932,6 +2055,28 @@ class LensWindow(Adw.ApplicationWindow):
         meter_click.connect("released", self._on_meter_tap)
         self.frame_stack.add_controller(meter_click)
 
+        # Drag up and down on the viewfinder to set exposure by hand. This is
+        # where a phone puts focus, but neither camera on this machine has a
+        # focus motor (no focus_absolute, no focus_automatic_continuous on
+        # either node), so there is nothing to drag. Exposure is the control
+        # that exists and it is the one that helps in a dim or backlit room.
+        exp_drag = Gtk.GestureDrag.new()
+        exp_drag.set_button(1)
+        exp_drag.connect("drag-begin", self._on_exp_begin)
+        exp_drag.connect("drag-update", self._on_exp_update)
+        exp_drag.connect("drag-end", self._on_exp_end)
+        self.frame_stack.add_controller(exp_drag)
+
+        self.exp_label = Gtk.Label(label="")
+        self.exp_label.add_css_class("hud-mono")
+        self.exp_label.add_css_class("hud-chip")
+        self.exp_label.set_halign(Gtk.Align.CENTER)
+        self.exp_label.set_valign(Gtk.Align.START)
+        self.exp_label.set_margin_top(16)
+        self.exp_label.set_visible(False)
+        self.exp_label.set_can_target(False)
+        self.frame_stack.add_overlay(self.exp_label)
+
         zoom_scroll = Gtk.EventControllerScroll.new(
             Gtk.EventControllerScrollFlags.VERTICAL)
         zoom_scroll.connect(
@@ -1974,6 +2119,10 @@ class LensWindow(Adw.ApplicationWindow):
             "Screen flash: light the subject with the display before the shot")
         self.btn_flash.connect("toggled", self._on_flash_toggled)
 
+        # Reset for the drag above. It doubles as the indicator: there is no
+        # other way to tell a held exposure from the camera's own.
+        self.btn_exp = self._pill_button("AE", self._exposure_to_auto,
+                                         width=52, tint=False)
         self.btn_grid   = self._pill_button("#",   self._toggle_grid,   width=42, tint=False)
         self.btn_aspect = self._pill_button(self.aspects[0], self._toggle_aspect, width=58, tint=False)
         # A real icon, not the "⏱" glyph: that rendered tiny and was barely
@@ -2008,6 +2157,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.fx_popover.set_child(fxbox)
 
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        top.append(self.btn_exp)
         top.append(self.btn_grid); top.append(self.btn_aspect)
         top.append(self.btn_fx); top.append(self.btn_timer)
 
@@ -2631,6 +2781,7 @@ class LensWindow(Adw.ApplicationWindow):
         .winctl-close:hover { background: #e01b24; }
         .flash-on { color: #ffc107; background: rgba(255,193,7,0.18); }
         .flash-on:hover { background: rgba(255,193,7,0.30); }
+        .exp-manual { color: #ffc107; background: rgba(255,193,7,0.18); }
         .winctl:disabled { color: rgba(255,255,255,0.25);
                            background: rgba(255,255,255,0.04); }
         .cam-row { background: transparent; border: none; color: white;
@@ -2828,6 +2979,7 @@ class LensWindow(Adw.ApplicationWindow):
             "grid_visible": self.grid_visible,
             "overlay_mode": getattr(self, "overlay_mode", 0),
             "mic_enabled":  self.mic_enabled,
+            "mic_gain":     self.mic_gain,
             "container":    self.container,
             "pic_dir":      str(self.pic_dir),
             "vid_dir":      str(self.vid_dir),
@@ -3036,8 +3188,13 @@ class LensWindow(Adw.ApplicationWindow):
         never starts, and the file is left at zero bytes.
         """
         src = f"pulsesrc device={self.mic_source}" if self.mic_source else "pulsesrc"
-        chain = f" ! {DENOISE_CHAIN} ! audioconvert" if self.denoise else ""
-        return f"{src} provide-clock=false ! audioconvert{chain}"
+        chain = (f" ! {DENOISE_CHAIN} ! audioconvert ! {NOISE_GATE} ! {LEVELLER}"
+                 if self.denoise else "")
+        # Named so mute can be flipped on a running pipeline. Muting by
+        # tearing the branch out would end the file and start another one.
+        vol = (f" ! volume name=micvol volume={self.mic_gain:.2f} "
+               f"mute={'true' if not self.mic_enabled else 'false'}")
+        return f"{src} provide-clock=false ! audioconvert{chain}{vol} ! audioconvert"
 
     # ---- live audio level ----
     def _start_audio_monitor(self):
@@ -3269,10 +3426,16 @@ class LensWindow(Adw.ApplicationWindow):
         self.audio_meter.set_muted(not (self.mic_available and self.mic_enabled))
 
     def _toggle_mic(self):
-        if not self.mic_available or self.recording:
-            return          # changing it mid-take would split the file
+        if not self.mic_available:
+            return
         self.mic_enabled = not self.mic_enabled
-        if self.mic_enabled and self.video_mode:
+        if self.recording:
+            # Live. The branch is already there and only its mute flips, so
+            # the take carries on and the file stays in one piece.
+            v = self.pipeline.get_by_name("micvol")
+            if v is not None:
+                v.props.mute = not self.mic_enabled
+        elif self.mic_enabled and self.video_mode:
             self._start_audio_monitor()
         else:
             self._stop_audio_monitor()
@@ -3743,7 +3906,10 @@ class LensWindow(Adw.ApplicationWindow):
         # Clips were silent: there was no audio branch at all. Opus into the
         # same matroska container, dropped if there is no capture source so a
         # machine without a mic still records video.
-        self.mic_active = self.mic_available and self.mic_enabled
+        # Built whenever a mic exists, muted rather than absent. You cannot
+        # unmute into a branch that was never plumbed, and splicing one into
+        # a running pipeline would break the file in two.
+        self.mic_active = self.mic_available
         src = self._audio_src()
         # Every branch feeding the muxer gets a queue, and audio gets a
         # generous one. Without it pulsesrc fed the muxer directly while
@@ -3894,6 +4060,41 @@ class LensWindow(Adw.ApplicationWindow):
         pref.connect("notify::text", prefix_done)
         grp2.add(pref)
         page.add(grp2)
+
+        grpa = Adw.PreferencesGroup(
+            title="Microphone",
+            description="Applied while recording, not to the device itself, "
+                        "so nothing else on the system is affected")
+        gain = Adw.SpinRow.new_with_range(0.5, 8.0, 0.1)
+        gain.set_title("Level")
+        gain.set_subtitle("Makeup gain after the gate. Raise it if you sound "
+                          "quiet, lower it if you clip")
+        gain.set_digits(1)
+        gain.set_value(self.mic_gain)
+
+        def gain_done(row, *_):
+            self.mic_gain = float(row.get_value())
+            v = self.pipeline.get_by_name("micvol")
+            if v is not None:          # takes effect on the running take
+                v.props.volume = self.mic_gain
+            self._save_settings()
+        gain.connect("notify::value", gain_done)
+        grpa.add(gain)
+
+        clean = Adw.SwitchRow(title="Noise reduction")
+        clean.set_subtitle("Band-pass, gate and levelling. Turn it off if it "
+                           "swallows the start of quiet words")
+        clean.set_active(self.denoise)
+
+        def clean_done(row, *_):
+            self.denoise = row.get_active()
+            self._save_settings()
+            if self._audio_mon:        # rebuild the meter with the new chain
+                self._stop_audio_monitor()
+                self._start_audio_monitor()
+        clean.connect("notify::active", clean_done)
+        grpa.add(clean)
+        page.add(grpa)
 
         grp3 = Adw.PreferencesGroup(
             title="Recycle bin",

@@ -30,13 +30,14 @@ Full-screen black viewfinder, iPhone-style controls:
 | Filters (mono, vivid, warm, cool, sepia, x-ray, cross) | ✅ |
 | Screen flash for low light | ✅ |
 | Tap to meter | ✅ |
+| Manual exposure, drag up or down on the picture | ✅ |
 | Camcorder HUD, interactive | ✅ |
 | Gallery: browse, crop, rotate, mirror, rename | ✅ |
 | Trash with a recycle bin and retention | ✅ |
 | Settings: folders, naming, camera, mic, retention | ✅ |
 | Touch gestures (swipe = flip, pinch = zoom) | 🚧 planned |
 | Subtitles from speech | 🚧 planned |
-| Manual focus | ❌ not possible, both cameras are fixed-focus |
+| Manual focus | ❌ not possible, no focus motor on either camera |
 
 ## Recording HUD
 
