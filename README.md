@@ -31,11 +31,12 @@ Full-screen black viewfinder, iPhone-style controls:
 | Filters (mono, vivid, warm, cool, sepia, x-ray, cross) | ✅ |
 | Screen flash for low light | ✅ |
 | Tap to meter | ✅ |
+| Mirrored preview, with the file left unmirrored | ✅ |
 | Manual exposure, drag up or down on the picture | ✅ |
 | Camcorder HUD, interactive | ✅ |
 | Gallery: browse, crop, rotate, mirror, rename | ✅ |
 | Trash with a recycle bin and retention | ✅ |
-| Settings: folders, naming, camera, mic, retention | ✅ |
+| Settings: folders, naming, mic gain with a live meter, mirroring, retention | ✅ |
 | Touch gestures (swipe = flip, pinch = zoom) | 🚧 planned |
 | Subtitles from speech | 🚧 planned |
 | Manual focus | ❌ not possible, no focus motor on either camera |

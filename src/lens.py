@@ -1868,6 +1868,8 @@ class LensWindow(Adw.ApplicationWindow):
         self.mic_available = has_microphone()
         self.mic_enabled = bool(cfg.get("mic_enabled", True))
         self.mic_gain = float(cfg.get("mic_gain", 2.0))
+        self.mirror_view = bool(cfg.get("mirror_view", True))
+        self.mirror_saved = bool(cfg.get("mirror_saved", False))
         self.exposure_auto = True
         self.exposure_val = None
         self._exp_range = None
@@ -1954,8 +1956,15 @@ class LensWindow(Adw.ApplicationWindow):
         pipe_str = (
             f"{src} ! videocrop name=zoom ! videobalance name=vb ! "
             f"coloreffects name=fx ! tee name=t "
-            f"t. ! queue max-size-buffers=2 leaky=downstream ! gtk4paintablesink name=sink "
-            f"t. ! queue max-size-buffers=2 leaky=downstream ! jpegenc quality=92 ! "
+            # Mirroring goes after the tee, on the display branch alone. A
+            # front camera shown unmirrored feels wrong because you move one
+            # way and your image moves the other, but the file should still
+            # come out the way the room actually was: mirrored, any writing
+            # in shot reads backwards.
+            f"t. ! queue max-size-buffers=2 leaky=downstream ! videoflip name=mirror ! "
+            f"gtk4paintablesink name=sink "
+            f"t. ! queue max-size-buffers=2 leaky=downstream ! videoflip name=savemirror ! "
+            f"jpegenc quality=92 ! "
             f"appsink name=photosink emit-signals=false max-buffers=1 drop=true sync=false"
         )
         self.pipeline = Gst.parse_launch(pipe_str)
@@ -1965,6 +1974,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.fx_elem = self.pipeline.get_by_name("fx")
         self._apply_zoom()
         self._apply_filter()
+        self._apply_mirror()
         new_paintable = sink.props.paintable
         self.paintable = new_paintable
 
@@ -2143,6 +2153,18 @@ class LensWindow(Adw.ApplicationWindow):
                                capture_output=True, timeout=1)
             except Exception:
                 return
+
+    def _apply_mirror(self):
+        """Point the flip elements at the current setting.
+
+        method is live, so this costs nothing and needs no rebuild.
+        """
+        for name, on in (("mirror", self.mirror_view),
+                         ("savemirror", self.mirror_view and self.mirror_saved),
+                         ("recmirror", self.mirror_view and self.mirror_saved)):
+            el = self.pipeline.get_by_name(name) if self.pipeline else None
+            if el is not None:
+                el.set_property("method", 4 if on else 0)   # 4 = horizontal-flip
 
     def _apply_filter(self):
         """Set the look. Live properties, so switching costs nothing."""
@@ -3242,6 +3264,8 @@ class LensWindow(Adw.ApplicationWindow):
             "overlay_mode": getattr(self, "overlay_mode", 0),
             "mic_enabled":  self.mic_enabled,
             "mic_gain":     self.mic_gain,
+            "mirror_view":  self.mirror_view,
+            "mirror_saved": self.mirror_saved,
             "container":    self.container,
             "pic_dir":      str(self.pic_dir),
             "vid_dir":      str(self.vid_dir),
@@ -3467,6 +3491,22 @@ class LensWindow(Adw.ApplicationWindow):
         return " ! ".join(parts)
 
     # ---- live audio level ----
+    def _feed_settings_meter(self, st):
+        """Mirror the level into the settings dialog while it is open."""
+        m = getattr(self, "set_meter", None)
+        if m is None or not m.get_mapped():
+            return
+        try:
+            peak = st.get_value("peak")
+            rms = st.get_value("rms")
+            pv = max(peak) if peak else -60.0
+            rv = max(rms) if rms else -60.0
+        except Exception:
+            return
+        m.set_db(rv)
+        self.set_meter_label.set_label(
+            "clipping" if pv > -0.5 else f"{pv:5.1f} dB")
+
     def _start_audio_monitor(self):
         """Small audio-only pipeline that reports levels.
 
@@ -3508,6 +3548,7 @@ class LensWindow(Adw.ApplicationWindow):
         st = msg.get_structure()
         if not st or st.get_name() != "level":
             return
+        self._feed_settings_meter(st)
         try:
             rms = st.get_value("rms")
             self.audio_meter.set_db(max(rms) if rms else None)
@@ -4195,8 +4236,10 @@ class LensWindow(Adw.ApplicationWindow):
                  f"{aenc} ! queue ! mux. ") if self.mic_active else ""
         self.pipeline = Gst.parse_launch(
             f"{self._source_for(dev)} ! tee name=t "
-            f"t. ! queue ! videoconvert ! gtk4paintablesink name=sink "
-            f"t. ! queue max-size-buffers=8 ! videoconvert ! {venc} ! "
+            f"t. ! queue ! videoflip name=mirror ! videoconvert ! "
+            f"gtk4paintablesink name=sink "
+            f"t. ! queue max-size-buffers=8 ! videoflip name=recmirror ! "
+            f"videoconvert ! {venc} ! "
             f"queue ! mux. "
             f"{audio}"
             f"{muxer} name=mux ! filesink location={path}"
@@ -4204,6 +4247,8 @@ class LensWindow(Adw.ApplicationWindow):
         sink = self.pipeline.get_by_name("sink")
         self.paintable = sink.props.paintable
         self.picture.set_paintable(self.paintable)
+        # Fresh pipeline, so the flips are back at their defaults.
+        self._apply_mirror()
         self.pipeline.set_state(Gst.State.PLAYING)
         self.recording = True
         self.shutter_core.add_css_class("recording")
@@ -4333,27 +4378,56 @@ class LensWindow(Adw.ApplicationWindow):
 
         grpa = Adw.PreferencesGroup(
             title="Microphone",
-            description="Applied while recording, not to the device itself, "
-                        "so nothing else on the system is affected")
-        gain = Adw.SpinRow.new_with_range(0.5, 8.0, 0.1)
-        gain.set_title("Level")
-        gain.set_subtitle("Makeup gain after the gate. Raise it if you sound "
-                          "quiet, lower it if you clip")
-        gain.set_digits(1)
-        gain.set_value(self.mic_gain)
+            description="Applied to the recording only. Nothing here touches "
+                        "the system capture level, so other apps are unaffected")
 
-        def gain_done(row, *_):
-            self.mic_gain = float(row.get_value())
-            v = self.pipeline.get_by_name("micvol")
-            if v is not None:          # takes effect on the running take
-                v.props.volume = self.mic_gain
+        # A meter, because gain is not a number anyone can guess. Talk at it
+        # and set the slider so the loud parts sit in the amber, not the red.
+        self.set_meter = AudioMeter()
+        self.set_meter.set_content_width(150)
+        self.set_meter.set_content_height(16)
+        meter_row = Adw.ActionRow(title="Input level")
+        meter_row.set_subtitle("Speak normally and watch this while you set the gain")
+        self.set_meter_label = Gtk.Label(label="--")
+        self.set_meter_label.add_css_class("hud-mono")
+        self.set_meter_label.set_width_chars(9)
+        meter_row.add_suffix(self.set_meter_label)
+        meter_row.add_suffix(self.set_meter)
+        grpa.add(meter_row)
+
+        gain_row = Adw.ActionRow(title="Gain")
+        scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, -12.0, 18.0, 0.5)
+        scale.set_size_request(230, -1)
+        scale.set_draw_value(False)
+        scale.set_valign(Gtk.Align.CENTER)
+        scale.add_mark(0.0, Gtk.PositionType.BOTTOM, None)
+        # Slider in decibels, not multiples. Doubling from 1x to 2x is a big
+        # step and 7x to 8x is barely audible, so a linear multiplier gives a
+        # slider that does almost everything in its first third.
+        scale.set_value(20.0 * math.log10(max(self.mic_gain, 0.01)))
+
+        def show_gain():
+            db = 20.0 * math.log10(max(self.mic_gain, 0.01))
+            gain_row.set_subtitle(f"{db:+.1f} dB  ({self.mic_gain:.2f}x)")
+        show_gain()
+
+        def gain_moved(sc):
+            self.mic_gain = 10.0 ** (sc.get_value() / 20.0)
+            show_gain()
+            for pipe in (self.pipeline, self._audio_mon):
+                if pipe is None:
+                    continue
+                v = pipe.get_by_name("micvol")
+                if v is not None:      # live, including on a running take
+                    v.props.volume = self.mic_gain
             self._save_settings()
-        gain.connect("notify::value", gain_done)
-        grpa.add(gain)
+        scale.connect("value-changed", gain_moved)
+        gain_row.add_suffix(scale)
+        grpa.add(gain_row)
 
         clean = Adw.SwitchRow(title="Noise reduction")
-        clean.set_subtitle("Band-pass, gate and levelling. Turn it off if it "
-                           "swallows the start of quiet words")
+        clean.set_subtitle("RNNoise, the same voice isolation Discord uses, "
+                           "plus a limiter to stop the gain clipping")
         clean.set_active(self.denoise)
 
         def clean_done(row, *_):
@@ -4365,6 +4439,35 @@ class LensWindow(Adw.ApplicationWindow):
         clean.connect("notify::active", clean_done)
         grpa.add(clean)
         page.add(grpa)
+
+        grpv = Adw.PreferencesGroup(title="Viewfinder")
+        mir = Adw.SwitchRow(title="Mirror the preview")
+        mir.set_subtitle("Move left and your image moves left, the way a "
+                         "mirror behaves. Only changes what you see")
+        mir.set_active(self.mirror_view)
+
+        mir_save = Adw.SwitchRow(title="Mirror what gets saved too")
+        mir_save.set_subtitle("Off keeps files the way the room really was. "
+                              "On matches the preview, but writing in shot "
+                              "will read backwards")
+        mir_save.set_active(self.mirror_saved)
+        mir_save.set_sensitive(self.mirror_view)
+
+        def mir_done(row, *_):
+            self.mirror_view = row.get_active()
+            mir_save.set_sensitive(self.mirror_view)
+            self._apply_mirror()
+            self._save_settings()
+
+        def mir_save_done(row, *_):
+            self.mirror_saved = row.get_active()
+            self._apply_mirror()
+            self._save_settings()
+        mir.connect("notify::active", mir_done)
+        mir_save.connect("notify::active", mir_save_done)
+        grpv.add(mir)
+        grpv.add(mir_save)
+        page.add(grpv)
 
         grp3 = Adw.PreferencesGroup(
             title="Recycle bin",
@@ -4406,6 +4509,18 @@ class LensWindow(Adw.ApplicationWindow):
         empty.add_suffix(eb)
         grp3.add(empty)
         page.add(grp3)
+
+        # The meter is pointless without a live mic, so hold one open only
+        # while this dialog is, and put it back exactly as it was on close.
+        was_monitoring = bool(self._audio_mon)
+        if not was_monitoring and self.mic_available and self.mic_enabled:
+            self._start_audio_monitor()
+
+        def settings_closed(*_):
+            if not was_monitoring and not (self.video_mode and self.mic_enabled):
+                self._stop_audio_monitor()
+            return False
+        win.connect("close-request", settings_closed)
 
         win.add(page)
         win.present()
