@@ -32,6 +32,17 @@ rolloff earlier in this project. Frequency response needs a known signal.
 - `2026-08-04-as-found.json` — the state after the preamp was reduced from
   +30 dB to +18 dB. Realtek ALC285, PipeWire 1.0.5, no system processing
   loaded.
+- `2026-08-04-working.json` — the configuration that was finally judged good
+  by ear: analog +18 dB, PipeWire 20%, Lens +12 dB, RNNoise on at 5% dry.
+
+Note when comparing those two: their gain stages are identical, so the
++10.4 dB peak difference between them is a transient in the room during one
+capture, not a result. The noise floor difference of -1.4 dB is real and
+reproducible. This is what the spread column is for.
+
+These baselines measure the raw capture device, deliberately, with no
+processing in the path. They describe what the microphone gives Lens, not
+what Lens does with it.
 
 ## Findings so far
 
