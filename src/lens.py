@@ -259,6 +259,258 @@ def tux_frames():
     return tux_frames._cache
 
 
+def have(element):
+    """Is this GStreamer element installed?"""
+    return Gst.ElementFactory.find(element) is not None
+
+
+# Neural voice isolation, the same thing Discord uses, and the reason Discord
+# sounded clean on this machine while Lens did not. Everything before it was
+# spectral guesswork: a band-pass cannot help when the noise sits under the
+# voice, and a gate only helps between words. Worse, once capture was set to a
+# sensible level the room floor measured -29.4 dBFS while the gate triggered at
+# -40, so the gate was passing the noise through untouched. Measured on the
+# same room, in order: nothing -29.4, band-pass plus gate plus compressor
+# -29.3, this -700.
+RNNOISE = "ladspa-librnnoise-ladspa-so-noise-suppressor-mono"
+# Kept only as the fallback for a machine without the plugin. It is much worse
+# and the numbers above say so.
+FALLBACK_CLEAN = ("audiowsincband mode=band-pass lower-frequency=110 "
+                  "upper-frequency=7500 length=101 ! audioconvert ! "
+                  "audiodynamic mode=expander characteristics=soft-knee "
+                  "ratio=2.5 threshold=0.010")
+# Catches the peaks the makeup gain pushes past full scale. Without it a take
+# measured a dead-flat 0.0 dBFS peak with 130 hard-clipped samples, which is
+# exactly what "loud but not clear" sounds like. LSP rather than audiodynamic
+# because it has real attack, release and lookahead, where audiodynamic has
+# none of the three and reshapes each sample where it stands: using that to
+# hold peaks down only trades clipping for distortion. Note enabled defaults
+# to false on LSP elements, so it has to be asked for.
+LIMITER = ("lsp-plug-in-plugins-lv2-limiter-mono enabled=true th=0.79 lk=5.0 "
+           "at=1.0 rt=10.0 knee=0.5")
+
+
+CONTAINERS = {
+    "MKV":  ("mkv",  "matroskamux", "x264enc tune=zerolatency bitrate=4000",
+             "voaacenc bitrate=128000"),
+    "MP4":  ("mp4",  "mp4mux",      "x264enc tune=zerolatency bitrate=4000",
+             "voaacenc bitrate=128000"),
+    "WebM": ("webm", "webmmux",     "vp8enc deadline=1",                     "opusenc"),
+}
+
+
+def _stable_camera_ids():
+    """{/dev/videoN: stable-id} from /dev/v4l/by-id.
+
+    The link names carry the vendor, model and serial, plus a -video-indexN
+    suffix identifying the *node* rather than the device. Stripping that
+    suffix gives one id per physical camera, which is what we want to group
+    on and what we persist in the config.
+    """
+    import re
+    out = {}
+    byid = pathlib.Path("/dev/v4l/by-id")
+    if not byid.is_dir():
+        return out
+    for link in sorted(byid.iterdir()):
+        try:
+            target = str(link.resolve())
+        except OSError:
+            continue
+        out[target] = re.sub(r"-video-index\d+$", "", link.name)
+    return out
+
+
+def list_v4l2_cameras():
+    """Return [(path, human_name, stable_id)], one entry per physical camera.
+
+    A single camera exposes several /dev/videoN nodes (capture, metadata,
+    subdev), so we keep only nodes reporting "Video Capture" and then take
+    the first node per physical device.
+
+    Grouping is by the /dev/v4l/by-id identity, not by the card name. Card
+    names are per *model*, so two cameras of the same model collapsed into
+    one and the second silently disappeared.
+    """
+    import subprocess
+    stable = _stable_camera_ids()
+    devs = []
+    seen = set()
+
+    def _devnum(pth):
+        tail = pth.name[5:]
+        return int(tail) if tail.isdigit() else 9999
+
+    for d in sorted(pathlib.Path("/dev").glob("video*"), key=_devnum):
+        try:
+            info = subprocess.run(["v4l2-ctl", "-d", str(d), "--info"],
+                                  capture_output=True, text=True, timeout=1).stdout
+        except Exception:
+            continue
+        # Must be an actual capture device (not metadata/subdev)
+        # Look at Device Caps line — should include "Video Capture"
+        capture = False
+        card = "Camera"
+        for line in info.splitlines():
+            line = line.strip()
+            if line.startswith("Card type"):
+                card = line.split(":", 1)[1].strip()
+            if "Video Capture" in line and "Metadata" not in line:
+                capture = True
+        if not capture:
+            continue
+        # Fall back to the card name only when by-id is unavailable, which
+        # is the old (lossy) behaviour but better than dropping the device.
+        sid = stable.get(str(d)) or f"card:{card}"
+        if sid in seen:
+            continue
+        seen.add(sid)
+        devs.append((str(d), card, sid))
+    return devs
+
+
+_MODE_CACHE = {}
+
+
+def _enumerate_modes(dev):
+    """[(fourcc, w, h, fps)] the device advertises. Cached: shelling out to
+    v4l2-ctl on every shutter press would be silly."""
+    if dev in _MODE_CACHE:
+        return _MODE_CACHE[dev]
+    import subprocess, re
+    try:
+        out = subprocess.run(["v4l2-ctl", "-d", dev, "--list-formats-ext"],
+                             capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        return []
+    fmt = size = None
+    modes = []
+    for line in out.splitlines():
+        m = re.search(r"\]: '(\w+)'", line)
+        if m:
+            fmt = m.group(1); continue
+        m = re.search(r"Size: Discrete (\d+)x(\d+)", line)
+        if m:
+            size = (int(m.group(1)), int(m.group(2))); continue
+        m = re.search(r"\(([\d.]+) fps\)", line)
+        if m and fmt and size:
+            modes.append((fmt, size[0], size[1], float(m.group(1))))
+    _MODE_CACHE[dev] = modes
+    return modes
+
+
+def best_mode(dev):
+    """Pick a sane capture mode for a device: (fourcc, w, h, fps) or None.
+
+    Without a caps filter GStreamer takes whatever v4l2src offers first,
+    which on the Z13 rear camera is YUYV 2592x1944 at *2 fps*. That is the
+    "laggy rear camera". The same sensor does MJPG 1600x1200 at 30.
+    """
+    modes = _enumerate_modes(dev)
+    if not modes:
+        return None
+    # Smooth first, then detail. Cap the pixel count so decode stays cheap;
+    # stills are cropped from this frame anyway.
+    usable = [m for m in modes if m[3] >= 20 and m[1] * m[2] <= 2_100_000]
+    if not usable:
+        usable = [m for m in modes if m[3] >= 10] or modes
+    # Prefer MJPG: the raw modes on these sensors are the slow ones.
+    mjpg = [m for m in usable if m[0] == "MJPG"]
+    pool = mjpg or usable
+    # Stick to the sensor's native aspect. The Z13 rear sensor is 4:3, and
+    # picking one of its 16:9 modes squashes the picture, which is the
+    # stretching this app had before it stopped forcing caps at all.
+    biggest = max(modes, key=lambda m: m[1] * m[2])
+    native = biggest[1] / biggest[2]
+    same = [m for m in pool if abs(m[1] / m[2] - native) < 0.02]
+    if same:
+        pool = same
+    return max(pool, key=lambda m: (m[1] * m[2], m[3]))
+
+
+def best_still_mode(dev):
+    """Largest MJPG mode on a device, ignoring framerate.
+
+    Stills come off the preview stream, so they were only ever as large as
+    the preview: 1600x1200 on the rear camera and 640x480 on the front. The
+    rear sensor actually does 3264x2448, so it is worth briefly retuning the
+    camera for the shot.
+    """
+    modes = _enumerate_modes(dev)
+    mjpg = [m for m in modes if m[0] == "MJPG"]
+    if not mjpg:
+        return None
+    biggest = max(modes, key=lambda m: m[1] * m[2])
+    native = biggest[1] / biggest[2]
+    same = [m for m in mjpg if abs(m[1] / m[2] - native) < 0.02]
+    return max(same or mjpg, key=lambda m: m[1] * m[2])
+
+
+# Voice band-pass, applied inside our own pipeline.
+#
+# Everything outside roughly 110Hz-7.5kHz is noise for speech: rumble below,
+# hiss above. Measured on the internal mic in a quiet room, this takes the
+# noise floor from -46.5 dBFS to -62.3, about 16dB, which is the difference
+# between clearly audible hiss and inaudible.
+#
+# Deliberately not a PulseAudio module. A module is system state: it outlives
+# the app, keeps a capture stream open, and lights the system microphone
+# indicator with nothing recording. This lives and dies with the pipeline, so
+# Lens can be packaged and shipped without touching the machine it runs on.
+# name -> (videobalance props, coloreffects preset)
+FILTERS = {
+    "None":   ({}, "none"),
+    "Mono":   ({"saturation": 0.0}, "none"),
+    "Vivid":  ({"saturation": 1.7, "contrast": 1.15}, "none"),
+    "Warm":   ({"hue": 0.06, "saturation": 1.15}, "none"),
+    "Cool":   ({"hue": -0.08, "saturation": 1.05}, "none"),
+    "Sepia":  ({}, "sepia"),
+    "X-Ray":  ({}, "xray"),
+    "Cross":  ({}, "xpro"),
+}
+
+# Sprite sheet for the save indicator: 32 frames laid out in one row.
+TUX_SHEET  = "tux_saving.png"
+TUX_FRAMES = 32
+TUX_MS     = 80          # ~12fps, which is about where the dance reads right
+TUX_W, TUX_H = 117, 155
+
+
+def asset(name):
+    """Find a bundled asset whether running from the tree or installed."""
+    here = pathlib.Path(__file__).resolve().parent
+    for base in (here / "assets", here.parent / "assets",
+                 pathlib.Path("/usr/share/lens/assets")):
+        f = base / name
+        if f.exists():
+            return f
+    return None
+
+
+def tux_frames():
+    """Slice the sheet once and hand back textures, or None if it is missing.
+
+    Cached on the function because the overlay is rebuilt per save and
+    re-decoding 32 frames each time would stall the very moment it exists
+    to cover.
+    """
+    if not hasattr(tux_frames, "_cache"):
+        tux_frames._cache = None
+        f = asset(TUX_SHEET)
+        if f is not None:
+            try:
+                sheet = GdkPixbuf.Pixbuf.new_from_file(str(f))
+                w = sheet.get_width() // TUX_FRAMES
+                h = sheet.get_height()
+                tux_frames._cache = [
+                    Gdk.Texture.new_for_pixbuf(
+                        sheet.new_subpixbuf(i * w, 0, w, h))
+                    for i in range(TUX_FRAMES)]
+            except Exception as e:
+                print(f"Lens: cannot load {f}: {e}", file=sys.stderr)
+    return tux_frames._cache
+
+
 DENOISE_CHAIN = ("audiowsincband mode=band-pass lower-frequency=110 "
                  "upper-frequency=7500 length=101")
 # The hiss is the mic's own noise floor, not the room: turning the capture
@@ -277,6 +529,14 @@ NOISE_GATE = ("audiodynamic mode=expander characteristics=soft-knee "
 # have to be set for the quietest moment.
 LEVELLER = ("audiodynamic mode=compressor characteristics=soft-knee "
             "ratio=0.55 threshold=0.26")
+# Catches the peaks the makeup gain pushes past full scale. Without it a take
+# measured a dead-flat 0.0 dBFS peak with 130 hard-clipped samples, which is
+# what "loud but not clear" sounds like. LSP rather than audiodynamic because
+# it has real attack, release and lookahead: audiodynamic has none of the
+# three and simply reshapes each sample where it stands, so using it to hold
+# peaks down trades clipping for distortion.
+LIMITER = ("lsp-plug-in-plugins-lv2-limiter-mono enabled=true th=0.79 lk=5.0 "
+           "at=1.0 rt=10.0 knee=0.5")
 
 
 def list_audio_sources():
@@ -1853,15 +2113,17 @@ class LensWindow(Adw.ApplicationWindow):
         b = getattr(self, "btn_exp", None)
         if b is None:
             return
+        # The value itself is the state. "AE" against "MAN" was two words that
+        # look alike at a glance, and the colour alone was too quiet to read.
         if self.exposure_auto:
             b.set_label("AE")
-            b.remove_css_class("exp-manual")
+            b.remove_css_class("pill-active")
             b.set_tooltip_text("Exposure is automatic. Drag up or down on the "
                                "picture to set it by hand")
         else:
-            b.set_label("MAN")
-            b.add_css_class("exp-manual")
-            b.set_tooltip_text("Exposure is manual. Click to go back to auto")
+            b.set_label(f"1/{max(1, int(10000 / max(self.exposure_val or 1, 1)))}")
+            b.add_css_class("pill-active")
+            b.set_tooltip_text("Exposure is held. Click for automatic")
 
     def _meter_at(self, x, y):
         """Re-meter for what was tapped.
@@ -2122,7 +2384,7 @@ class LensWindow(Adw.ApplicationWindow):
         # Reset for the drag above. It doubles as the indicator: there is no
         # other way to tell a held exposure from the camera's own.
         self.btn_exp = self._pill_button("AE", self._exposure_to_auto,
-                                         width=52, tint=False)
+                                         width=58, tint=False)
         self.btn_grid   = self._pill_button("#",   self._toggle_grid,   width=42, tint=False)
         self.btn_aspect = self._pill_button(self.aspects[0], self._toggle_aspect, width=58, tint=False)
         # A real icon, not the "⏱" glyph: that rendered tiny and was barely
@@ -3188,13 +3450,21 @@ class LensWindow(Adw.ApplicationWindow):
         never starts, and the file is left at zero bytes.
         """
         src = f"pulsesrc device={self.mic_source}" if self.mic_source else "pulsesrc"
-        chain = (f" ! {DENOISE_CHAIN} ! audioconvert ! {NOISE_GATE} ! {LEVELLER}"
-                 if self.denoise else "")
+        parts = [f"{src} provide-clock=false", "audioconvert"]
+        if self.denoise:
+            # Mono throughout: RNNoise and the limiter are both mono elements,
+            # and one built-in mic has nothing stereo to say anyway.
+            parts.append("audio/x-raw,channels=1")
+            parts.append(RNNOISE if have(RNNOISE) else FALLBACK_CLEAN)
         # Named so mute can be flipped on a running pipeline. Muting by
         # tearing the branch out would end the file and start another one.
-        vol = (f" ! volume name=micvol volume={self.mic_gain:.2f} "
-               f"mute={'true' if not self.mic_enabled else 'false'}")
-        return f"{src} provide-clock=false ! audioconvert{chain}{vol} ! audioconvert"
+        parts.append(f"volume name=micvol volume={self.mic_gain:.2f} "
+                     f"mute={'true' if not self.mic_enabled else 'false'}")
+        # Limiting last, after the gain that creates the peaks.
+        if self.denoise and have("lsp-plug-in-plugins-lv2-limiter-mono"):
+            parts += ["audioconvert", "audio/x-raw,channels=1", LIMITER]
+        parts.append("audioconvert")
+        return " ! ".join(parts)
 
     # ---- live audio level ----
     def _start_audio_monitor(self):
