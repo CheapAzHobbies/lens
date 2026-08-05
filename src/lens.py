@@ -2363,6 +2363,17 @@ class LensWindow(Adw.ApplicationWindow):
             # screen, still in its old orientation, into the new geometry:
             # a frame or two of the picture flipped the wrong way before it
             # settled.
+            # Hold a still of what is on screen right now. Keeping the live
+            # feed and holding the transform meant that once the pipeline
+            # started rotating, its frames were turned by the pipeline and
+            # again by the transform: a quarter turn too far, which is the
+            # second flash. A frozen shot under the same transform looks
+            # identical and stops changing, so the pipeline can be switched
+            # underneath it unseen.
+            frozen = self._freeze_frame()
+            live = self.paintable
+            if frozen is not None:
+                self.picture.set_paintable(frozen)
             cid = self._current_cam_id()
             if cid is not None:
                 self.rotation_map[cid] = (self.rotation_for_current() + deg) % 360
@@ -2379,20 +2390,25 @@ class LensWindow(Adw.ApplicationWindow):
                 if state["seen"] < 2 and _:
                     return False
                 state["done"] = True
-                if state["h"] is not None and self.paintable is not None:
+                if state["h"] is not None and live is not None:
                     try:
-                        self.paintable.disconnect(state["h"])
+                        live.disconnect(state["h"])
                     except Exception:
                         pass
+                # Everything in one step: the new shape, the released
+                # transform and the live feed coming back, so no frame is
+                # ever drawn with a mismatched pair.
                 self._apply_view_aspect()
                 tb.angle, tb.scale = 0.0, 1.0
+                if frozen is not None and live is not None:
+                    self.picture.set_paintable(live)
                 tb.queue_draw()
                 self.frame_stack.set_overflow(Gtk.Overflow.HIDDEN)
                 self._hide_hud_for_move(False)
                 self._view_anim = False
                 return False
-            if self.paintable is not None:
-                state["h"] = self.paintable.connect("invalidate-contents", commit)
+            if live is not None:
+                state["h"] = live.connect("invalidate-contents", commit)
             GLib.timeout_add(500, commit)   # if no frame ever comes
         self._drive_view(420, step, finish)
 
@@ -3123,7 +3139,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.btn_exp = Gtk.Button(label="AE")
         self.btn_exp.add_css_class("zoomstep")
         self.btn_exp.add_css_class("zoomval")
-        self.btn_exp.set_tooltip_text("Exposure. Click to hand it back to the camera")
+        self.btn_exp.set_tooltip_text("Exposure. Click for automatic")
         self.btn_exp.connect("clicked", lambda *_: self._exposure_to_auto())
         self.exp_slider = Gtk.Scale.new_with_range(
             Gtk.Orientation.HORIZONTAL, -3.0, 3.0, 0.1)
@@ -3131,6 +3147,8 @@ class LensWindow(Adw.ApplicationWindow):
         self.exp_slider.set_draw_value(False)
         self.exp_slider.add_mark(0.0, Gtk.PositionType.BOTTOM, None)
         self.exp_slider.set_value(0.0)
+        self.exp_slider.set_tooltip_text(
+            "Exposure. Centre is automatic, right is brighter")
         self.exp_slider.connect("value-changed", self._on_exp_slider)
         self.exp_box.append(self.btn_exp)
         self.exp_box.append(self.exp_slider)
@@ -3143,7 +3161,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.btn_rotate.set_child(_i)
         self.btn_rotate.add_css_class("winctl")
         self.btn_rotate.set_valign(Gtk.Align.CENTER)
-        self.btn_rotate.set_tooltip_text("Rotate the view a quarter turn")
+        self.btn_rotate.set_tooltip_text("Rotate 90\u00b0")
         self.btn_rotate.connect("clicked", lambda *_: self._rotate_view(90))
         self.btn_hflip = Gtk.Button()
         _ih = Gtk.Image.new_from_icon_name("object-flip-horizontal-symbolic")
@@ -3151,7 +3169,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.btn_hflip.set_child(_ih)
         self.btn_hflip.add_css_class("winctl")
         self.btn_hflip.set_valign(Gtk.Align.CENTER)
-        self.btn_hflip.set_tooltip_text("Flip the view left to right")
+        self.btn_hflip.set_tooltip_text("Mirror")
         self.btn_hflip.connect("clicked", lambda *_: self._flip_view(horizontal=True))
         self.btn_vflip = Gtk.Button()
         _i = Gtk.Image.new_from_icon_name("object-flip-vertical-symbolic")
@@ -3159,11 +3177,13 @@ class LensWindow(Adw.ApplicationWindow):
         self.btn_vflip.set_child(_i)
         self.btn_vflip.add_css_class("winctl")
         self.btn_vflip.set_valign(Gtk.Align.CENTER)
-        self.btn_vflip.set_tooltip_text("Flip the view top to bottom")
+        self.btn_vflip.set_tooltip_text("Flip")
         self.btn_vflip.connect("clicked", lambda *_: self._flip_view())
 
         self.btn_grid   = self._pill_button("#",   self._toggle_grid,   width=42, tint=False)
+        self.btn_grid.set_tooltip_text("Guides: thirds, then 2x2, then off")
         self.btn_aspect = self._pill_button(self.aspects[0], self._toggle_aspect, width=58, tint=False)
+        self.btn_aspect.set_tooltip_text("Aspect ratio")
         # A real icon, not the "⏱" glyph: that rendered tiny and was barely
         # visible at any size.
         self.btn_timer = Gtk.Button()
@@ -3179,6 +3199,7 @@ class LensWindow(Adw.ApplicationWindow):
         self.btn_timer.add_css_class("pill")
         self.btn_timer.connect("clicked", lambda *_: self._toggle_timer())
         self.btn_fx = Gtk.MenuButton(label="FX")
+        self.btn_fx.set_tooltip_text("Look")
         self.btn_fx.set_size_request(58, 42)
         self.btn_fx.add_css_class("pill")
         self.btn_fx.set_tooltip_text("Look")
