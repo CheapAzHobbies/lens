@@ -1885,6 +1885,9 @@ class LensWindow(Adw.ApplicationWindow):
         # Separately, whether the sensor is mounted upside down. Also per
         # camera: it is a property of how the part was fitted, not a taste.
         self.vflip_map = dict(cfg.get("vflip_map") or {})
+        # Quarter turns, also per camera. An external camera on its side is
+        # a normal thing and nothing else in the pipeline knows about it.
+        self.rotation_map = dict(cfg.get("rotation_map") or {})
         # Kept for machines set up before this was per-camera.
         self._mirror_legacy = bool(cfg.get("mirror_view", True))
         self.mirror_saved = bool(cfg.get("mirror_saved", False))
@@ -2283,6 +2286,95 @@ class LensWindow(Adw.ApplicationWindow):
             return False
         return bool(self.mirror_map.get(cid, True))
 
+    def rotation_for_current(self):
+        cid = self._current_cam_id()
+        return int(self.rotation_map.get(cid, 0)) % 360 if cid else 0
+
+    def set_rotation_for_current(self, deg):
+        cid = self._current_cam_id()
+        if cid is not None:
+            self.rotation_map[cid] = int(deg) % 360
+            self._save_settings()
+        self._apply_mirror()
+        self._apply_view_aspect()
+
+    def _rotate_view(self, deg):
+        """Turn the viewfinder, animating the way the gallery does."""
+        if getattr(self, "_view_anim", False):
+            return
+        self._view_anim = True
+        tb = self.cam_tbox
+        a = self.picture.get_allocation()
+        w, h = a.width or 1, a.height or 1
+
+        def step(e):
+            tb.angle = deg * e
+            tb.scale = self._view_fit(w, h, tb.angle)
+            tb.queue_draw()
+
+        def finish():
+            self.set_rotation_for_current(self.rotation_for_current() + deg)
+            tb.angle, tb.scale = 0.0, 1.0
+            tb.queue_draw()
+            self._view_anim = False
+        self._drive_view(420, step, finish)
+
+    def _flip_view(self):
+        """Turn the view over, squashing to the edge and back."""
+        if getattr(self, "_view_anim", False):
+            return
+        self._view_anim = True
+        tb = self.cam_tbox
+        done = {"swapped": False}
+
+        def step(e):
+            tb.flip_y = abs(1.0 - 2.0 * e)
+            if not done["swapped"] and e >= 0.5:
+                done["swapped"] = True
+                self.set_vflip_for_current(not self.vflip_for_current())
+            tb.queue_draw()
+
+        def finish():
+            tb.flip_y = 1.0
+            tb.queue_draw()
+            self._view_anim = False
+        self._drive_view(340, step, finish)
+
+    def _view_fit(self, w, h, deg):
+        a = math.radians(deg)
+        c, sn = abs(math.cos(a)), abs(math.sin(a))
+        bw, bh = w * c + h * sn, w * sn + h * c
+        sw, sh = self.frame_stack.get_width(), self.frame_stack.get_height()
+        if min(bw, bh, sw, sh) <= 0:
+            return 1.0
+        return min(sw / bw, sh / bh)
+
+    def _drive_view(self, ms, step, finish):
+        state = {"t0": None}
+
+        def tick(widget, clock):
+            if state["t0"] is None:
+                state["t0"] = clock.get_frame_time()
+            t = min(1.0, (clock.get_frame_time() - state["t0"]) / (ms * 1000.0))
+            step(t * t * (3.0 - 2.0 * t))
+            if t >= 1.0:
+                finish()
+                return GLib.SOURCE_REMOVE
+            return GLib.SOURCE_CONTINUE
+        self.cam_tbox.add_tick_callback(tick)
+
+    def _apply_view_aspect(self):
+        """A quarter turn swaps the viewfinder's shape.
+
+        The aspect frame is told the ratio the user picked; after 90 or 270
+        degrees the picture inside it is the other way up, so the frame has
+        to be inverted or the image is letterboxed into the wrong box.
+        """
+        base = {"4:3": 4 / 3, "16:9": 16 / 9, "1:1": 1.0}[self.aspects[self.aspect_idx]]
+        if self.rotation_for_current() in (90, 270):
+            base = 1.0 / base
+        self.aspect_frame.set_ratio(base)
+
     def vflip_for_current(self):
         cid = self._current_cam_id()
         return bool(self.vflip_map.get(cid, False)) if cid else False
@@ -2308,11 +2400,24 @@ class LensWindow(Adw.ApplicationWindow):
         """
         mv = self.mirror_for_current()
         vf = self.vflip_for_current()
+        rot = self.rotation_for_current()
+        # A vertical flip is a horizontal flip plus half a turn, so it folds
+        # into the pair below rather than needing a method of its own.
+        if vf:
+            mv = not mv
+            rot = (rot + 180) % 360
         # videoflip does one operation, so the two are combined: a horizontal
         # and a vertical flip together are a 180 degree rotation.
         #   0 none, 2 rotate-180, 4 horizontal-flip, 5 vertical-flip
-        def method(h, v):
-            return 2 if (h and v) else (4 if h else (5 if v else 0))
+        # Checked by pushing a marker image through all eight and reading
+        # where the corners landed, rather than trusting the names: 6 and 7
+        # are diagonals, and which of them is a mirrored quarter turn each way
+        # is not something to guess at.
+        TABLE = {(0, False): 0, (90, False): 1, (180, False): 2, (270, False): 3,
+                 (0, True): 4, (90, True): 7, (180, True): 5, (270, True): 6}
+
+        def method(h, _v):
+            return TABLE[(rot, bool(h))]
         # The preview mirrors; the file only does if that was asked for. The
         # vertical flip is not a preference, it is the sensor being mounted
         # upside down, so it always applies to both.
@@ -2720,7 +2825,13 @@ class LensWindow(Adw.ApplicationWindow):
         self.frame_stack.set_overflow(Gtk.Overflow.HIDDEN)
         self.picture.set_hexpand(True)
         self.picture.set_vexpand(True)
-        self.frame_stack.add_overlay(self.picture)
+        # Same widget the gallery turns its photos with. The live view is a
+        # paintable rather than a texture, but a Gsk transform does not care
+        # what is underneath it.
+        self.cam_tbox = TransformBox(self.picture)
+        self.cam_tbox.set_hexpand(True)
+        self.cam_tbox.set_vexpand(True)
+        self.frame_stack.add_overlay(self.cam_tbox)
         # Parent the camera menu to the viewfinder, not to the banner. GTK CSS
         # inherits, and the banner carries letter-spacing 5px in bold
         # monospace to look like a tube caption, which the menu inside it
@@ -2902,6 +3013,26 @@ class LensWindow(Adw.ApplicationWindow):
         self.exp_slider.connect("value-changed", self._on_exp_slider)
         self.exp_box.append(self.btn_exp)
         self.exp_box.append(self.exp_slider)
+        # Orientation, in the bar rather than in Settings. It is a thing you
+        # discover by looking at a wrong-way-round picture, which is the
+        # moment you want the control in front of you.
+        self.btn_rotate = Gtk.Button()
+        _i = Gtk.Image.new_from_icon_name("object-rotate-right-symbolic")
+        _i.set_pixel_size(18)
+        self.btn_rotate.set_child(_i)
+        self.btn_rotate.add_css_class("winctl")
+        self.btn_rotate.set_valign(Gtk.Align.CENTER)
+        self.btn_rotate.set_tooltip_text("Rotate the view a quarter turn")
+        self.btn_rotate.connect("clicked", lambda *_: self._rotate_view(90))
+        self.btn_vflip = Gtk.Button()
+        _i = Gtk.Image.new_from_icon_name("object-flip-vertical-symbolic")
+        _i.set_pixel_size(18)
+        self.btn_vflip.set_child(_i)
+        self.btn_vflip.add_css_class("winctl")
+        self.btn_vflip.set_valign(Gtk.Align.CENTER)
+        self.btn_vflip.set_tooltip_text("Flip the view top to bottom")
+        self.btn_vflip.connect("clicked", lambda *_: self._flip_view())
+
         self.btn_grid   = self._pill_button("#",   self._toggle_grid,   width=42, tint=False)
         self.btn_aspect = self._pill_button(self.aspects[0], self._toggle_aspect, width=58, tint=False)
         # A real icon, not the "⏱" glyph: that rendered tiny and was barely
@@ -2937,6 +3068,8 @@ class LensWindow(Adw.ApplicationWindow):
 
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         top.append(self.exp_box)
+        top.append(self.btn_rotate)
+        top.append(self.btn_vflip)
         top.append(self.btn_grid); top.append(self.btn_aspect)
         top.append(self.btn_fx); top.append(self.btn_timer)
 
@@ -3837,6 +3970,7 @@ class LensWindow(Adw.ApplicationWindow):
             "trash_path":   self.trash_path,
             "mirror_map":   self.mirror_map,
             "vflip_map":    self.vflip_map,
+            "rotation_map": self.rotation_map,
             "mirror_saved": self.mirror_saved,
             "container":    self.container,
             "pic_dir":      str(self.pic_dir),
