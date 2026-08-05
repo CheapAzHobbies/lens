@@ -2269,31 +2269,19 @@ class LensWindow(Adw.ApplicationWindow):
         return cam[2] or cam[0]
 
     def mirror_for_current(self):
-        """Whether this camera's preview is mirrored.
+        """Whether this camera's preview is mirrored, left to right.
 
-        Defaults by a heuristic when a camera has not been seen before: the
-        lower-resolution one on a machine is almost always the selfie camera,
-        and that is the one that wants mirroring. It is a guess, which is why
-        it is a per-camera setting rather than a fixed rule.
+        On by default for every camera. A first guess at this tried to be
+        clever, mirroring only whichever camera had the lower resolution on
+        the theory that it was the selfie one, and it was wrong on this
+        machine: both wanted it. Mirrored is also the behaviour people expect
+        from a camera app, since it is what every phone and every video call
+        does, and it is per camera for the cases where it is not.
         """
         cid = self._current_cam_id()
         if cid is None:
             return False
-        if cid in self.mirror_map:
-            return bool(self.mirror_map[cid])
-        return self._guess_is_selfie(self.cam_idx)
-
-    def _guess_is_selfie(self, idx):
-        try:
-            areas = []
-            for path, _n, _s in self.cameras:
-                mode = best_still_mode(path) or (0, 0)
-                areas.append(mode[0] * mode[1])
-            if len(areas) < 2 or max(areas) == min(areas):
-                return False
-            return areas[idx] == min(areas)
-        except Exception:
-            return False
+        return bool(self.mirror_map.get(cid, True))
 
     def vflip_for_current(self):
         cid = self._current_cam_id()
