@@ -2299,16 +2299,29 @@ class LensWindow(Adw.ApplicationWindow):
         self._apply_view_aspect()
 
     def _rotate_view(self, deg):
-        """Turn the viewfinder, animating the way the gallery does."""
+        """Turn the viewfinder, morphing its shape as it goes.
+
+        The frame has to change shape along with the turn. Setting the new
+        ratio at the end instead made the picture shrink through the
+        rotation and then snap out to its new size in one frame, which is
+        the jolt at the end of the move. Interpolating the ratio on the same
+        curve means the box is always the shape the picture currently is.
+        """
         if getattr(self, "_view_anim", False):
             return
         self._view_anim = True
+        self._hide_hud_for_move(True)
         tb = self.cam_tbox
         a = self.picture.get_allocation()
         w, h = a.width or 1, a.height or 1
+        r0 = self.aspect_frame.get_ratio()
+        r1 = 1.0 / r0 if (deg // 90) % 2 else r0
 
         def step(e):
             tb.angle = deg * e
+            # Geometric, so halfway through a 4:3 to 3:4 turn is square
+            # rather than the arithmetic mean, which favours the wider one.
+            self.aspect_frame.set_ratio(r0 * (r1 / r0) ** e)
             tb.scale = self._view_fit(w, h, tb.angle)
             tb.queue_draw()
 
@@ -2316,31 +2329,64 @@ class LensWindow(Adw.ApplicationWindow):
             self.set_rotation_for_current(self.rotation_for_current() + deg)
             tb.angle, tb.scale = 0.0, 1.0
             tb.queue_draw()
+            self._hide_hud_for_move(False)
             self._view_anim = False
         self._drive_view(420, step, finish)
 
-    def _flip_view(self):
+    def _flip_view(self, horizontal=False):
         """Turn the view over, squashing to the edge and back."""
         if getattr(self, "_view_anim", False):
             return
         self._view_anim = True
+        self._hide_hud_for_move(True)
         tb = self.cam_tbox
         done = {"swapped": False}
 
         def step(e):
-            tb.flip_y = abs(1.0 - 2.0 * e)
+            v = abs(1.0 - 2.0 * e)
+            if horizontal:
+                tb.flip_x = v
+            else:
+                tb.flip_y = v
             if not done["swapped"] and e >= 0.5:
                 done["swapped"] = True
-                self.set_vflip_for_current(not self.vflip_for_current())
+                if horizontal:
+                    self.set_mirror_for_current(not self.mirror_for_current())
+                else:
+                    self.set_vflip_for_current(not self.vflip_for_current())
             tb.queue_draw()
 
         def finish():
-            tb.flip_y = 1.0
+            tb.flip_x = tb.flip_y = 1.0
             tb.queue_draw()
+            self._hide_hud_for_move(False)
             self._view_anim = False
         self._drive_view(340, step, finish)
 
+    def _hide_hud_for_move(self, hiding):
+        """Take the readouts away while the picture moves.
+
+        Words turning with the image are unreadable and turning against it
+        look pinned on, so they leave and come back once it has settled. The
+        grid stays: it belongs to the frame and is meant to follow it, which
+        is why it lives inside the transform.
+        """
+        for w in (getattr(self, "rec_indicator", None),
+                  getattr(self, "zoom_bar", None),
+                  getattr(self, "exp_label", None)):
+            if w is None:
+                continue
+            if hiding:
+                w.set_opacity(0.0)
+            else:
+                w.set_opacity(1.0)
+
     def _view_fit(self, w, h, deg):
+        """Largest scale at which the turning picture still fits.
+
+        Measured against the frame's size right now, which is changing
+        underneath this as the ratio interpolates.
+        """
         a = math.radians(deg)
         c, sn = abs(math.cos(a)), abs(math.sin(a))
         bw, bh = w * c + h * sn, w * sn + h * c
@@ -2828,7 +2874,10 @@ class LensWindow(Adw.ApplicationWindow):
         # Same widget the gallery turns its photos with. The live view is a
         # paintable rather than a texture, but a Gsk transform does not care
         # what is underneath it.
-        self.cam_tbox = TransformBox(self.picture)
+        self._cam_inner = Gtk.Overlay()
+        self._cam_inner.set_child(self.picture)
+        self._cam_inner.add_overlay(self.grid_widget)
+        self.cam_tbox = TransformBox(self._cam_inner)
         self.cam_tbox.set_hexpand(True)
         self.cam_tbox.set_vexpand(True)
         self.frame_stack.add_overlay(self.cam_tbox)
@@ -2840,7 +2889,6 @@ class LensWindow(Adw.ApplicationWindow):
         self.camera_popover.set_parent(self.frame_stack)
         self.frame_stack.add_overlay(self.no_signal)
         self.frame_stack.add_overlay(self.btn_no_signal)
-        self.frame_stack.add_overlay(self.grid_widget)
         self.meter_box = MeterBox()
         self.frame_stack.add_overlay(self.meter_box)
         # Zoom readout, shown only while zoomed so it is not permanent chrome.
@@ -3024,6 +3072,14 @@ class LensWindow(Adw.ApplicationWindow):
         self.btn_rotate.set_valign(Gtk.Align.CENTER)
         self.btn_rotate.set_tooltip_text("Rotate the view a quarter turn")
         self.btn_rotate.connect("clicked", lambda *_: self._rotate_view(90))
+        self.btn_hflip = Gtk.Button()
+        _ih = Gtk.Image.new_from_icon_name("object-flip-horizontal-symbolic")
+        _ih.set_pixel_size(18)
+        self.btn_hflip.set_child(_ih)
+        self.btn_hflip.add_css_class("winctl")
+        self.btn_hflip.set_valign(Gtk.Align.CENTER)
+        self.btn_hflip.set_tooltip_text("Flip the view left to right")
+        self.btn_hflip.connect("clicked", lambda *_: self._flip_view(horizontal=True))
         self.btn_vflip = Gtk.Button()
         _i = Gtk.Image.new_from_icon_name("object-flip-vertical-symbolic")
         _i.set_pixel_size(18)
@@ -3069,6 +3125,7 @@ class LensWindow(Adw.ApplicationWindow):
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         top.append(self.exp_box)
         top.append(self.btn_rotate)
+        top.append(self.btn_hflip)
         top.append(self.btn_vflip)
         top.append(self.btn_grid); top.append(self.btn_aspect)
         top.append(self.btn_fx); top.append(self.btn_timer)
