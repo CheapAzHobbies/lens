@@ -611,8 +611,10 @@ class AudioMeter(Gtk.DrawingArea):
         super().__init__()
         self.level = 0.0       # 0..1
         self.muted = False
-        self.set_content_width(46)
-        self.set_content_height(11)
+        # Sized to sit with the top row rather than under it. At 46x11 the
+        # bars read as a hairline next to chips with 14px bold text.
+        self.set_content_width(66)
+        self.set_content_height(18)
         self.set_valign(Gtk.Align.CENTER)
         self.set_can_target(False)
         self.set_draw_func(self._draw)
@@ -3125,7 +3127,7 @@ class LensWindow(Adw.ApplicationWindow):
         audio_row.set_valign(Gtk.Align.CENTER)
         self.btn_mic = Gtk.Button()
         self.mic_icon = Gtk.Image.new_from_icon_name("audio-input-microphone-symbolic")
-        self.mic_icon.set_pixel_size(18)
+        self.mic_icon.set_pixel_size(22)
         self.btn_mic.set_child(self.mic_icon)
         self.btn_mic.add_css_class("hud-btn")
         self.btn_mic.add_css_class("hud-chip")
@@ -3503,7 +3505,14 @@ class LensWindow(Adw.ApplicationWindow):
         .hud-btn.hud-chip:hover { background-color: rgba(255,255,255,0.20); }
         /* Give the mic a fixed footprint so muting cannot resize it, and so
            the icon is a decent target rather than a tiny glyph when live. */
-        .hud-mic > button { min-width: 26px; min-height: 22px; }
+        /* A circle, not a small rounded chip. The mic is the one HUD control
+           that is pressed rather than read, and at chip size it was a much
+           lighter target than anything in the top bar. */
+        .hud-mic { background: rgba(0,0,0,0.55); border-radius: 50%;
+                   padding: 0; min-width: 38px; min-height: 38px; }
+        .hud-mic:hover { background: rgba(0,0,0,0.72); }
+        .hud-mic > button { min-width: 38px; min-height: 38px;
+                            border-radius: 50%; }
         .hud-btn-off { color: rgba(255,255,255,0.35); }
         /* Filled, not outlined. A red line-art glyph over a bright picture
            was almost invisible, which defeats the point of warning that the
@@ -4277,18 +4286,18 @@ class LensWindow(Adw.ApplicationWindow):
         if not self.mic_available:
             # Nothing to record from: state the fact, quietly.
             self.mic_icon.set_from_icon_name("microphone-disabled-symbolic")
-            self.mic_icon.set_pixel_size(18)
+            self.mic_icon.set_pixel_size(22)
             self.btn_mic.set_tooltip_text("No microphone found")
             self.btn_mic.add_css_class("hud-btn-off")
         elif self.mic_enabled:
             self.mic_icon.set_from_icon_name("audio-input-microphone-symbolic")
-            self.mic_icon.set_pixel_size(18)
+            self.mic_icon.set_pixel_size(22)
             self.btn_mic.set_tooltip_text("Microphone on, click to mute")
         else:
             # Muted is a warning, not a disabled state: you are about to
             # record something silent. Grey made it nearly invisible.
             self.mic_icon.set_from_icon_name("microphone-disabled-symbolic")
-            self.mic_icon.set_pixel_size(18)
+            self.mic_icon.set_pixel_size(22)
             self.btn_mic.set_tooltip_text("Microphone MUTED, click to unmute")
             self.btn_mic.add_css_class("hud-btn-muted")
         self.btn_mic.set_sensitive(self.mic_available)
