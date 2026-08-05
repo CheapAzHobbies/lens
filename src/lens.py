@@ -690,6 +690,91 @@ class BatteryGauge(Gtk.DrawingArea):
             cr.fill()
 
 
+class NoSignal(Gtk.DrawingArea):
+    """Analogue static, for when there is nothing to show.
+
+    A black rectangle is indistinguishable from a camera pointed at
+    something dark, from a camera another process has taken, and from no
+    camera at all. Static is unambiguous: everyone born before streaming
+    knows exactly what it means.
+
+    The noise is a handful of small tiles cycled at a low rate rather than
+    fresh noise every frame. Generating 300k random pixels sixty times a
+    second in Python would cost more than the viewfinder it is standing in
+    for, and real analogue static repeats to the eye anyway.
+    """
+
+    TILES = 8
+    TILE_W, TILE_H = 148, 112
+    MS = 66                     # ~15fps, which is where static stops
+                                # looking like it is stepping
+
+    def __init__(self):
+        super().__init__()
+        self._tiles = self._make_tiles()
+        self._i = 0
+        self.set_draw_func(self._draw)
+        self._tick = GLib.timeout_add(self.MS, self._advance)
+        self.connect("destroy", self._stop)
+
+    def _stop(self, *_):
+        if self._tick:
+            GLib.source_remove(self._tick)
+            self._tick = None
+
+    def _advance(self):
+        self._i = (self._i + 1) % len(self._tiles)
+        self.queue_draw()
+        return True
+
+    def _make_tiles(self):
+        import cairo
+        w, h = self.TILE_W, self.TILE_H
+        stride = cairo.ImageSurface.format_stride_for_width(cairo.FORMAT_RGB24, w)
+        out = []
+        for _ in range(self.TILES):
+            raw = os.urandom(w * h)
+            data = bytearray(stride * h)
+            k = 0
+            for y in range(h):
+                row = y * stride
+                for x in range(w):
+                    # Weighted towards dark so the white speckle reads as
+                    # sparks on a dim screen rather than a grey wash.
+                    v = raw[k] // 2 + (raw[k] > 214) * 120
+                    k += 1
+                    o = row + x * 4
+                    data[o] = data[o + 1] = data[o + 2] = min(255, v)
+            out.append(cairo.ImageSurface.create_for_data(
+                data, cairo.FORMAT_RGB24, w, h, stride))
+        return out
+
+    def _draw(self, area, cr, width, height):
+        import cairo
+        cr.save()
+        cr.scale(width / self.TILE_W, height / self.TILE_H)
+        cr.set_source_surface(self._tiles[self._i], 0, 0)
+        cr.get_source().set_filter(cairo.FILTER_NEAREST)
+        cr.paint()
+        cr.restore()
+        # Scanlines. Without them it reads as digital noise; the dark gaps
+        # are what make it a tube.
+        cr.set_source_rgba(0, 0, 0, 0.30)
+        y = 0
+        while y < height:
+            cr.rectangle(0, y, width, 2)
+            y += 4
+        cr.fill()
+        # Vignette, because a CRT is never evenly lit at the corners.
+        rg = cairo.RadialGradient(width / 2, height / 2, min(width, height) * 0.25,
+                                  width / 2, height / 2, max(width, height) * 0.72)
+        rg.add_color_stop_rgba(0, 0, 0, 0, 0.0)
+        rg.add_color_stop_rgba(1, 0, 0, 0, 0.65)
+        cr.set_source(rg)
+        cr.rectangle(0, 0, width, height)
+        cr.fill()
+
+
 class MeterBox(Gtk.DrawingArea):
     """The yellow square a phone camera draws where you tap.
 
@@ -1795,6 +1880,10 @@ class LensWindow(Adw.ApplicationWindow):
         self.cur_res = None
         self._fps_count = 0
         self._fps_shown = 0
+        self._frames_total = 0
+        self._no_signal_on = False
+        self._wd_idle = 0
+        self._wd_last = -1
         self.overlay_mode = int(cfg.get("overlay_mode", 0)) % 4
         self.grid_visible = self.overlay_mode == 1
         # How long each camera takes to deliver its first frame, keyed by
@@ -1838,6 +1927,10 @@ class LensWindow(Adw.ApplicationWindow):
         self._install_breakpoints()
         self._apply_settings()
         self._start_pipeline(defer_attach=True)
+        # Watches for frames stopping, whatever the cause: no camera,
+        # a device another process is holding, or one unplugged while
+        # running. All of those used to look like a black rectangle.
+        self._wd_timer = GLib.timeout_add_seconds(1, self._signal_watchdog)
 
     # ---------- pipeline ----------
     def _start_pipeline(self, defer_attach=False, on_ready=None):
@@ -2233,7 +2326,86 @@ class LensWindow(Adw.ApplicationWindow):
                 self.zoom_reset.remove_css_class("pill-active")
         self._save_settings()
 
+    def _open_camera_menu(self, *_):
+        """Which cameras exist, right now rather than at startup.
+
+        A camera that was unplugged, or one another process had taken and
+        has since released, is the usual reason for being on this screen,
+        so the list is re-read on every open.
+        """
+        found = list_v4l2_cameras()
+        box = self._menu_box()
+        box.append(self._menu_head("CAMERA"))
+        if not found:
+            row = Gtk.Label(label="No cameras detected")
+            row.add_css_class("menu-dim")
+            row.set_margin_start(12); row.set_margin_end(12)
+            row.set_margin_top(6); row.set_margin_bottom(6)
+            box.append(row)
+        else:
+            for i, (path, name, _sid) in enumerate(found):
+                box.append(self._menu_row(
+                    f"{name}  ({path})", i == self.cam_idx,
+                    lambda n=i: self._pick_camera(n)))
+        box.append(Gtk.Separator())
+        box.append(self._menu_row("Look again", False, self._rescan_cameras,
+                                  icon="view-refresh-symbolic"))
+        self.camera_popover.set_child(box)
+        self.camera_popover.popup()
+
+    def _pick_camera(self, idx):
+        self.camera_popover.popdown()
+        found = list_v4l2_cameras()
+        if not found:
+            return
+        self.cameras = found
+        self.cam_idx = max(0, min(idx, len(found) - 1))
+        self._save_settings()
+        self._start_pipeline()
+
+    def _rescan_cameras(self):
+        self.camera_popover.popdown()
+        found = list_v4l2_cameras()
+        if found:
+            self.cameras = found
+            self.cam_idx = min(self.cam_idx, len(found) - 1)
+        self._start_pipeline()
+
+    def _set_no_signal(self, on, why=""):
+        if bool(on) == bool(getattr(self, "_no_signal_on", False)):
+            return
+        self._no_signal_on = bool(on)
+        self.no_signal.set_visible(on)
+        self.btn_no_signal.set_visible(on)
+        if on and why:
+            print(f"Lens: no signal ({why})", file=sys.stderr)
+
+    def _signal_watchdog(self):
+        """Static whenever frames have stopped arriving.
+
+        Counting frames rather than trusting the pipeline state: a v4l2
+        source another process already holds will happily report PLAYING
+        and then never produce anything, which is exactly the case that
+        used to leave a black rectangle and no explanation.
+        """
+        if self.viewer.get_visible():
+            return True
+        seen = self._frames_total
+        moved = seen != getattr(self, "_wd_last", -1)
+        self._wd_last = seen
+        if moved:
+            self._wd_idle = 0
+        else:
+            self._wd_idle = getattr(self, "_wd_idle", 0) + 1
+        # Three quiet seconds. Long enough to survive a camera swap or the
+        # pipeline rebuild that recording does, short enough to explain
+        # itself before anyone reaches for the mouse.
+        self._set_no_signal(self._wd_idle >= 3,
+                            "no frames" if self._wd_idle >= 3 else "")
+        return True
+
     def _on_frame(self, *_):
+        self._frames_total = getattr(self, "_frames_total", 0) + 1
         self._fps_count += 1
 
     def _freeze_frame(self):
@@ -2338,12 +2510,45 @@ class LensWindow(Adw.ApplicationWindow):
         # rule-of-thirds guide means nothing.
         self.grid_widget = _GridOverlay()
         self.grid_widget.set_visible(False)
+
+        self.no_signal = NoSignal()
+        self.no_signal.set_visible(False)
+        self.no_signal.set_can_target(False)     # the banner takes the click
+        self.btn_no_signal = Gtk.Button(label="NO SIGNAL")
+        self.btn_no_signal.add_css_class("nosignal")
+        self.btn_no_signal.set_halign(Gtk.Align.CENTER)
+        self.btn_no_signal.set_valign(Gtk.Align.CENTER)
+        self.btn_no_signal.set_visible(False)
+        self.btn_no_signal.set_tooltip_text("Click to choose a camera")
+        self.btn_no_signal.connect("clicked", self._open_camera_menu)
+        self.camera_popover = Gtk.Popover()
+        self.camera_popover.set_parent(self.btn_no_signal)
         self.frame_stack = Gtk.Overlay()
-        # The Picture is the measured child. Making it an unmeasured overlay
-        # instead (to stop it re-measuring on a feed swap) left the aspect
-        # frame with a zero-height child, which collapsed the viewfinder into
-        # a permanent band. Not worth it.
-        self.frame_stack.set_child(self.picture)
+        # Nothing about the viewfinder's size may depend on the video. The
+        # measured child is an empty box that expands and asks for nothing,
+        # so the aspect frame sizes purely from the space it is given and
+        # the ratio, and the picture rides along as an overlay.
+        #
+        # Every viewfinder collapse in this project came from the opposite
+        # arrangement: a Picture whose natural size is the paintable's, and
+        # a paintable that reports nothing until its first frame. That is
+        # one bug, and it appeared at startup, on starting a recording, on
+        # stopping one, and again the moment a placeholder smaller than the
+        # window was used to paper over it. Patching each site individually
+        # kept missing the next one.
+        #
+        # An earlier attempt at this left the child with no expand set, so
+        # it measured zero and stayed zero. The expand flags are the whole
+        # trick.
+        self._stage_spacer = Gtk.Box()
+        self._stage_spacer.set_hexpand(True)
+        self._stage_spacer.set_vexpand(True)
+        self.frame_stack.set_child(self._stage_spacer)
+        self.picture.set_hexpand(True)
+        self.picture.set_vexpand(True)
+        self.frame_stack.add_overlay(self.picture)
+        self.frame_stack.add_overlay(self.no_signal)
+        self.frame_stack.add_overlay(self.btn_no_signal)
         self.frame_stack.add_overlay(self.grid_widget)
         self.meter_box = MeterBox()
         self.frame_stack.add_overlay(self.meter_box)
@@ -2619,6 +2824,14 @@ class LensWindow(Adw.ApplicationWindow):
         # ---- Bottom control area ----
         bottom = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         bottom.set_valign(Gtk.Align.END)
+        # Explicitly not expanding. GTK computes expand from descendants, and
+        # act_base inside sets vexpand so it fills the action overlay; that
+        # propagated all the way up here and made the controls compete with
+        # the viewfinder for the spare vertical space, taking half of it and
+        # then drawing only its natural height at the bottom of the slot. It
+        # went unnoticed while the Picture's own natural height was large
+        # enough to win the argument.
+        bottom.set_vexpand(False)
         bottom.add_css_class("bottom-bar")
         # Natural min via child widgets, don't force size — lets window shrink freely
         column.append(bottom)
@@ -2642,6 +2855,7 @@ class LensWindow(Adw.ApplicationWindow):
         act_area = Gtk.Overlay()
         act_area.set_size_request(-1, 160)   # tall enough for the enlarged deck
         act_area.set_margin_top(12); act_area.set_hexpand(True)
+        act_area.set_vexpand(False)
         act_base = Gtk.Box(); act_base.set_hexpand(True); act_base.set_vexpand(True)
         act_area.set_child(act_base)
         bottom.append(act_area)
@@ -3208,6 +3422,13 @@ class LensWindow(Adw.ApplicationWindow):
         .winctl-close:hover { background: #e01b24; }
         .flash-on { color: #ffc107; background: rgba(255,193,7,0.18); }
         .flash-on:hover { background: rgba(255,193,7,0.30); }
+        .nosignal { background: rgba(0,0,0,0.62); color: #e8e8ec;
+                    border: 2px solid rgba(255,255,255,0.55);
+                    border-radius: 3px; padding: 10px 22px;
+                    font-family: monospace; font-size: 19px;
+                    letter-spacing: 5px; font-weight: bold; }
+        .nosignal:hover { background: rgba(0,0,0,0.78);
+                          border-color: rgba(255,255,255,0.85); }
         .zoombar { background: rgba(0,0,0,0.45); border-radius: 20px;
                    padding: 4px 3px; }
         .expbar { background: rgba(255,255,255,0.06);
