@@ -23,6 +23,7 @@ Full-screen black viewfinder, iPhone-style controls:
 | Video capture (MKV / MP4 / WebM) | ✅ |
 | Audio recording (AAC / Opus), unprocessed | ✅ |
 | Camera flip (front / rear / any V4L2 device) | ✅ |
+| NO SIGNAL static when there is no picture, click to pick a camera | ✅ |
 | Self-timer (3s, 10s) | ✅ |
 | Grid overlay (rule of thirds, 2x2) | ✅ |
 | Aspect ratio (4:3, 16:9, 1:1) | ✅ |

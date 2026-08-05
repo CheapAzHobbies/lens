@@ -1859,6 +1859,9 @@ class LensWindow(Adw.ApplicationWindow):
         self.mic_enabled = bool(cfg.get("mic_enabled", True))
         self.mic_gain = float(cfg.get("mic_gain", 1.0))
         self.mic_rate = int(cfg.get("mic_rate", 0)) or 0   # 0 = let it choose
+        # Deliberately off, as opposed to missing. A machine with one
+        # camera, or none, is normal, and so is not wanting it on.
+        self.camera_off = bool(cfg.get("camera_off", False))
         self.denoise = bool(cfg.get("denoise", True))
         self.nr_mix = float(cfg.get("nr_mix", 0.05))
         self.mirror_view = bool(cfg.get("mirror_view", True))
@@ -1934,6 +1937,18 @@ class LensWindow(Adw.ApplicationWindow):
 
     # ---------- pipeline ----------
     def _start_pipeline(self, defer_attach=False, on_ready=None):
+        if getattr(self, "camera_off", False):
+            # Switched off by choice, which is not the same as missing. Tear
+            # down whatever is running and leave the static up rather than
+            # reopening a device the user has said they do not want opened.
+            if self.pipeline:
+                self.pipeline.set_state(Gst.State.NULL)
+                self.pipeline.get_state(2 * Gst.SECOND)
+                self.pipeline = None
+                self.paintable = None
+            self._set_no_signal(True, "camera switched off")
+            self._refresh_flip_button()
+            return
         # Always tear the old one down first. Running two pipelines and
         # swapping paintables out from under a live Picture segfaulted on
         # rapid flips (gdk_device_get_n_axes assertion, then SIGSEGV). The
@@ -2032,6 +2047,14 @@ class LensWindow(Adw.ApplicationWindow):
         file you get are 1200x1200. Reporting the sensor size there was
         simply wrong.
         """
+        if getattr(self, 'camera_off', False):
+            # Switched off by choice. Tear down whatever is running and
+            # leave the static up rather than reopening the device.
+            if self.pipeline:
+                self.pipeline.set_state(Gst.State.NULL)
+                self.pipeline = None
+            self._set_no_signal(True, 'camera switched off')
+            return
         if not self.cur_res:
             return None
         w, h = self.cur_res
@@ -2336,6 +2359,9 @@ class LensWindow(Adw.ApplicationWindow):
         found = list_v4l2_cameras()
         box = self._menu_box()
         box.append(self._menu_head("CAMERA"))
+        box.append(self._menu_row("No camera", self.camera_off,
+                                  self._camera_none))
+        box.append(Gtk.Separator())
         if not found:
             row = Gtk.Label(label="No cameras detected")
             row.add_css_class("menu-dim")
@@ -2345,7 +2371,8 @@ class LensWindow(Adw.ApplicationWindow):
         else:
             for i, (path, name, _sid) in enumerate(found):
                 box.append(self._menu_row(
-                    f"{name}  ({path})", i == self.cam_idx,
+                    f"{name}  ({path})",
+                    (not self.camera_off) and i == self.cam_idx,
                     lambda n=i: self._pick_camera(n)))
         box.append(Gtk.Separator())
         box.append(self._menu_row("Look again", False, self._rescan_cameras,
@@ -2353,14 +2380,33 @@ class LensWindow(Adw.ApplicationWindow):
         self.camera_popover.set_child(box)
         self.camera_popover.popup()
 
+    def _camera_none(self):
+        """Turn the camera off on purpose.
+
+        Distinct from having none: the static says the same thing either way,
+        but this survives a restart and stops anything trying to reopen a
+        device the user has said they do not want opened.
+        """
+        self.camera_popover.popdown()
+        self.camera_off = True
+        self._save_settings()
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline = None
+        self._set_no_signal(True, "camera switched off")
+        self._refresh_flip_button()
+
     def _pick_camera(self, idx):
         self.camera_popover.popdown()
         found = list_v4l2_cameras()
         if not found:
             return
+        self.camera_off = False
+        self._save_settings()
         self.cameras = found
         self.cam_idx = max(0, min(idx, len(found) - 1))
         self._save_settings()
+        self._refresh_flip_button()
         self._start_pipeline()
 
     def _rescan_cameras(self):
@@ -2370,6 +2416,16 @@ class LensWindow(Adw.ApplicationWindow):
             self.cameras = found
             self.cam_idx = min(self.cam_idx, len(found) - 1)
         self._start_pipeline()
+
+    def _refresh_flip_button(self):
+        """Only offer the flip when there is something to flip to.
+
+        A machine with one camera, or none, is ordinary; a button that
+        cycles a list of one is just a button that appears to do nothing.
+        """
+        b = getattr(self, "btn_flip", None)
+        if b is not None:
+            b.set_visible(len(self.cameras) > 1 and not self.camera_off)
 
     def _set_no_signal(self, on, why=""):
         if bool(on) == bool(getattr(self, "_no_signal_on", False)):
@@ -2389,6 +2445,13 @@ class LensWindow(Adw.ApplicationWindow):
         used to leave a black rectangle and no explanation.
         """
         if self.viewer.get_visible():
+            return True
+        if getattr(self, "camera_off", False):
+            # Switched off deliberately. The idle counter is still winding up
+            # from when frames were arriving, so without this the watchdog
+            # spends its first three seconds concluding all is well and
+            # switching the static back off underneath the user's choice.
+            self._set_no_signal(True)
             return True
         seen = self._frames_total
         moved = seen != getattr(self, "_wd_last", -1)
@@ -2544,6 +2607,11 @@ class LensWindow(Adw.ApplicationWindow):
         self._stage_spacer.set_hexpand(True)
         self._stage_spacer.set_vexpand(True)
         self.frame_stack.set_child(self._stage_spacer)
+        # Gtk.Overlay does not clip its overlay children, so a HUD row wider
+        # than the picture will happily draw past the window edge. The fit
+        # below keeps that from happening, but this makes it impossible
+        # rather than merely unlikely.
+        self.frame_stack.set_overflow(Gtk.Overflow.HIDDEN)
         self.picture.set_hexpand(True)
         self.picture.set_vexpand(True)
         self.frame_stack.add_overlay(self.picture)
@@ -3087,6 +3155,11 @@ class LensWindow(Adw.ApplicationWindow):
         # completely dead to the touch. Re-adding raises it back to the front.
         self.frame_stack.remove_overlay(self.zoom_bar)
         self.frame_stack.add_overlay(self.zoom_bar)
+        # And the NO SIGNAL banner, for the same reason. It is the one control
+        # that has to work when nothing else does, and it was sitting under
+        # the HUD: visible, and unclickable.
+        self.frame_stack.remove_overlay(self.btn_no_signal)
+        self.frame_stack.add_overlay(self.btn_no_signal)
         self.hud_timer = None
         self._power_samples = []
 
@@ -3638,6 +3711,7 @@ class LensWindow(Adw.ApplicationWindow):
             "mic_enabled":  self.mic_enabled,
             "mic_gain":     self.mic_gain,
             "mic_rate":     self.mic_rate,
+            "camera_off":   self.camera_off,
             "denoise":      self.denoise,
             "nr_mix":       self.nr_mix,
             "trash_auto":   self.trash_auto,
@@ -4323,6 +4397,12 @@ class LensWindow(Adw.ApplicationWindow):
                     f"{secs // 3600}:{(secs % 3600) // 60:02d}")
             else:
                 self.bat_left_label.set_label("")
+        # The readouts change width as their content does: the battery goes
+        # from '--%' at startup to '83% CHG' a second later, and the clock
+        # appears from nothing. Refitting only on resize meant that growth
+        # was never checked, and the top right corner sat outside the
+        # picture until something else happened to trigger a fit.
+        self._fit_hud()
         return True
 
     def _toggle_maximize(self):
