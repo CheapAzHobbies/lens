@@ -231,11 +231,11 @@ SAVING_MIN_VISIBLE = 7.05
 # Measured in the app with the real style applied: 'Saving' is 58px and
 # each dot adds 10, so 'Saving...' needs 88. It was set to 84, four short,
 # and the label quietly ellipsised itself into looking crushed.
-SAVING_LABEL_W = 132
+SAVING_LABEL_W = 94
 TUX_W, TUX_H = 124, 120
 # Corner size. The bottom strip between the flip button and the window edge
 # is about 50px, so this is close to the ceiling.
-TUX_SMALL_H = 84
+TUX_SMALL_H = 44
 TUX_SMALL_W = round(TUX_W * TUX_SMALL_H / TUX_H)
 
 
@@ -3275,12 +3275,8 @@ class LensWindow(Adw.ApplicationWindow):
         self.saving.add_css_class("saving-chip")
         self.saving.set_halign(Gtk.Align.END)
         self.saving.set_valign(Gtk.Align.END)
-        # Left of the flip button rather than under it. The strip along the
-        # bottom edge is only about 58px tall, which was fine for a 44px
-        # penguin and is not for an 84px one; the band between the shutter
-        # and the flip is the full height of the action area.
-        self.saving.set_margin_end(180)
-        self.saving.set_margin_bottom(24)
+        self.saving.set_margin_end(6)
+        self.saving.set_margin_bottom(3)
         self.tux = Gtk.Picture()
         self.tux.set_size_request(TUX_SMALL_W, TUX_SMALL_H)
         self.tux.set_content_fit(Gtk.ContentFit.CONTAIN)
@@ -3432,7 +3428,7 @@ class LensWindow(Adw.ApplicationWindow):
         .saving-chip { background: rgba(12,12,16,0.82);
                        border-radius: 14px; padding: 4px 6px 4px 12px; }
         /* The sprite carries its own motion, so nothing to animate in CSS. */
-        .saving-text { color: rgba(255,255,255,0.92); font-size: 21px;
+        .saving-text { color: rgba(255,255,255,0.92); font-size: 14px;
                        font-family: monospace; letter-spacing: 2px; }
         .gal { background: #16161a; }
         .gal-bar { background: #16161a; }
@@ -3848,39 +3844,6 @@ class LensWindow(Adw.ApplicationWindow):
             "cam_latency":  self._cam_latency,
         })
 
-    def _fit_saving_chip(self):
-        """Place the chip in the gap between the shutter and the flip button.
-
-        A fixed margin cannot work: the shutter is centred, so the gap moves
-        and shrinks with the window while a fixed offset from the right edge
-        does not. At 960 the two happened to agree and at 820 the chip sat on
-        top of the shutter.
-
-        The gap is measured, the chip is pinned just left of the flip button,
-        and it sheds the caption and then the whole chip as the room runs
-        out. A penguin over the shutter is worse than no penguin.
-        """
-        lbl = getattr(self, "saving_label", None)
-        if lbl is None:
-            return True
-        try:
-            ok1, sh = self.shutter.compute_bounds(self)
-            ok2, fl = self.btn_flip.compute_bounds(self)
-        except Exception:
-            return True
-        if not (ok1 and ok2) or self.get_width() < 2:
-            return True
-        gap = 12
-        band = (fl.origin.x - gap) - (sh.origin.x + sh.size.width + gap)
-        pad = 22                       # the chip's own padding and spacing
-        with_caption = TUX_SMALL_W + SAVING_LABEL_W + pad
-        lbl.set_visible(band >= with_caption)
-        want = with_caption if band >= with_caption else TUX_SMALL_W + pad
-        if band < want:
-            return False               # no room at all
-        self.saving.set_margin_end(int(self.get_width() - (fl.origin.x - gap)))
-        return True
-
     def _show_saving(self, on):
         """Dancing penguin while the file is written.
 
@@ -3909,11 +3872,6 @@ class LensWindow(Adw.ApplicationWindow):
             if getattr(self, "_saving_hide", None):
                 GLib.source_remove(self._saving_hide)
                 self._saving_hide = None
-            if not self._fit_saving_chip():
-                # Nowhere to put it. Better nothing than a penguin sitting on
-                # the shutter button.
-                self.saving.set_visible(False)
-                return
             if getattr(self, "_saving_timer", None):
                 # Already dancing. Stop here and let it carry on: the clock
                 # above has been reset, so the hold extends. Falling through
