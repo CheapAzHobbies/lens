@@ -5,6 +5,7 @@ GTK4 + libadwaita + GStreamer.
 """
 
 import gi, os, re, sys, math, json, time, datetime, pathlib, tempfile
+import subprocess
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Gst", "1.0")
@@ -1862,6 +1863,12 @@ class LensWindow(Adw.ApplicationWindow):
         # Deliberately off, as opposed to missing. A machine with one
         # camera, or none, is normal, and so is not wanting it on.
         self.camera_off = bool(cfg.get("camera_off", False))
+        # UVC cameras will quietly drop to a fraction of their rated frame
+        # rate to hold the shutter open longer in dim light. Measured on this
+        # machine in a normally lit room: 7.4fps with it on, 29.9 with it off.
+        # A viewfinder at 7fps looks broken, so smooth is the default and the
+        # trade is offered rather than hidden.
+        self.smooth_motion = bool(cfg.get("smooth_motion", True))
         self.denoise = bool(cfg.get("denoise", True))
         self.nr_mix = float(cfg.get("nr_mix", 0.05))
         self.mirror_view = bool(cfg.get("mirror_view", True))
@@ -1963,6 +1970,10 @@ class LensWindow(Adw.ApplicationWindow):
             self.pipeline = None
             self.paintable = None
 
+        # Set before the caps are negotiated: the sensor decides its rate
+        # when the stream starts, so changing this afterwards has no effect
+        # until the next start.
+        self._apply_frame_rate_policy()
         dev = self.cameras[self.cam_idx][0]
         src = self._source_for(dev)
         # Preview branch + photo-capture branch, both fed by the same v4l2src via tee.
@@ -2216,6 +2227,25 @@ class LensWindow(Adw.ApplicationWindow):
                                capture_output=True, timeout=1)
             except Exception:
                 return
+
+    def _apply_frame_rate_policy(self):
+        """Let the sensor slow down for light, or hold it to its rated rate.
+
+        exposure_dynamic_framerate is the UVC control for this. It is on by
+        default on both cameras here, which is why the preview sat at 7fps
+        in a dim room while every resolution and both devices reported the
+        same number: the cap is exposure, not bandwidth.
+        """
+        if not self.cameras or self.camera_off:
+            return
+        dev = self.cameras[self.cam_idx][0]
+        want = "0" if self.smooth_motion else "1"
+        try:
+            subprocess.run(["v4l2-ctl", "-d", dev, "-c",
+                            f"exposure_dynamic_framerate={want}"],
+                           capture_output=True, timeout=1.5)
+        except Exception:
+            pass
 
     def _apply_mirror(self):
         """Point the flip elements at the current setting.
@@ -3720,6 +3750,7 @@ class LensWindow(Adw.ApplicationWindow):
             "mic_gain":     self.mic_gain,
             "mic_rate":     self.mic_rate,
             "camera_off":   self.camera_off,
+            "smooth_motion": self.smooth_motion,
             "denoise":      self.denoise,
             "nr_mix":       self.nr_mix,
             "trash_auto":   self.trash_auto,
@@ -4817,6 +4848,7 @@ class LensWindow(Adw.ApplicationWindow):
         # Zooming crops, so without a scale back up the encoded size would
         # change the moment you touched the zoom mid-take, renegotiating caps
         # under a running encoder. Lock it to what the frame is now.
+        self._apply_frame_rate_policy()
         rw, rh = self.cur_res or (1280, 720)
         rw -= rw % 2
         rh -= rh % 2
@@ -4829,9 +4861,20 @@ class LensWindow(Adw.ApplicationWindow):
         self.pipeline = Gst.parse_launch(
             f"{self._source_for(dev)} ! videocrop name=zoom ! "
             f"videobalance name=vb ! coloreffects name=fx ! tee name=t "
-            f"t. ! queue ! videoflip name=mirror ! videoconvert ! "
+            # The display branch leaks, exactly as it does in standby. With a
+            # plain queue it shared the encoder's backpressure and the
+            # viewfinder fell to about 7fps while the file itself was fine:
+            # the preview is the one place where dropping a late frame is
+            # always the right answer, since nobody is going to watch it back.
+            f"t. ! queue max-size-buffers=2 leaky=downstream ! "
+            f"videoflip name=mirror ! videoconvert ! "
             f"gtk4paintablesink name=sink "
-            f"t. ! queue max-size-buffers=8 ! videoflip name=recmirror ! "
+            # The encode branch deliberately does NOT leak. Dropping a frame
+            # from the preview is free; dropping one from the file is not,
+            # and a viewfinder stutter is the right price for a complete
+            # recording.
+            f"t. ! queue max-size-buffers=12 ! "
+            f"videoflip name=recmirror ! "
             f"videoscale ! video/x-raw,width={rw},height={rh} ! "
             f"videoconvert ! {venc} ! "
             f"queue ! mux. "
@@ -5269,6 +5312,20 @@ class LensWindow(Adw.ApplicationWindow):
         rb.connect("clicked", do_rescan)
         rescan.add_suffix(rb)
         grpc.add(rescan)
+
+        smooth = Adw.SwitchRow(title="Smooth motion")
+        smooth.set_subtitle(
+            "Hold the camera to its full frame rate. Off lets it slow down "
+            "in dim light for a brighter picture: measured here, 30fps "
+            "against 7")
+        smooth.set_active(self.smooth_motion)
+
+        def smooth_done(row, *_):
+            self.smooth_motion = row.get_active()
+            self._save_settings()
+            self._start_pipeline()      # the rate is fixed at stream start
+        smooth.connect("notify::active", smooth_done)
+        grpc.add(smooth)
         page.add(grpc)
 
         grpv = Adw.PreferencesGroup(title="Viewfinder")

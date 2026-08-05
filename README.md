@@ -19,6 +19,7 @@ Full-screen black viewfinder, iPhone-style controls:
 | Feature | Status |
 |---|---|
 | Live viewfinder | ✅ |
+| Smooth motion: holds the sensor to its rated frame rate in dim light | ✅ |
 | Photo capture (JPEG, up to 8MP) | ✅ |
 | Video capture (MKV / MP4 / WebM) | ✅ |
 | Audio recording (AAC / Opus), unprocessed | ✅ |
