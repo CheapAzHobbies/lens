@@ -2424,8 +2424,17 @@ class LensWindow(Adw.ApplicationWindow):
         cycles a list of one is just a button that appears to do nothing.
         """
         b = getattr(self, "btn_flip", None)
-        if b is not None:
-            b.set_visible(len(self.cameras) > 1 and not self.camera_off)
+        if b is None:
+            return
+        # Always present and always sensitive. Hiding it when there was
+        # nothing to flip to also hid the only way of reaching the camera
+        # menu, which is where 'no camera' lives. With fewer than two
+        # cameras a tap opens the menu rather than cycling a list of one.
+        b.set_visible(True)
+        b.set_sensitive(True)
+        many = len(self.cameras) > 1 and not self.camera_off
+        b.set_tooltip_text("Switch camera (hold to choose)" if many
+                           else "Choose a camera")
 
     def _set_no_signal(self, on, why=""):
         if bool(on) == bool(getattr(self, "_no_signal_on", False)):
@@ -2974,8 +2983,7 @@ class LensWindow(Adw.ApplicationWindow):
         self._flip_shut = False
         self._flip_ready = False
         self._flip_commit = None
-        self.btn_flip.set_sensitive(len(self.cameras) > 1)
-        self.btn_flip.connect("clicked", lambda *_: self._flip_camera())
+        self.btn_flip.connect("clicked", lambda *_: self._flip_or_choose())
         self.btn_flip.set_tooltip_text("Switch camera (hold to choose)")
 
         # Hold to pick a specific camera. Tapping cycles, which is fine for
@@ -4438,14 +4446,23 @@ class LensWindow(Adw.ApplicationWindow):
         head.set_margin_bottom(4)
         box.append(head)
 
-        for i, cam in enumerate(self.cameras):
+        # Off is a choice, not just a failure. It has to live here because
+        # this is the menu people actually find: the other route to it was
+        # the NO SIGNAL banner, which you can only see once you already have
+        # no signal, so there was no way in.
+        entries = [(None, "No camera")] + [
+            (i, cam[1].split(":")[0].strip() or cam[0])
+            for i, cam in enumerate(self.cameras)]
+        for i, name in entries:
             # Card names carry a redundant "USB2.0 HD UVC WebCam: USB2.0 HD"
             # style repeat, so keep the part before the colon.
-            name = cam[1].split(":")[0].strip() or cam[0]
             row = Gtk.Button()
             inner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            chosen = (i is None and self.camera_off) or \
+                     (i is not None and not self.camera_off and i == self.cam_idx)
             tick = Gtk.Image.new_from_icon_name(
-                "object-select-symbolic" if i == self.cam_idx else "camera-photo-symbolic")
+                "object-select-symbolic" if chosen else
+                ("camera-disabled-symbolic" if i is None else "camera-photo-symbolic"))
             tick.set_pixel_size(14)
             lbl = Gtk.Label(label=name)
             lbl.set_halign(Gtk.Align.START); lbl.set_hexpand(True)
@@ -4454,7 +4471,7 @@ class LensWindow(Adw.ApplicationWindow):
             inner.append(tick); inner.append(lbl)
             row.set_child(inner)
             row.add_css_class("cam-row")
-            if i == self.cam_idx:
+            if chosen:
                 row.add_css_class("cam-row-active")
             row.connect("clicked", lambda _b, idx=i: self._select_camera(idx))
             box.append(row)
@@ -4462,8 +4479,28 @@ class LensWindow(Adw.ApplicationWindow):
         self.cam_popover.set_child(box)
         self.cam_popover.popup()
 
+    def _flip_or_choose(self):
+        """Cycle when there is somewhere to cycle to, otherwise offer the list."""
+        if len(self.cameras) > 1 and not self.camera_off:
+            self._flip_camera()
+        else:
+            self._show_camera_menu()
+
     def _select_camera(self, idx):
         self.cam_popover.popdown()
+        if idx is None:
+            self._camera_none()
+            return
+        if self.camera_off:
+            # Coming back from off: there is no running pipeline to animate
+            # a flip out of, so just start the one that was asked for.
+            self.camera_off = False
+            self.cam_idx = max(0, min(idx, len(self.cameras) - 1))
+            self._save_settings()
+            self._refresh_flip_button()
+            self._set_no_signal(False)
+            self._start_pipeline()
+            return
         if idx == self.cam_idx or self._flipping:
             return
         # Reuse the flip animation, just aimed at a specific camera.
