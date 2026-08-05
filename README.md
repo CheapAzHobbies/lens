@@ -37,7 +37,7 @@ Full-screen black viewfinder, iPhone-style controls:
 | Camcorder HUD, interactive | ✅ |
 | Gallery: browse, crop, rotate, mirror, rename | ✅ |
 | Trash with a recycle bin, its own folder, optional auto-purge | ✅ |
-| Settings: folders, naming, mic level and rate, mirroring, retention | ✅ |
+| Settings: camera, folders, naming, mic level and rate, mirroring, retention | ✅ |
 | Audio diagnostics: shows hardware vs software gain, format, processing | ✅ |
 | Touch gestures (swipe = flip, pinch = zoom) | 🚧 planned |
 | Subtitles from speech | 🚧 planned |

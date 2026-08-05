@@ -5202,6 +5202,67 @@ class LensWindow(Adw.ApplicationWindow):
         rows["backend"].add_suffix(btn)
         page.add(grpd)
 
+        grpc = Adw.PreferencesGroup(
+            title="Camera",
+            description="Off is a choice, not only what happens when there "
+                        "is nothing plugged in")
+        cams = list_v4l2_cameras()
+        cam_names = ["No camera"] + [c[1].split(":")[0].strip() or c[0] for c in cams]
+        cam_row = Adw.ComboRow(title="Use")
+        cam_row.set_model(Gtk.StringList.new(cam_names))
+        cam_row.set_selected(0 if self.camera_off
+                             else min(self.cam_idx + 1, len(cam_names) - 1))
+
+        def cam_sub():
+            if self.camera_off:
+                cam_row.set_subtitle("The device is closed and nothing will reopen it")
+            elif cams:
+                cam_row.set_subtitle(cams[min(self.cam_idx, len(cams) - 1)][0])
+            else:
+                cam_row.set_subtitle("No cameras detected")
+        cam_sub()
+
+        def cam_done(row, *_):
+            sel = row.get_selected()
+            # Guarded: setting the model or the selection below fires this
+            # again, and re-entering would restart the pipeline mid-restart.
+            if getattr(self, "_cam_row_busy", False):
+                return
+            self._cam_row_busy = True
+            try:
+                self._select_camera(None if sel == 0 else sel - 1)
+                cam_sub()
+            finally:
+                self._cam_row_busy = False
+        cam_row.connect("notify::selected", cam_done)
+        grpc.add(cam_row)
+
+        rescan = Adw.ActionRow(title="Look for cameras again")
+        rescan.set_subtitle("For one plugged in, or freed by another app, "
+                            "since Lens started")
+        rb = Gtk.Button(label="Rescan")
+        rb.set_valign(Gtk.Align.CENTER)
+
+        def do_rescan(*_):
+            found = list_v4l2_cameras()
+            names = ["No camera"] + [c[1].split(":")[0].strip() or c[0] for c in found]
+            if found:
+                self.cameras = found
+                self.cam_idx = min(self.cam_idx, len(found) - 1)
+            self._cam_row_busy = True
+            try:
+                cam_row.set_model(Gtk.StringList.new(names))
+                cam_row.set_selected(0 if self.camera_off
+                                     else min(self.cam_idx + 1, len(names) - 1))
+            finally:
+                self._cam_row_busy = False
+            rescan.set_subtitle(f"Found {len(found)} camera(s)")
+            self._refresh_flip_button()
+        rb.connect("clicked", do_rescan)
+        rescan.add_suffix(rb)
+        grpc.add(rescan)
+        page.add(grpc)
+
         grpv = Adw.PreferencesGroup(title="Viewfinder")
         mir = Adw.SwitchRow(title="Mirror the preview")
         mir.set_subtitle("Move left and your image moves left, the way a "
