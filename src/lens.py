@@ -2357,12 +2357,43 @@ class LensWindow(Adw.ApplicationWindow):
             tb.queue_draw()
 
         def finish():
-            self.set_rotation_for_current(self.rotation_for_current() + deg)
-            tb.angle, tb.scale = 0.0, 1.0
-            tb.queue_draw()
-            self.frame_stack.set_overflow(Gtk.Overflow.HIDDEN)
-            self._hide_hud_for_move(False)
-            self._view_anim = False
+            # Tell the pipeline to rotate, but keep showing the turned old
+            # frame until a turned new one has actually arrived. Dropping the
+            # transform here instead drew whatever buffer was already on
+            # screen, still in its old orientation, into the new geometry:
+            # a frame or two of the picture flipped the wrong way before it
+            # settled.
+            cid = self._current_cam_id()
+            if cid is not None:
+                self.rotation_map[cid] = (self.rotation_for_current() + deg) % 360
+                self._save_settings()
+            self._apply_mirror()
+            state = {"done": False, "seen": 0, "h": None}
+
+            def commit(*_):
+                if state["done"]:
+                    return False
+                # The display queue holds a couple of buffers, so the first
+                # frame after the change can still be an old one.
+                state["seen"] += 1
+                if state["seen"] < 2 and _:
+                    return False
+                state["done"] = True
+                if state["h"] is not None and self.paintable is not None:
+                    try:
+                        self.paintable.disconnect(state["h"])
+                    except Exception:
+                        pass
+                self._apply_view_aspect()
+                tb.angle, tb.scale = 0.0, 1.0
+                tb.queue_draw()
+                self.frame_stack.set_overflow(Gtk.Overflow.HIDDEN)
+                self._hide_hud_for_move(False)
+                self._view_anim = False
+                return False
+            if self.paintable is not None:
+                state["h"] = self.paintable.connect("invalidate-contents", commit)
+            GLib.timeout_add(500, commit)   # if no frame ever comes
         self._drive_view(420, step, finish)
 
     def _flip_view(self, horizontal=False):
