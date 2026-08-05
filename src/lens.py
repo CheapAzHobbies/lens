@@ -2274,17 +2274,41 @@ class LensWindow(Adw.ApplicationWindow):
     def mirror_for_current(self):
         """Whether this camera's preview is mirrored, left to right.
 
-        On by default for every camera. A first guess at this tried to be
-        clever, mirroring only whichever camera had the lower resolution on
-        the theory that it was the selfie one, and it was wrong on this
-        machine: both wanted it. Mirrored is also the behaviour people expect
-        from a camera app, since it is what every phone and every video call
-        does, and it is per camera for the cases where it is not.
+        Mirrored for the camera pointing at you, not for the one pointing
+        away. A selfie view unmirrored feels wrong because you move one way
+        and your image goes the other; a rear view mirrored is simply wrong,
+        and any writing in shot gives it away.
+
+        Nothing in V4L2 says which is which, so it is inferred from
+        resolution: the lower one on a machine is almost always the selfie
+        camera. On this machine that is the 0.9MP front against the 8MP rear,
+        and it picks both correctly.
+
+        This was here, then removed on my misreading of a report that the
+        rear was wrong, then restored when Bao flipped the rear by hand and
+        the saved setting turned out to be exactly what the heuristic had
+        been producing. It is a guess, which is why the per-camera switch
+        overrides it.
         """
         cid = self._current_cam_id()
         if cid is None:
             return False
-        return bool(self.mirror_map.get(cid, True))
+        if cid in self.mirror_map:
+            return bool(self.mirror_map[cid])
+        return self._guess_is_selfie(self.cam_idx)
+
+    def _guess_is_selfie(self, idx):
+        """The smaller sensor, when there is more than one to compare."""
+        try:
+            areas = []
+            for path, _n, _s in self.cameras:
+                mode = best_still_mode(path) or (0, 0)
+                areas.append(mode[0] * mode[1])
+            if len(areas) < 2 or max(areas) == min(areas):
+                return True          # only one camera: assume it faces you
+            return areas[idx] == min(areas)
+        except Exception:
+            return True
 
     def rotation_for_current(self):
         cid = self._current_cam_id()
@@ -2299,13 +2323,19 @@ class LensWindow(Adw.ApplicationWindow):
         self._apply_view_aspect()
 
     def _rotate_view(self, deg):
-        """Turn the viewfinder, morphing its shape as it goes.
+        """Turn the viewfinder, landing exactly on its new shape.
 
-        The frame has to change shape along with the turn. Setting the new
-        ratio at the end instead made the picture shrink through the
-        rotation and then snap out to its new size in one frame, which is
-        the jolt at the end of the move. Interpolating the ratio on the same
-        curve means the box is always the shape the picture currently is.
+        The frame stays put for the duration and changes shape in the same
+        frame the transform is released. That is not a compromise: the fit
+        scale at ninety degrees is the scale that makes the turned picture
+        precisely the size the new frame will give it, so the two agree and
+        nothing moves at the handover.
+
+        Interpolating the frame's ratio through the turn seems like the
+        smoother idea and is worse. The fit is measured against the frame,
+        so morphing it underneath means the picture is scaled down by the
+        transform and squeezed by the frame at the same time, and it shrinks
+        to about half what it should mid-turn.
         """
         if getattr(self, "_view_anim", False):
             return
@@ -2314,14 +2344,8 @@ class LensWindow(Adw.ApplicationWindow):
         tb = self.cam_tbox
         a = self.picture.get_allocation()
         w, h = a.width or 1, a.height or 1
-        r0 = self.aspect_frame.get_ratio()
-        r1 = 1.0 / r0 if (deg // 90) % 2 else r0
-
         def step(e):
             tb.angle = deg * e
-            # Geometric, so halfway through a 4:3 to 3:4 turn is square
-            # rather than the arithmetic mean, which favours the wider one.
-            self.aspect_frame.set_ratio(r0 * (r1 / r0) ** e)
             tb.scale = self._view_fit(w, h, tb.angle)
             tb.queue_draw()
 
