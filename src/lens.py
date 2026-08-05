@@ -4853,6 +4853,14 @@ class LensWindow(Adw.ApplicationWindow):
         # the Picture a zero intrinsic size, which collapsed the viewfinder to
         # half height for about 200ms every time recording started. The
         # preview path already deferred for this reason; this one did not.
+        #
+        # Count frames off this paintable as well. Only the preview pipeline
+        # did, so the frame counter froze the moment recording started, and
+        # three seconds later the watchdog announced NO SIGNAL over a
+        # recording that was working perfectly and saved perfectly. The
+        # counter also feeds the HUD's fps readout, which was reading zero
+        # for the same reason.
+        new_paintable.connect("invalidate-contents", self._on_frame)
         if frozen is not None:
             state = {"done": False}
 
