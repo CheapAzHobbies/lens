@@ -2408,6 +2408,11 @@ class LensWindow(Adw.ApplicationWindow):
         box.append(self._menu_row("Look again", False, self._rescan_cameras,
                                   icon="view-refresh-symbolic"))
         self.camera_popover.set_child(box)
+        ok, r = self.btn_no_signal.compute_bounds(self.frame_stack)
+        if ok:
+            self.camera_popover.set_pointing_to(
+                Gdk.Rectangle(x=int(r.origin.x), y=int(r.origin.y),
+                              width=int(r.size.width), height=int(r.size.height)))
         self.camera_popover.popup()
 
     def _camera_none(self):
@@ -2624,7 +2629,6 @@ class LensWindow(Adw.ApplicationWindow):
         self.btn_no_signal.set_tooltip_text("Click to choose a camera")
         self.btn_no_signal.connect("clicked", self._open_camera_menu)
         self.camera_popover = Gtk.Popover()
-        self.camera_popover.set_parent(self.btn_no_signal)
         self.frame_stack = Gtk.Overlay()
         # Nothing about the viewfinder's size may depend on the video. The
         # measured child is an empty box that expands and asks for nothing,
@@ -2654,6 +2658,12 @@ class LensWindow(Adw.ApplicationWindow):
         self.picture.set_hexpand(True)
         self.picture.set_vexpand(True)
         self.frame_stack.add_overlay(self.picture)
+        # Parent the camera menu to the viewfinder, not to the banner. GTK CSS
+        # inherits, and the banner carries letter-spacing 5px in bold
+        # monospace to look like a tube caption, which the menu inside it
+        # then inherited: every entry came out stretched and wrong. It still
+        # points at the banner.
+        self.camera_popover.set_parent(self.frame_stack)
         self.frame_stack.add_overlay(self.no_signal)
         self.frame_stack.add_overlay(self.btn_no_signal)
         self.frame_stack.add_overlay(self.grid_widget)
