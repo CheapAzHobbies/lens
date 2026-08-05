@@ -2408,13 +2408,23 @@ class LensWindow(Adw.ApplicationWindow):
     def _view_fit(self, w, h, deg):
         """Largest scale at which the turning picture still fits.
 
-        Measured against the frame's size right now, which is changing
-        underneath this as the ratio interpolates.
+        Measured against the whole area the viewfinder has, not against the
+        aspect-constrained frame inside it. Using the frame works turning a
+        wide picture into a tall one, because the frame's height is the
+        binding constraint either way, and fails badly in the other
+        direction: a portrait frame is narrow, so the turning picture was
+        squeezed to fit a width it was about to stop needing, ending the
+        turn at 200x112 and then leaping to 633x356 in a single frame.
+
+        Against the full area the scale is free to pass 1.0, which is what
+        growing into a wider shape requires, and it lands exactly on the new
+        frame in both directions.
         """
         a = math.radians(deg)
         c, sn = abs(math.cos(a)), abs(math.sin(a))
         bw, bh = w * c + h * sn, w * sn + h * c
-        sw, sh = self.frame_stack.get_width(), self.frame_stack.get_height()
+        av = self.aspect_frame.get_allocation()
+        sw, sh = av.width, av.height
         if min(bw, bh, sw, sh) <= 0:
             return 1.0
         return min(sw / bw, sh / bh)
