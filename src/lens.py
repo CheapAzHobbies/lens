@@ -231,11 +231,11 @@ SAVING_MIN_VISIBLE = 7.05
 # Measured in the app with the real style applied: 'Saving' is 58px and
 # each dot adds 10, so 'Saving...' needs 88. It was set to 84, four short,
 # and the label quietly ellipsised itself into looking crushed.
-SAVING_LABEL_W = 94
+SAVING_LABEL_W = 132
 TUX_W, TUX_H = 124, 120
 # Corner size. The bottom strip between the flip button and the window edge
 # is about 50px, so this is close to the ceiling.
-TUX_SMALL_H = 44
+TUX_SMALL_H = 84
 TUX_SMALL_W = round(TUX_W * TUX_SMALL_H / TUX_H)
 
 
@@ -1873,7 +1873,17 @@ class LensWindow(Adw.ApplicationWindow):
         self.smooth_motion = bool(cfg.get("smooth_motion", True))
         self.denoise = bool(cfg.get("denoise", True))
         self.nr_mix = float(cfg.get("nr_mix", 0.05))
-        self.mirror_view = bool(cfg.get("mirror_view", True))
+        # Per camera, because it is only ever right for one of them. A selfie
+        # camera unmirrored feels wrong: you move one way and your image goes
+        # the other. A rear camera mirrored is simply wrong, and it took
+        # seeing a foot on the wrong side to notice, because a face is
+        # symmetrical enough to hide it.
+        #
+        # Keyed by the stable device id rather than the index, so unplugging
+        # something does not silently hand one camera another's setting.
+        self.mirror_map = dict(cfg.get("mirror_map") or {})
+        # Kept for machines set up before this was per-camera.
+        self._mirror_legacy = bool(cfg.get("mirror_view", True))
         self.mirror_saved = bool(cfg.get("mirror_saved", False))
         self.exposure_auto = True
         self.exposure_val = None
@@ -2249,14 +2259,55 @@ class LensWindow(Adw.ApplicationWindow):
         except Exception:
             pass
 
+    def _current_cam_id(self):
+        if not self.cameras:
+            return None
+        cam = self.cameras[max(0, min(self.cam_idx, len(self.cameras) - 1))]
+        return cam[2] or cam[0]
+
+    def mirror_for_current(self):
+        """Whether this camera's preview is mirrored.
+
+        Defaults by a heuristic when a camera has not been seen before: the
+        lower-resolution one on a machine is almost always the selfie camera,
+        and that is the one that wants mirroring. It is a guess, which is why
+        it is a per-camera setting rather than a fixed rule.
+        """
+        cid = self._current_cam_id()
+        if cid is None:
+            return False
+        if cid in self.mirror_map:
+            return bool(self.mirror_map[cid])
+        return self._guess_is_selfie(self.cam_idx)
+
+    def _guess_is_selfie(self, idx):
+        try:
+            areas = []
+            for path, _n, _s in self.cameras:
+                mode = best_still_mode(path) or (0, 0)
+                areas.append(mode[0] * mode[1])
+            if len(areas) < 2 or max(areas) == min(areas):
+                return False
+            return areas[idx] == min(areas)
+        except Exception:
+            return False
+
+    def set_mirror_for_current(self, on):
+        cid = self._current_cam_id()
+        if cid is not None:
+            self.mirror_map[cid] = bool(on)
+            self._save_settings()
+        self._apply_mirror()
+
     def _apply_mirror(self):
         """Point the flip elements at the current setting.
 
         method is live, so this costs nothing and needs no rebuild.
         """
-        for name, on in (("mirror", self.mirror_view),
-                         ("savemirror", self.mirror_view and self.mirror_saved),
-                         ("recmirror", self.mirror_view and self.mirror_saved)):
+        mv = self.mirror_for_current()
+        for name, on in (("mirror", mv),
+                         ("savemirror", mv and self.mirror_saved),
+                         ("recmirror", mv and self.mirror_saved)):
             el = self.pipeline.get_by_name(name) if self.pipeline else None
             if el is not None:
                 el.set_property("method", 4 if on else 0)   # 4 = horizontal-flip
@@ -2343,7 +2394,7 @@ class LensWindow(Adw.ApplicationWindow):
             # moves left. Mirrored, that reverses: the flip happens after the
             # crop, so moving the window right makes the image travel right on
             # screen rather than left.
-            sign = -1.0 if self.mirror_view else 1.0
+            sign = -1.0 if self.mirror_for_current() else 1.0
             self.pan_x -= sign * 2.0 * (dx * (w / z) / vw) / mx
         if my > 0:
             self.pan_y -= 2.0 * (dy * (h / z) / vh) / my
@@ -3224,8 +3275,12 @@ class LensWindow(Adw.ApplicationWindow):
         self.saving.add_css_class("saving-chip")
         self.saving.set_halign(Gtk.Align.END)
         self.saving.set_valign(Gtk.Align.END)
-        self.saving.set_margin_end(6)
-        self.saving.set_margin_bottom(3)
+        # Left of the flip button rather than under it. The strip along the
+        # bottom edge is only about 58px tall, which was fine for a 44px
+        # penguin and is not for an 84px one; the band between the shutter
+        # and the flip is the full height of the action area.
+        self.saving.set_margin_end(180)
+        self.saving.set_margin_bottom(24)
         self.tux = Gtk.Picture()
         self.tux.set_size_request(TUX_SMALL_W, TUX_SMALL_H)
         self.tux.set_content_fit(Gtk.ContentFit.CONTAIN)
@@ -3377,7 +3432,7 @@ class LensWindow(Adw.ApplicationWindow):
         .saving-chip { background: rgba(12,12,16,0.82);
                        border-radius: 14px; padding: 4px 6px 4px 12px; }
         /* The sprite carries its own motion, so nothing to animate in CSS. */
-        .saving-text { color: rgba(255,255,255,0.92); font-size: 14px;
+        .saving-text { color: rgba(255,255,255,0.92); font-size: 21px;
                        font-family: monospace; letter-spacing: 2px; }
         .gal { background: #16161a; }
         .gal-bar { background: #16161a; }
@@ -3595,6 +3650,7 @@ class LensWindow(Adw.ApplicationWindow):
                    box-shadow: 0 0 8px rgba(255,59,48,0.9);
                    transition: opacity 180ms ease-out; }
         .rec-dot.blink   { opacity: 0.15; }
+        .hud-mono.blink  { opacity: 0.25; }
         .rec-dot.standby { background: rgba(255,255,255,0.55);
                            box-shadow: none; opacity: 1; }
         .rec-time { color: white; font-family: monospace; font-size: 14px;
@@ -3774,7 +3830,7 @@ class LensWindow(Adw.ApplicationWindow):
             "nr_mix":       self.nr_mix,
             "trash_auto":   self.trash_auto,
             "trash_path":   self.trash_path,
-            "mirror_view":  self.mirror_view,
+            "mirror_map":   self.mirror_map,
             "mirror_saved": self.mirror_saved,
             "container":    self.container,
             "pic_dir":      str(self.pic_dir),
@@ -3791,6 +3847,39 @@ class LensWindow(Adw.ApplicationWindow):
             "cam_id":       self.cameras[self.cam_idx][2],
             "cam_latency":  self._cam_latency,
         })
+
+    def _fit_saving_chip(self):
+        """Place the chip in the gap between the shutter and the flip button.
+
+        A fixed margin cannot work: the shutter is centred, so the gap moves
+        and shrinks with the window while a fixed offset from the right edge
+        does not. At 960 the two happened to agree and at 820 the chip sat on
+        top of the shutter.
+
+        The gap is measured, the chip is pinned just left of the flip button,
+        and it sheds the caption and then the whole chip as the room runs
+        out. A penguin over the shutter is worse than no penguin.
+        """
+        lbl = getattr(self, "saving_label", None)
+        if lbl is None:
+            return True
+        try:
+            ok1, sh = self.shutter.compute_bounds(self)
+            ok2, fl = self.btn_flip.compute_bounds(self)
+        except Exception:
+            return True
+        if not (ok1 and ok2) or self.get_width() < 2:
+            return True
+        gap = 12
+        band = (fl.origin.x - gap) - (sh.origin.x + sh.size.width + gap)
+        pad = 22                       # the chip's own padding and spacing
+        with_caption = TUX_SMALL_W + SAVING_LABEL_W + pad
+        lbl.set_visible(band >= with_caption)
+        want = with_caption if band >= with_caption else TUX_SMALL_W + pad
+        if band < want:
+            return False               # no room at all
+        self.saving.set_margin_end(int(self.get_width() - (fl.origin.x - gap)))
+        return True
 
     def _show_saving(self, on):
         """Dancing penguin while the file is written.
@@ -3814,11 +3903,17 @@ class LensWindow(Adw.ApplicationWindow):
             if getattr(self, "_saving_hide", None):
                 GLib.source_remove(self._saving_hide)
                 self._saving_hide = None
+            self.rec_state_label.remove_css_class("blink")
         else:
             self._saving_since = time.monotonic()
             if getattr(self, "_saving_hide", None):
                 GLib.source_remove(self._saving_hide)
                 self._saving_hide = None
+            if not self._fit_saving_chip():
+                # Nowhere to put it. Better nothing than a penguin sitting on
+                # the shutter button.
+                self.saving.set_visible(False)
+                return
             if getattr(self, "_saving_timer", None):
                 # Already dancing. Stop here and let it carry on: the clock
                 # above has been reset, so the hold extends. Falling through
@@ -3846,10 +3941,18 @@ class LensWindow(Adw.ApplicationWindow):
                         frames[self._saving_frame % len(frames)])
                 # The dots run slower than the sprite, so they read as a
                 # count rather than a flicker.
-                dots = (self._saving_frame // 5) % 4
+                dots = (self._saving_frame // 8) % 4
                 if dots != self._saving_dots:
                     self._saving_dots = dots
                     self.saving_label.set_label("Saving" + "." * dots)
+                # SAVE in the corner blinks along with it. A recording that
+                # has stopped shows a state word that never changes, which
+                # reads as frozen rather than busy.
+                on = (self._saving_frame // 6) % 2 == 0
+                if on:
+                    self.rec_state_label.remove_css_class("blink")
+                else:
+                    self.rec_state_label.add_css_class("blink")
                 return True
             self._saving_timer = GLib.timeout_add(TUX_MS, tick)
         elif getattr(self, "_saving_timer", None):
@@ -5348,23 +5451,25 @@ class LensWindow(Adw.ApplicationWindow):
         page.add(grpc)
 
         grpv = Adw.PreferencesGroup(title="Viewfinder")
+        cam_label = "this camera"
+        if self.cameras:
+            cam_label = (self.cameras[min(self.cam_idx, len(self.cameras) - 1)][1]
+                         .split(":")[0].strip() or "this camera")
         mir = Adw.SwitchRow(title="Mirror the preview")
-        mir.set_subtitle("Move left and your image moves left, the way a "
-                         "mirror behaves. Only changes what you see")
-        mir.set_active(self.mirror_view)
+        mir.set_subtitle(f"Applies to {cam_label} only. Right for a camera "
+                         f"pointing at you, wrong for one pointing away")
+        mir.set_active(self.mirror_for_current())
 
         mir_save = Adw.SwitchRow(title="Mirror what gets saved too")
         mir_save.set_subtitle("Off keeps files the way the room really was. "
                               "On matches the preview, but writing in shot "
                               "will read backwards")
         mir_save.set_active(self.mirror_saved)
-        mir_save.set_sensitive(self.mirror_view)
+        mir_save.set_sensitive(self.mirror_for_current())
 
         def mir_done(row, *_):
-            self.mirror_view = row.get_active()
-            mir_save.set_sensitive(self.mirror_view)
-            self._apply_mirror()
-            self._save_settings()
+            self.set_mirror_for_current(row.get_active())
+            mir_save.set_sensitive(row.get_active())
 
         def mir_save_done(row, *_):
             self.mirror_saved = row.get_active()

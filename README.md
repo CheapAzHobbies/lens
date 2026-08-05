@@ -33,7 +33,7 @@ Full-screen black viewfinder, iPhone-style controls:
 | Filters (mono, vivid, warm, cool, sepia, x-ray, cross) | ✅ |
 | Screen flash for low light | ✅ |
 | Tap to meter | ✅ |
-| Mirrored preview, with the file left unmirrored | ✅ |
+| Mirrored preview, per camera, with the file left unmirrored | ✅ |
 | Exposure slider in EV, centre is auto | ✅ |
 | Camcorder HUD, interactive | ✅ |
 | Gallery: browse, crop, rotate, mirror, rename | ✅ |
