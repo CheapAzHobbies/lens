@@ -1882,6 +1882,9 @@ class LensWindow(Adw.ApplicationWindow):
         # Keyed by the stable device id rather than the index, so unplugging
         # something does not silently hand one camera another's setting.
         self.mirror_map = dict(cfg.get("mirror_map") or {})
+        # Separately, whether the sensor is mounted upside down. Also per
+        # camera: it is a property of how the part was fitted, not a taste.
+        self.vflip_map = dict(cfg.get("vflip_map") or {})
         # Kept for machines set up before this was per-camera.
         self._mirror_legacy = bool(cfg.get("mirror_view", True))
         self.mirror_saved = bool(cfg.get("mirror_saved", False))
@@ -2292,6 +2295,17 @@ class LensWindow(Adw.ApplicationWindow):
         except Exception:
             return False
 
+    def vflip_for_current(self):
+        cid = self._current_cam_id()
+        return bool(self.vflip_map.get(cid, False)) if cid else False
+
+    def set_vflip_for_current(self, on):
+        cid = self._current_cam_id()
+        if cid is not None:
+            self.vflip_map[cid] = bool(on)
+            self._save_settings()
+        self._apply_mirror()
+
     def set_mirror_for_current(self, on):
         cid = self._current_cam_id()
         if cid is not None:
@@ -2305,12 +2319,21 @@ class LensWindow(Adw.ApplicationWindow):
         method is live, so this costs nothing and needs no rebuild.
         """
         mv = self.mirror_for_current()
+        vf = self.vflip_for_current()
+        # videoflip does one operation, so the two are combined: a horizontal
+        # and a vertical flip together are a 180 degree rotation.
+        #   0 none, 2 rotate-180, 4 horizontal-flip, 5 vertical-flip
+        def method(h, v):
+            return 2 if (h and v) else (4 if h else (5 if v else 0))
+        # The preview mirrors; the file only does if that was asked for. The
+        # vertical flip is not a preference, it is the sensor being mounted
+        # upside down, so it always applies to both.
         for name, on in (("mirror", mv),
                          ("savemirror", mv and self.mirror_saved),
                          ("recmirror", mv and self.mirror_saved)):
             el = self.pipeline.get_by_name(name) if self.pipeline else None
             if el is not None:
-                el.set_property("method", 4 if on else 0)   # 4 = horizontal-flip
+                el.set_property("method", method(on, vf))
 
     def _apply_filter(self):
         """Set the look. Live properties, so switching costs nothing."""
@@ -2521,8 +2544,7 @@ class LensWindow(Adw.ApplicationWindow):
         b.set_visible(True)
         b.set_sensitive(True)
         many = len(self.cameras) > 1 and not self.camera_off
-        b.set_tooltip_text("Switch camera (hold to choose)" if many
-                           else "Choose a camera")
+        b.set_tooltip_text("Change Camera")
 
     def _set_no_signal(self, on, why=""):
         if bool(on) == bool(getattr(self, "_no_signal_on", False)):
@@ -3077,18 +3099,17 @@ class LensWindow(Adw.ApplicationWindow):
         self._flip_ready = False
         self._flip_commit = None
         self.btn_flip.connect("clicked", lambda *_: self._flip_or_choose())
-        self.btn_flip.set_tooltip_text("Switch camera (hold to choose)")
+        self.btn_flip.set_tooltip_text("Change Camera")
 
-        # Hold to pick a specific camera. Tapping cycles, which is fine for
-        # two, but a machine with three or four wants to jump straight to one.
+        # No long press. Holding a button to reveal a menu is invisible: there
+        # is nothing on screen that says the gesture exists, and the tooltip
+        # that claimed it was the only clue. Right-click still opens the list,
+        # as does a tap when there is no second camera to cycle to, and it is
+        # in Settings under Camera.
         self.cam_popover = Gtk.Popover()
         self.cam_popover.set_parent(self.btn_flip)
         self.cam_popover.set_position(Gtk.PositionType.TOP)
         self.cam_popover.set_has_arrow(True)
-        hold = Gtk.GestureLongPress.new()
-        hold.set_delay_factor(1.0)
-        hold.connect("pressed", lambda *_: self._show_camera_menu())
-        self.btn_flip.add_controller(hold)
         # Right-click gets there too, the usual way to reach extra options.
         rmb = Gtk.GestureClick.new()
         rmb.set_button(3)
@@ -3827,6 +3848,7 @@ class LensWindow(Adw.ApplicationWindow):
             "trash_auto":   self.trash_auto,
             "trash_path":   self.trash_path,
             "mirror_map":   self.mirror_map,
+            "vflip_map":    self.vflip_map,
             "mirror_saved": self.mirror_saved,
             "container":    self.container,
             "pic_dir":      str(self.pic_dir),
@@ -5417,6 +5439,14 @@ class LensWindow(Adw.ApplicationWindow):
         mir.set_subtitle(f"Applies to {cam_label} only. Right for a camera "
                          f"pointing at you, wrong for one pointing away")
         mir.set_active(self.mirror_for_current())
+
+        vfl = Adw.SwitchRow(title="Camera is mounted upside down")
+        vfl.set_subtitle(f"Flips {cam_label} top to bottom, in the preview and "
+                         f"in what gets saved. Per camera")
+        vfl.set_active(self.vflip_for_current())
+        vfl.connect("notify::active",
+                    lambda row, *_: self.set_vflip_for_current(row.get_active()))
+        grpv.add(vfl)
 
         mir_save = Adw.SwitchRow(title="Mirror what gets saved too")
         mir_save.set_subtitle("Off keeps files the way the room really was. "
