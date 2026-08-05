@@ -2341,6 +2341,13 @@ class LensWindow(Adw.ApplicationWindow):
             return
         self._view_anim = True
         self._hide_hud_for_move(True)
+        # Let the turn use the black area around the frame. The viewfinder
+        # clips its overlays so a HUD row can never draw past the picture,
+        # but a quarter turn out of portrait grows wider than the frame it
+        # is still sitting in, and clipping that made the picture look cut
+        # off until the frame caught up at the end. Nothing else is on
+        # screen during the move to escape.
+        self.frame_stack.set_overflow(Gtk.Overflow.VISIBLE)
         tb = self.cam_tbox
         a = self.picture.get_allocation()
         w, h = a.width or 1, a.height or 1
@@ -2353,6 +2360,7 @@ class LensWindow(Adw.ApplicationWindow):
             self.set_rotation_for_current(self.rotation_for_current() + deg)
             tb.angle, tb.scale = 0.0, 1.0
             tb.queue_draw()
+            self.frame_stack.set_overflow(Gtk.Overflow.HIDDEN)
             self._hide_hud_for_move(False)
             self._view_anim = False
         self._drive_view(420, step, finish)
